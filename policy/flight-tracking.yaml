@@ -1,0 +1,34 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Flight Tracking Integration — sandbox network policy.
+#
+# The sandbox-side FastAPI server (server.py) needs outbound access to:
+#   - opensky-network.org:443    (live aircraft state vectors)
+#
+# Inference traffic (api -> Nemotron) is already governed by OpenShell's
+# gateway-managed inference route configured via `openshell inference set`,
+# so we don't need to declare it here.
+#
+# Static map tiles (openfreemap.org) are fetched directly by the user's
+# browser via the openshell port-forward — they never leave the host. The
+# sandbox itself does not need access to the tile server.
+#
+# install.sh applies the policy block below via `openshell policy set`. The
+# binary path (`/usr/bin/python3`) matches the Python 3.11 interpreter that
+# ships in the NemoClaw base image.
+
+network_policies:
+  flight_tracking_opensky:
+    name: flight_tracking_opensky
+    endpoints:
+      - host: opensky-network.org
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        tls: terminate
+        rules:
+          - allow: { method: GET, path: "/api/states/all" }
+          - allow: { method: GET, path: "/api/states/all*" }
+    binaries:
+      - { path: /usr/bin/python3 }
+      - { path: /usr/bin/python3.11 }

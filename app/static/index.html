@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="color-scheme" content="dark" />
+  <title>FlightOps · Live Aircraft Console</title>
+
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Manrope:wght@400;500;700;800&display=swap" rel="stylesheet" />
+
+  <link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div id="app">
+    <aside class="rail" id="rail">
+      <header class="brand">
+        <div class="brand-mark">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none">
+            <path d="M2.5 14.5 L11 10 V3.2 L13 3.2 V10 L21.5 14.5 V16 L13 13.5 V19 L15.5 20.5 V22 L12 21 L8.5 22 V20.5 L11 19 V13.5 L2.5 16 Z" fill="currentColor"/>
+          </svg>
+        </div>
+        <div class="brand-text">
+          <div class="brand-title">FlightOps</div>
+          <div class="brand-sub">Live Aircraft Console</div>
+        </div>
+        <div class="status-pill" id="status-pill" title="Live data status">
+          <span class="dot"></span>
+          <span class="status-text" id="status-text">connecting</span>
+        </div>
+      </header>
+
+      <section class="hud">
+        <div class="hud-row">
+          <div class="hud-cell">
+            <div class="hud-label">In view</div>
+            <div class="hud-value" id="hud-flights">—</div>
+          </div>
+          <div class="hud-cell">
+            <div class="hud-label">Airports</div>
+            <div class="hud-value" id="hud-airports">—</div>
+          </div>
+          <div class="hud-cell">
+            <div class="hud-label">Refresh</div>
+            <div class="hud-value" id="hud-refresh">—</div>
+          </div>
+        </div>
+      </section>
+
+      <section class="layers">
+        <div class="layers-title">Layers</div>
+        <label class="toggle"><input type="checkbox" id="layer-flights" checked /><span>Live aircraft</span></label>
+        <label class="toggle"><input type="checkbox" id="layer-airports" checked /><span>Airports</span></label>
+        <label class="toggle"><input type="checkbox" id="layer-arcs" /><span>Inbound arcs</span></label>
+        <label class="toggle"><input type="checkbox" id="layer-trails" /><span>Selected trail</span></label>
+      </section>
+
+      <section class="chat">
+        <div class="chat-title">Copilot</div>
+        <div class="chat-log" id="chat-log">
+          <div class="msg msg-bot welcome">
+            <div class="msg-content">
+              FlightOps copilot online. Try one of the suggested prompts below or type an airport code.
+            </div>
+          </div>
+        </div>
+        <div class="chat-suggestions">
+          <button class="chip" data-prompt="Go to IAD and analyse traffic">Go to IAD &amp; analyse</button>
+          <button class="chip" data-prompt="Show inbound arcs to JFK">Inbound to JFK</button>
+          <button class="chip" data-prompt="What's flying near LAX right now?">Flights near LAX</button>
+          <button class="chip" data-prompt="Any unusual squawks near LHR?">Unusual squawks LHR</button>
+        </div>
+        <form class="chat-input" id="chat-form" autocomplete="off">
+          <input type="text" id="chat-text" placeholder="Ask FlightOps…" autocomplete="off" />
+          <button type="submit" id="chat-send" aria-label="Send">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M3.4 20.6 21 12 3.4 3.4 3.3 9.8 17 12 3.3 14.2z"/></svg>
+          </button>
+        </form>
+      </section>
+
+      <footer class="rail-footer">
+        Data: OpenSky Network · Airports: OpenFlights · Tiles: openfreemap.org
+      </footer>
+    </aside>
+
+    <main class="map-stage">
+      <div id="map" class="map"></div>
+
+      <div class="floater attribution">
+        © OpenStreetMap contributors · OpenFreeMap · OpenSky Network
+      </div>
+
+      <aside class="detail-drawer hidden" id="detail-drawer" aria-hidden="true">
+        <button class="drawer-close" id="drawer-close" aria-label="Close">×</button>
+        <div class="drawer-eyebrow" id="drawer-eyebrow">Aircraft</div>
+        <div class="drawer-title" id="drawer-title">—</div>
+        <div class="drawer-grid" id="drawer-grid"></div>
+        <div class="drawer-actions">
+          <button class="btn-ghost" id="drawer-trail">Show trail</button>
+          <button class="btn-ghost" id="drawer-arcs">Arcs to nearest airport</button>
+        </div>
+      </aside>
+
+      <div class="toast" id="toast"></div>
+    </main>
+  </div>
+
+  <!-- Map + viz stack: load MapLibre first, then deck.gl, in classic script tags -->
+  <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+  <script src="https://unpkg.com/deck.gl@9.0.38/dist.min.js"></script>
+  <script type="module" src="/static/app.js"></script>
+</body>
+</html>

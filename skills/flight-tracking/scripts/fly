@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# fly — convenience wrapper around the FlightOps API.
+#
+# Usage:
+#   fly goto IAD                       # fly the map to IAD
+#   fly analyze IAD 80                 # analyse traffic within 80 km of IAD
+#   fly arcs IAD 80                    # draw arcs from inbound flights to IAD
+#   fly layer arcs on|off              # toggle a map layer
+#   fly highlight UAL123               # highlight a flight by callsign or ICAO24
+#   fly airport IAD                    # print airport details
+#   fly health                         # backend health check
+
+set -euo pipefail
+
+BASE="${FLIGHT_APP_URL:-http://127.0.0.1:18890}"
+
+post_json() {
+  local path="$1"; shift
+  curl -fsSL -X POST "${BASE}${path}" \
+    -H 'Content-Type: application/json' \
+    -d "$1"
+}
+
+cmd="${1:-help}"; shift || true
+
+case "$cmd" in
+  goto)
+    target="${1:?usage: fly goto <airport>}"
+    zoom="${2:-9}"
+    post_json /api/map/goto "$(printf '{"target":"%s","zoom":%s}' "$target" "$zoom")"
+    ;;
+  analyze)
+    airport="${1:?usage: fly analyze <airport> [radius_km]}"
+    radius="${2:-80}"
+    curl -fsSL "${BASE}/api/analyze?airport=${airport}&radius_km=${radius}"
+    ;;
+  arcs)
+    airport="${1:?usage: fly arcs <airport> [radius_km]}"
+    radius="${2:-80}"
+    post_json /api/map/arcs "$(printf '{"airport":"%s","radius_km":%s}' "$airport" "$radius")"
+    ;;
+  layer)
+    layer="${1:?usage: fly layer <flights|airports|arcs|trails> <on|off>}"
+    state="${2:?usage: fly layer <layer> <on|off>}"
+    visible=$([ "$state" = "on" ] && echo true || echo false)
+    post_json /api/map/layer "$(printf '{"layer":"%s","visible":%s}' "$layer" "$visible")"
+    ;;
+  highlight)
+    flight="${1:?usage: fly highlight <callsign-or-icao24>}"
+    post_json /api/map/highlight "$(printf '{"flight":"%s"}' "$flight")"
+    ;;
+  airport)
+    code="${1:?usage: fly airport <iata-or-icao>}"
+    curl -fsSL "${BASE}/api/airport/${code}"
+    ;;
+  health)
+    curl -fsSL "${BASE}/api/health"
+    ;;
+  *)
+    cat <<EOF
+fly — FlightOps CLI helper
+
+Commands:
+  fly goto <airport> [zoom]
+  fly analyze <airport> [radius_km]
+  fly arcs <airport> [radius_km]
+  fly layer <flights|airports|arcs|trails> <on|off>
+  fly highlight <callsign-or-icao24>
+  fly airport <iata-or-icao>
+  fly health
+
+Env:
+  FLIGHT_APP_URL  override base URL (default: http://127.0.0.1:18890)
+EOF
+    ;;
+esac
+echo
