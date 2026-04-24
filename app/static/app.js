@@ -15,6 +15,14 @@ const {
   TextLayer,
 } = deck;
 
+// Loud sanity check — if deck.gl's UMD bundle ever drops one of these
+// exports we'll know immediately rather than silently failing to render.
+for (const [name, ref] of Object.entries({
+  MapboxOverlay, ScatterplotLayer, IconLayer, ArcLayer, TripsLayer, TextLayer,
+})) {
+  if (!ref) console.error(`deck.gl export missing: ${name}`);
+}
+
 // ── State ────────────────────────────────────────────────────────────────
 
 const state = {
@@ -65,9 +73,14 @@ const elDrawerArcs = document.getElementById('drawer-arcs');
 const elToast = document.getElementById('toast');
 
 // ── Plane icon (data URI so we don't need an asset file) ────────────────
+// NOTE: explicit width/height on the <svg> root are *required* for deck.gl's
+// icon manager to rasterize correctly. Without them some browsers compute a
+// 0×0 layout and the icon appears invisible even though everything else looks
+// healthy. We also use the per-feature getIcon callback rather than
+// iconAtlas + iconMapping — that path is more reliable for data URIs.
 
 const PLANE_ICON_SVG = encodeURIComponent(
-  `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  `<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
      <defs>
        <linearGradient id="g" x1="0" x2="0" y1="0" y2="1">
          <stop offset="0" stop-color="#8ef5ff"/>
@@ -80,8 +93,13 @@ const PLANE_ICON_SVG = encodeURIComponent(
 );
 const PLANE_ICON_URL = `data:image/svg+xml;utf8,${PLANE_ICON_SVG}`;
 
-const ICON_MAPPING = {
-  plane: { x: 0, y: 0, width: 64, height: 64, anchorX: 32, anchorY: 32, mask: false },
+const PLANE_ICON_DEF = {
+  url: PLANE_ICON_URL,
+  width: 64,
+  height: 64,
+  anchorX: 32,
+  anchorY: 32,
+  mask: false,
 };
 
 // ── Map setup ────────────────────────────────────────────────────────────
@@ -103,8 +121,11 @@ function initMap() {
   state.map.addControl(new maplibregl.NavigationControl({ showCompass: true }), 'top-right');
   state.map.touchZoomRotate.disableRotation();
 
+  // Overlay mode (interleaved: false) puts deck.gl on its own canvas above
+  // MapLibre. More tolerant of WebGL edge cases than interleaved mode and
+  // we don't need to interleave with vector tile layers for this app.
   state.deckOverlay = new MapboxOverlay({
-    interleaved: true,
+    interleaved: false,
     layers: buildLayers(),
     onClick: (info) => handleDeckClick(info),
   });
@@ -207,12 +228,14 @@ function buildLayers() {
       new IconLayer({
         id: 'flights',
         data: flights,
-        iconAtlas: PLANE_ICON_URL,
-        iconMapping: ICON_MAPPING,
-        getIcon: () => 'plane',
-        getPosition: (f) => [f.lon, f.lat, Math.max(0, f.alt_m || 0)],
-        getSize: (f) => (f.id === state.selectedFlightId ? 36 : 22),
-        getAngle: (f) => -((f.heading || 0) - 90), // deck.gl angles are CCW from +X; OpenSky heading is degrees from north
+        // Per-feature getIcon is the most reliable path for data URIs in
+        // deck.gl — it avoids the iconAtlas autopack step entirely.
+        getIcon: () => PLANE_ICON_DEF,
+        getPosition: (f) => [f.lon, f.lat],
+        getSize: (f) => (f.id === state.selectedFlightId ? 32 : 20),
+        // Plane SVG points UP (0° = north). OpenSky heading is degrees CW
+        // from north. deck.gl getAngle is CCW degrees, so we negate.
+        getAngle: (f) => -(f.heading || 0),
         getColor: (f) =>
           f.id === state.selectedFlightId
             ? [255, 184, 107, 255]
@@ -220,6 +243,8 @@ function buildLayers() {
             ? [110, 130, 160, 200]
             : [255, 255, 255, 230],
         sizeUnits: 'pixels',
+        sizeMinPixels: 12,
+        sizeMaxPixels: 36,
         billboard: true,
         pickable: true,
         updateTriggers: {

@@ -28,7 +28,11 @@ warn()  { printf "${YELLOW}  ⚠ %s${NC}\n" "$1"; }
 fail()  { printf "${RED}  ✗ %s${NC}\n" "$1"; exit 1; }
 
 ssh_sandbox() {
-  ssh -o StrictHostKeyChecking=no \
+  # -F /dev/null skips system-wide SSH config; some cloud images ship
+  # /etc/ssh/ssh_config.d files with bad owner/permissions, which OpenSSH
+  # 9.x treats as fatal and aborts before our exec gets a chance to run.
+  ssh -F /dev/null \
+      -o StrictHostKeyChecking=no \
       -o UserKnownHostsFile=/dev/null \
       -o LogLevel=ERROR \
       -o ProxyCommand="openshell ssh-proxy --gateway-name nemoclaw --name $SANDBOX_NAME" \
@@ -283,8 +287,12 @@ info "Forwarding localhost:$PORT to the sandbox…"
 openshell forward stop "$PORT" >/dev/null 2>&1 || true
 openshell forward start "$PORT" "$SANDBOX_NAME" -d >/dev/null 2>&1 || true
 sleep 1
-if openshell forward list 2>/dev/null | grep -q ":$PORT"; then
+# `openshell forward list` columns are: SANDBOX BIND PORT PID STATUS — match
+# either the PORT column or a "BIND:PORT" pattern, whichever the version emits.
+if openshell forward list 2>/dev/null | awk 'NR>1 {print $3}' | grep -qx "$PORT"; then
   ok "Port forward active: http://localhost:$PORT"
+elif curl -fsS -o /dev/null --max-time 3 "http://127.0.0.1:$PORT/api/health"; then
+  ok "Port forward active (verified via /api/health): http://localhost:$PORT"
 else
   warn "Port forward not visible — start it manually: openshell forward start $PORT $SANDBOX_NAME -d"
 fi
