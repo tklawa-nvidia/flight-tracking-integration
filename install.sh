@@ -236,12 +236,45 @@ ok "Python deps installed"
 info "Starting FlightOps server inside the sandbox on port $PORT…"
 
 ssh_sandbox "
-pkill -f 'uvicorn server:app' >/dev/null 2>&1 || true
+set -e
+# Best-effort kill of any prior uvicorn for this app.
+if command -v pkill >/dev/null 2>&1; then
+  pkill -f 'uvicorn server:app' >/dev/null 2>&1 || true
+else
+  ps -eo pid,args 2>/dev/null | awk '/uvicorn server:app/ && !/awk/ {print \$1}' \
+    | xargs -r kill 2>/dev/null || true
+fi
 sleep 1
-nohup $SANDBOX_BASE/start.sh > $SANDBOX_BASE/server.log 2>&1 &
-sleep 2
-pgrep -f 'uvicorn server:app' >/dev/null
-" && ok "Server is running" || fail "Server failed to start. Tail $SANDBOX_BASE/server.log"
+# Detach with setsid so the server survives the SSH disconnect on minimal images.
+setsid nohup $SANDBOX_BASE/start.sh > $SANDBOX_BASE/server.log 2>&1 < /dev/null &
+disown 2>/dev/null || true
+"
+
+# Wait until the port is actually accepting connections from inside the sandbox.
+SERVER_UP=false
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  sleep 1
+  if ssh_sandbox "
+if command -v ss >/dev/null 2>&1; then
+  ss -ltn 2>/dev/null | awk '{print \$4}' | grep -qE ':(${PORT})\$'
+elif command -v netstat >/dev/null 2>&1; then
+  netstat -ltn 2>/dev/null | awk '{print \$4}' | grep -qE ':(${PORT})\$'
+else
+  python3 -c 'import socket,sys;s=socket.socket();exit(0 if s.connect_ex((\"127.0.0.1\",${PORT}))==0 else 1)'
+fi
+  " 2>/dev/null; then
+    SERVER_UP=true
+    break
+  fi
+done
+
+if [ "$SERVER_UP" = true ]; then
+  ok "Server is listening on :$PORT"
+else
+  warn "Server did not start. Last 30 log lines:"
+  ssh_sandbox "tail -n 30 $SANDBOX_BASE/server.log 2>/dev/null" || true
+  fail "FlightOps backend failed to come up. Inspect $SANDBOX_BASE/server.log"
+fi
 
 # ── 8. Host-side port forward ───────────────────────────────────────────
 info "Forwarding localhost:$PORT to the sandbox…"
