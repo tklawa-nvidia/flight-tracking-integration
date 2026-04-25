@@ -81,9 +81,14 @@ const APPROX_CREDITS_PER_CALL = 2;
 const FLIGHT_STALE_MS = 60_000;        // drop flights we haven't seen in 60s
 const MAX_HISTORY = 60;
 // Don't extrapolate further than this since the last fix — an aircraft we
-// haven't heard from in 30s is more likely lost than still on its old
-// vector. Beyond this we just freeze the icon at the last fix.
-const DEAD_RECKON_MAX_S = 30;
+// haven't heard from in 60s is more likely lost than still on its old
+// vector. Beyond this we just freeze the icon at the last known position.
+const DEAD_RECKON_MAX_S = 60;
+// When a new fix lands, the icon is currently at its dead-reckoned visual
+// position. The new fix tells us where the plane actually is. Snapping to
+// the new position would jitter, so we keep a decaying offset that smoothly
+// pulls the icon onto the new dead-reckoning line over this many seconds.
+const CORRECTION_DECAY_S = 3;
 // Show breadcrumb paths for every visible flight at this zoom or above.
 const TRAIL_ZOOM_THRESHOLD = 6;
 // RainViewer publishes a JSON manifest of available radar/satellite frames.
@@ -175,28 +180,51 @@ function initMap() {
   });
 }
 
-// ── Smooth motion ────────────────────────────────────────────────────────
-// OpenSky updates every ~10s, which makes the planes "snap" between fixes.
-// To smooth that out we (a) compute a predicted *next* position for each
-// flight at ingest time using the reported heading + ground speed, then
-// (b) hand that target to deck.gl's IconLayer with a `transitions` prop
-// that GPU-interpolates from the previous target over the cadence window.
-// No per-frame work, no layer churn.
+// ── Smooth motion (continuous dead-reckoning) ────────────────────────────
+// OpenSky publishes every ~10–30s — a "snap to new fix" looks awful. The
+// previous version of this file linearly interpolated between two
+// predicted future positions, which produced an unnatural zig-zag whenever
+// heading or speed changed between fixes.
+//
+// New approach (what real flight trackers do):
+//   1. Each fix is an "anchor": (lat, lon, heading, ground_speed, ts).
+//   2. Each render frame, the icon's drawn position = dead-reckoned
+//      position from the latest anchor based on (now - ts). That makes
+//      the icon move forward along its true heading at its true speed.
+//   3. When a new fix arrives, the dead-reckoned guess is rarely exactly
+//      where the new anchor says the plane is. Instead of teleporting,
+//      we record a "correction offset" = (old_render_pos - new_anchor)
+//      and decay it to zero over a few seconds. The icon glides onto the
+//      new dead-reckoning line without ever leaving the heading.
 
-function predictedTarget(f, intervalMs) {
-  if (f == null || f.lat == null || f.lon == null) return [f?.lon ?? 0, f?.lat ?? 0];
-  if (f.on_ground) return [f.lon, f.lat];
-  const v = f.vel_mps;
-  if (!v || v <= 0 || f.heading == null) return [f.lon, f.lat];
-  // Project ~one fetch cadence ahead so the plane is still moving when the
-  // next fix lands. Cap the lookahead so a stale flight doesn't drift.
-  const lookS = Math.min(DEAD_RECKON_MAX_S, intervalMs / 1000);
-  const hdg = (f.heading * Math.PI) / 180;
-  const dN = v * Math.cos(hdg) * lookS;   // metres north
-  const dE = v * Math.sin(hdg) * lookS;   // metres east
-  const dLat = dN / 111320;
-  const dLon = dE / (111320 * Math.cos((f.lat * Math.PI) / 180));
-  return [f.lon + dLon, f.lat + dLat];
+function deadReckon(anchor, nowMs) {
+  // Returns [lon, lat] = where this anchor's plane should be at `nowMs`,
+  // assuming it has continued on its last known heading/speed.
+  if (!anchor) return null;
+  if (anchor.on_ground || !anchor.vel || anchor.vel <= 0 || anchor.heading == null) {
+    return [anchor.lon, anchor.lat];
+  }
+  const dt = Math.min(DEAD_RECKON_MAX_S, Math.max(0, (nowMs - anchor.ts) / 1000));
+  const hdg = (anchor.heading * Math.PI) / 180;
+  const dN = anchor.vel * Math.cos(hdg) * dt;   // metres north
+  const dE = anchor.vel * Math.sin(hdg) * dt;   // metres east
+  const dLat = dN / 111_320;
+  const dLon = dE / (111_320 * Math.cos((anchor.lat * Math.PI) / 180));
+  return [anchor.lon + dLon, anchor.lat + dLat];
+}
+
+function renderPos(f, nowMs) {
+  // Drawn position = dead-reckoning + decaying correction offset.
+  if (!f.anchor) return [f.lon, f.lat];
+  const dr = deadReckon(f.anchor, nowMs);
+  if (!f.correction) return dr;
+  const age = (nowMs - f.correctionTs) / 1000;
+  const decay = Math.exp(-age / CORRECTION_DECAY_S);
+  if (decay < 0.01) {
+    f.correction = null;
+    return dr;
+  }
+  return [dr[0] + f.correction[0] * decay, dr[1] + f.correction[1] * decay];
 }
 
 // ── Layer assembly ───────────────────────────────────────────────────────
@@ -323,17 +351,19 @@ function buildLayers() {
         id: 'flights',
         data: flights,
         // Per-feature getIcon is the most reliable path for data URIs in
-        // deck.gl — it avoids the iconAtlas autopack step entirely.
+        // deck.gl — it avoids the iconAtlas autopack step entirely. The
+        // returned object identity is stable (PLANE_ICON_DEF is a const)
+        // so deck.gl reuses the cached atlas across frame rebuilds.
         getIcon: () => PLANE_ICON_DEF,
-        // Use the per-flight `target` field (filled at ingest time). The
-        // `transitions` prop below tells deck.gl to GPU-interpolate from
-        // the previous target to this one over the fetch cadence — that's
-        // what makes the planes glide instead of snapping.
-        getPosition: (f) => f.target || [f.lon, f.lat],
+        // Position is computed every frame from the per-flight anchor +
+        // a decaying correction offset, so the icon traces the plane's
+        // *real* heading at its *real* ground speed between fixes — no
+        // bouncing along straight chords between predicted endpoints.
+        getPosition: (f) => renderPos(f, performance.now()),
         getSize: (f) => (f.id === state.selectedFlightId ? 32 : 20),
         // Plane SVG points UP (0° = north). OpenSky heading is degrees CW
         // from north. deck.gl getAngle is CCW degrees, so we negate.
-        getAngle: (f) => -(f.heading || 0),
+        getAngle: (f) => -(f.anchor?.heading ?? f.heading ?? 0),
         getColor: (f) =>
           f.id === state.selectedFlightId
             ? [255, 184, 107, 255]
@@ -345,16 +375,6 @@ function buildLayers() {
         sizeMaxPixels: 36,
         billboard: true,
         pickable: true,
-        transitions: {
-          // Linear interpolation of the position attribute over roughly one
-          // fetch interval. Slightly under cadence so the glide finishes
-          // before the next fix lands and re-arms the transition.
-          getPosition: {
-            type: 'interpolation',
-            duration: Math.max(2000, state.live.intervalMs - 500),
-            easing: (t) => t,
-          },
-        },
         updateTriggers: {
           getSize: state.selectedFlightId,
           getColor: state.selectedFlightId,
@@ -372,18 +392,25 @@ function refreshLayers() {
 }
 
 // ── Animation loop ───────────────────────────────────────────────────────
-// Plane motion itself is animated by deck.gl on the GPU via the IconLayer's
-// `transitions` prop — no JS work needed. We only need this loop to keep
-// the TripsLayer's currentTime advancing for the *selected* flight's
-// fading trail. Ten frames a second is plenty for that.
+// We drive plane motion ourselves (continuous dead-reckoning), so this
+// loop has to refresh the layers at a steady cadence to keep the icons
+// moving forward between fixes. ~20 fps is buttery and cheap: each
+// rebuild is O(N) sin/cos for ~5k flights, well under 1 ms on the main
+// thread, with similar GPU buffer churn.
+//
+// The TripsLayer used by the *selected* flight's trail also needs the
+// loop tick to advance its currentTime, so the same rebuild covers both.
 
 let _lastRenderTs = 0;
-const RENDER_INTERVAL_MS = 100;
+const RENDER_INTERVAL_MS = 50; // ~20 fps
 
 function animate(nowTs) {
-  if (state.layerVisibility.trails && state.selectedFlightId &&
-      nowTs - _lastRenderTs >= RENDER_INTERVAL_MS) {
-    refreshLayers();
+  if (nowTs - _lastRenderTs >= RENDER_INTERVAL_MS) {
+    if (state.layerVisibility.flights && state.flights.size > 0) {
+      refreshLayers();
+    } else if (state.layerVisibility.trails && state.selectedFlightId) {
+      refreshLayers();
+    }
     _lastRenderTs = nowTs;
   }
   requestAnimationFrame(animate);
@@ -700,11 +727,36 @@ function ingestFlights(flights) {
   for (const f of flights) {
     seen.add(f.id);
     f.fixTs = now;
-    // Predicted position one cadence ahead. The IconLayer transitions
-    // smoothly from the previous target toward this one over the cadence,
-    // so by the time we get here for fix N+1 the plane is roughly at fix N
-    // and we kick off a new glide toward the new prediction.
-    f.target = predictedTarget(f, state.live.intervalMs);
+
+    // New anchor from the freshly received state vector.
+    const newAnchor = {
+      lon: f.lon, lat: f.lat,
+      heading: f.heading, vel: f.vel_mps,
+      ts: now, on_ground: f.on_ground,
+    };
+
+    // If we already had a fix for this aircraft, the icon is currently
+    // dead-reckoned along the *old* anchor. Capture that visual position
+    // and turn the delta against the new anchor into a decaying offset
+    // — the icon will glide onto the new heading line over a few seconds
+    // instead of teleporting.
+    const prev = state.flights.get(f.id);
+    let correction = null;
+    if (prev && prev.anchor) {
+      const oldRender = renderPos(prev, now);
+      const dLon = oldRender[0] - newAnchor.lon;
+      const dLat = oldRender[1] - newAnchor.lat;
+      // Sanity guard: if the gap is huge (>~5 degrees, e.g. icao24 reuse
+      // or a fix from the other side of the world), don't try to glide;
+      // just snap.
+      if (dLon * dLon + dLat * dLat < 25) {
+        correction = [dLon, dLat];
+      }
+    }
+    f.anchor = newAnchor;
+    f.correction = correction;
+    f.correctionTs = now;
+
     state.flights.set(f.id, f);
     let history = state.flightHistory.get(f.id);
     if (!history) {
