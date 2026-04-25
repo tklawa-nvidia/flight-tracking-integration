@@ -59,17 +59,24 @@ const state = {
     nextRefresh: 0,
   },
   // OpenSky's anonymous quota is small (~400 credits/day with bbox costs of
-  // 1-4 each) so we let the user dial cadence and pause the live feed
-  // entirely. Any 429 from the server pushes nextAllowedAt out so we don't
-  // just bash the upstream until midnight UTC.
+  // 1-4 each) so we let the user dial cadence, pause the live feed, or
+  // switch to manual one-shot fetches. Any 429 from the server pushes
+  // nextAllowedAt out so we don't just bash the upstream until midnight UTC.
   live: {
     paused: false,
-    intervalMs: 10_000,           // user-selectable cadence
+    // 0 == manual mode (no auto-refresh; user clicks Snapshot)
+    intervalMs: 60_000,
     nextAllowedAt: 0,             // performance.now() floor; raised on 429
-    backoffMs: 60_000,            // current 429 backoff window
-    lastStatus: 'ok',             // 'ok' | 'rate-limit' | 'error' | 'paused' | 'hidden'
+    backoffMs: 60_000,             // current 429 backoff window
+    lastStatus: 'ok',              // 'ok' | 'rate-limit' | 'error' | 'paused' | 'hidden' | 'manual'
   },
 };
+
+// Anonymous OpenSky budget — 400 credits/day. Each bbox call costs roughly
+// 2 credits in the size range we typically use, so the practical anonymous
+// budget is ~200 calls/day. Used to drive the budget hint text.
+const OPENSKY_DAILY_CREDITS = 400;
+const APPROX_CREDITS_PER_CALL = 2;
 
 const FLIGHT_STALE_MS = 60_000;        // drop flights we haven't seen in 60s
 const MAX_HISTORY = 60;
@@ -523,17 +530,21 @@ let pendingPump = false;
 
 function schedulePump({ force = false } = {}) {
   if (pumpTimer) clearTimeout(pumpTimer);
-  // Respect pause + visibility — neither schedules a fetch.
+  // Respect pause / manual / visibility — none of these schedule a fetch.
   if (state.live.paused) {
     state.live.lastStatus = 'paused';
+    updateRefreshHud();
+    return;
+  }
+  if (state.live.intervalMs === 0) {
+    // Manual mode: no auto refresh. The user fires Snapshot to refetch.
+    state.live.lastStatus = 'manual';
     updateRefreshHud();
     return;
   }
   if (document.hidden) {
     state.live.lastStatus = 'hidden';
     updateRefreshHud();
-    // We *do* still re-schedule a tick when the tab returns; that's wired
-    // up via the visibilitychange listener in wireLiveControls().
     return;
   }
   const now = performance.now();
@@ -547,13 +558,20 @@ function schedulePump({ force = false } = {}) {
   updateRefreshHud(delay);
 }
 
-async function pump() {
+async function pump({ snapshot = false } = {}) {
   if (state.inFlight) {
     pendingPump = true;
     return;
   }
-  if (state.live.paused || document.hidden) {
+  // A manual snapshot bypasses pause / hidden-tab / manual-mode gates but
+  // still respects the 429 backoff floor.
+  if (!snapshot && (state.live.paused || document.hidden)) {
     schedulePump();
+    return;
+  }
+  if (snapshot && state.live.nextAllowedAt > performance.now()) {
+    const wait = Math.round((state.live.nextAllowedAt - performance.now()) / 1000);
+    toast(`Backoff active — try again in ${wait}s`);
     return;
   }
   state.inFlight = true;
@@ -594,6 +612,13 @@ async function pump() {
     }
   } finally {
     state.inFlight = false;
+    // In snapshot/manual mode we don't reschedule a follow-up; just leave
+    // the planes frozen at their last fix until the user asks again.
+    if (snapshot || state.live.intervalMs === 0) {
+      state.live.lastStatus = state.live.lastStatus === 'rate-limit' ? 'rate-limit' : 'manual';
+      updateRefreshHud();
+      return;
+    }
     if (pendingPump) {
       pendingPump = false;
       schedulePump({ force: true });
@@ -624,6 +649,9 @@ function updateRefreshHud(delayMs) {
     case 'paused':
       elHudRefresh.textContent = 'paused';
       break;
+    case 'manual':
+      elHudRefresh.textContent = 'manual';
+      break;
     case 'hidden':
       elHudRefresh.textContent = 'tab hidden';
       break;
@@ -636,8 +664,34 @@ function updateRefreshHud(delayMs) {
       elHudRefresh.textContent = 'retrying';
       break;
     default:
-      elHudRefresh.textContent = `${sec}s`;
+      elHudRefresh.textContent = sec >= 60 ? `${Math.round(sec / 60)} min` : `${sec}s`;
   }
+}
+
+// Update the credit-budget hint shown below the cadence selector.
+// At intervalMs cadence, calls/hour ≈ 3600/(intervalMs/1000).
+// Anonymous budget is OPENSKY_DAILY_CREDITS / APPROX_CREDITS_PER_CALL calls
+// per day. We surface the practical "hours of continuous viewing" number
+// so the user can pick a cadence that won't burn the daily quota.
+function updateBudgetHint() {
+  const elBudget = document.getElementById('live-budget');
+  const elHours = document.getElementById('live-budget-hours');
+  if (!elBudget || !elHours) return;
+  if (state.live.intervalMs === 0) {
+    elBudget.textContent = '0';
+    elHours.textContent = 'unlimited';
+    return;
+  }
+  const callsPerHour = 3600 / (state.live.intervalMs / 1000);
+  const creditsPerHour = Math.round(callsPerHour * APPROX_CREDITS_PER_CALL);
+  const dailyCalls = OPENSKY_DAILY_CREDITS / APPROX_CREDITS_PER_CALL;
+  const hours = dailyCalls / callsPerHour;
+  elBudget.textContent = `~${creditsPerHour}`;
+  elHours.textContent = hours >= 24
+    ? 'all day'
+    : hours >= 1
+    ? `~${hours.toFixed(hours < 5 ? 1 : 0)} hr`
+    : `~${Math.round(hours * 60)} min`;
 }
 
 function ingestFlights(flights) {
@@ -690,6 +744,7 @@ function toast(text, ms = 2500) {
 
 function wireLiveControls() {
   const elPause = document.getElementById('live-pause');
+  const elSnapshot = document.getElementById('live-snapshot');
   const elCadence = document.getElementById('live-cadence');
 
   if (elPause) {
@@ -703,9 +758,26 @@ function wireLiveControls() {
         updateRefreshHud();
         toast('Live feed paused — planes are frozen at last fix');
       } else {
-        state.live.lastStatus = 'ok';
+        state.live.lastStatus = state.live.intervalMs === 0 ? 'manual' : 'ok';
         toast('Live feed resumed');
-        schedulePump({ force: true });
+        if (state.live.intervalMs > 0) schedulePump({ force: true });
+      }
+    });
+  }
+
+  // Snapshot: a single one-shot fetch. Useful in manual mode, or when you
+  // just want fresh data without committing to a recurring poll. Bypasses
+  // the pause / hidden-tab gates but still respects the 429 backoff.
+  if (elSnapshot) {
+    elSnapshot.addEventListener('click', async () => {
+      elSnapshot.disabled = true;
+      elSnapshot.classList.add('is-active');
+      toast('Fetching one snapshot…', 1500);
+      try {
+        await pump({ snapshot: true });
+      } finally {
+        elSnapshot.disabled = false;
+        elSnapshot.classList.remove('is-active');
       }
     });
   }
@@ -716,11 +788,21 @@ function wireLiveControls() {
       const ms = parseInt(elCadence.value, 10);
       if (!Number.isFinite(ms)) return;
       state.live.intervalMs = ms;
-      updateRefreshHud();
-      // Re-schedule from now so the new cadence applies immediately.
-      schedulePump();
+      updateBudgetHint();
+      if (ms === 0) {
+        if (pumpTimer) clearTimeout(pumpTimer);
+        state.live.lastStatus = 'manual';
+        updateRefreshHud();
+        toast('Manual mode — use Snapshot to fetch when you need it');
+      } else {
+        // Re-schedule from now so the new cadence applies immediately.
+        state.live.lastStatus = 'ok';
+        schedulePump();
+      }
     });
   }
+
+  updateBudgetHint();
 
   // Auto-pause when the tab is backgrounded — saves a *lot* of credits over
   // the course of a day. Resume immediately when it comes back.
@@ -729,7 +811,7 @@ function wireLiveControls() {
       if (pumpTimer) clearTimeout(pumpTimer);
       state.live.lastStatus = 'hidden';
       updateRefreshHud();
-    } else if (!state.live.paused) {
+    } else if (!state.live.paused && state.live.intervalMs > 0) {
       schedulePump({ force: true });
     }
   });

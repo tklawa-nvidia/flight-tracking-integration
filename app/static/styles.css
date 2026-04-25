@@ -251,8 +251,14 @@ html, body, #app {
 .live-row {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
   margin-bottom: 8px;
+  flex-wrap: wrap;
+}
+
+.live-row .btn-pill {
+  flex: 1 1 auto;
+  text-align: center;
 }
 
 .btn-pill {
@@ -273,9 +279,21 @@ html, body, #app {
 .live-cadence {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 8px;
   font-size: 12px;
   color: var(--text-dim);
+  width: 100%;
+}
+
+.live-cadence span {
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.live-cadence select {
+  flex: 1;
 }
 
 .live-cadence select {
@@ -302,8 +320,13 @@ html, body, #app {
 
 .live-hint {
   font-size: 11px;
-  line-height: 1.4;
+  line-height: 1.5;
   color: var(--text-faint);
+}
+
+.live-hint strong {
+  color: var(--text-dim);
+  font-weight: 600;
 }
 
 /* ── Chat ───────────────────────────────────────────────────────────────── */

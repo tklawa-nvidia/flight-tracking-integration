@@ -11,7 +11,7 @@
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Manrope:wght@400;500;700;800&display=swap" rel="stylesheet" />
 
   <link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/styles.css?v=6" />
+  <link rel="stylesheet" href="/static/styles.css?v=7" />
 </head>
 <body>
   <div id="app">
@@ -52,18 +52,27 @@
       <section class="live">
         <div class="layers-title">Live data</div>
         <div class="live-row">
-          <button class="btn-ghost btn-pill" id="live-pause" type="button">Pause</button>
+          <button class="btn-ghost btn-pill" id="live-snapshot" type="button" title="Fetch once">Snapshot</button>
+          <button class="btn-ghost btn-pill" id="live-pause" type="button" title="Stop the live feed">Pause</button>
+        </div>
+        <div class="live-row">
           <label class="live-cadence">
-            <span>Every</span>
+            <span>Refresh</span>
             <select id="live-cadence">
-              <option value="10000">10 s</option>
-              <option value="30000">30 s</option>
-              <option value="60000">60 s</option>
-              <option value="120000">2 min</option>
+              <option value="0">Manual</option>
+              <option value="30000">Every 30 s</option>
+              <option value="60000" selected>Every 1 min</option>
+              <option value="120000">Every 2 min</option>
+              <option value="300000">Every 5 min</option>
+              <option value="600000">Every 10 min</option>
             </select>
           </label>
         </div>
-        <div class="live-hint">Auto-pauses when the tab is hidden. OpenSky has a small free quota — slower cadence stretches it further.</div>
+        <div class="live-hint">
+          Anonymous OpenSky gets <strong>~400 credits/day</strong> (1–4 per call).
+          At this cadence: <strong><span id="live-budget">~120</span></strong>/hr — quota lasts <strong><span id="live-budget-hours">~3 hr</span></strong>.
+          Tab auto-pauses when hidden.
+        </div>
       </section>
 
       <section class="layers">
@@ -129,6 +138,6 @@
   <!-- Map + viz stack: load MapLibre first, then deck.gl, in classic script tags -->
   <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
   <script src="https://unpkg.com/deck.gl@9.0.38/dist.min.js"></script>
-  <script type="module" src="/static/app.js?v=6"></script>
+  <script type="module" src="/static/app.js?v=7"></script>
 </body>
 </html>
