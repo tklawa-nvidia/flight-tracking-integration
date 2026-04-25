@@ -11,7 +11,7 @@
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Manrope:wght@400;500;700;800&display=swap" rel="stylesheet" />
 
   <link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/styles.css?v=8" />
+  <link rel="stylesheet" href="/static/styles.css?v=9" />
 </head>
 <body>
   <div id="app">
@@ -60,8 +60,8 @@
             <span>Refresh</span>
             <select id="live-cadence">
               <option value="0">Manual</option>
-              <option value="30000">Every 30 s</option>
-              <option value="60000" selected>Every 1 min</option>
+              <option value="30000" selected>Every 30 s</option>
+              <option value="60000">Every 1 min</option>
               <option value="120000">Every 2 min</option>
               <option value="300000">Every 5 min</option>
               <option value="600000">Every 10 min</option>
@@ -138,6 +138,6 @@
   <!-- Map + viz stack: load MapLibre first, then deck.gl, in classic script tags -->
   <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
   <script src="https://unpkg.com/deck.gl@9.0.38/dist.min.js"></script>
-  <script type="module" src="/static/app.js?v=8"></script>
+  <script type="module" src="/static/app.js?v=9"></script>
 </body>
 </html>

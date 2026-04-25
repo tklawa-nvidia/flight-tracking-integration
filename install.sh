@@ -128,47 +128,61 @@ fi
 # ── 3. Apply network policy ─────────────────────────────────────────────
 info "Applying flight_tracking_opensky network policy…"
 
-CURRENT_POLICY=$(openshell policy get "$SANDBOX_NAME" --full 2>/dev/null | sed '1,/^---$/d' || true)
 POLICY_FILE=$(mktemp /tmp/flight-tracking-policy-XXXX.yaml)
+openshell policy get "$SANDBOX_NAME" --full 2>/dev/null | sed '1,/^---$/d' > "$POLICY_FILE"
 
-if echo "$CURRENT_POLICY" | grep -q "flight_tracking_opensky"; then
-  ok "Policy already contains flight_tracking_opensky"
+# Idempotent upsert of the flight_tracking_opensky block. Earlier versions
+# of the demo only opened opensky-network.org; OAuth2 also needs
+# auth.opensky-network.org for the token mint, so we reconcile both hosts.
+PATCH_RESULT=$(python3 - "$POLICY_FILE" <<'PY'
+import sys, yaml
+path = sys.argv[1]
+with open(path) as f:
+    doc = yaml.safe_load(f) or {}
+nps = doc.get('network_policies') or {}
+desired = {
+    'name': 'flight_tracking_opensky',
+    'endpoints': [
+        {
+            'host': 'opensky-network.org', 'port': 443, 'protocol': 'rest',
+            'tls': 'terminate', 'enforcement': 'enforce',
+            'rules': [
+                {'allow': {'method': 'GET', 'path': '/api/states/all'}},
+                {'allow': {'method': 'GET', 'path': '/api/states/all*'}},
+            ],
+        },
+        {
+            'host': 'auth.opensky-network.org', 'port': 443, 'protocol': 'rest',
+            'tls': 'terminate', 'enforcement': 'enforce',
+            'rules': [
+                {'allow': {'method': 'POST',
+                           'path': '/auth/realms/opensky-network/protocol/openid-connect/token'}},
+            ],
+        },
+    ],
+    'binaries': [
+        {'path': '/usr/bin/python3'},
+        {'path': '/usr/bin/python3.11'},
+    ],
+}
+if nps.get('flight_tracking_opensky') == desired:
+    print('unchanged')
+else:
+    nps['flight_tracking_opensky'] = desired
+    doc['network_policies'] = nps
+    with open(path, 'w') as f:
+        yaml.safe_dump(doc, f, sort_keys=False)
+    print('patched')
+PY
+)
+if [ "$PATCH_RESULT" = "unchanged" ]; then
+  ok "Policy already up to date"
 else
-  cat > "$POLICY_FILE" <<EOF
-$(echo "$CURRENT_POLICY" | sed -e :a -e '/^\s*$/{$d;N;ba' -e '}')
-  flight_tracking_opensky:
-    name: flight_tracking_opensky
-    endpoints:
-    - host: opensky-network.org
-      port: 443
-      protocol: rest
-      tls: terminate
-      enforcement: enforce
-      rules:
-      - allow:
-          method: GET
-          path: /api/states/all
-      - allow:
-          method: GET
-          path: /api/states/all*
-    - host: auth.opensky-network.org
-      port: 443
-      protocol: rest
-      tls: terminate
-      enforcement: enforce
-      rules:
-      - allow:
-          method: POST
-          path: /auth/realms/opensky-network/protocol/openid-connect/token
-    binaries:
-    - path: /usr/bin/python3
-    - path: /usr/bin/python3.11
-EOF
   openshell policy set "$SANDBOX_NAME" --policy "$POLICY_FILE" --wait 2>&1 \
-    && ok "Policy applied" \
+    && ok "Policy applied (added/updated flight_tracking_opensky)" \
     || fail "openshell policy set failed; review $POLICY_FILE"
-  rm -f "$POLICY_FILE"
 fi
+rm -f "$POLICY_FILE"
 
 # ── 4. Stage server files inside the sandbox ────────────────────────────
 info "Provisioning $SANDBOX_BASE in the sandbox…"

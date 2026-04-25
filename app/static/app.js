@@ -65,7 +65,7 @@ const state = {
   live: {
     paused: false,
     // 0 == manual mode (no auto-refresh; user clicks Snapshot)
-    intervalMs: 60_000,
+    intervalMs: 30_000,
     nextAllowedAt: 0,             // performance.now() floor; raised on 429
     backoffMs: 60_000,             // current 429 backoff window
     lastStatus: 'ok',              // 'ok' | 'rate-limit' | 'error' | 'paused' | 'hidden' | 'manual'
