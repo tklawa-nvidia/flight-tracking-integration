@@ -74,6 +74,71 @@ OPENCLAW_TIMEOUT_S = int(os.getenv("OPENCLAW_TIMEOUT_S", "180"))
 DEFAULT_ANALYSIS_RADIUS_KM = 80.0
 EARTH_RADIUS_KM = 6371.0
 
+# ── FAA AIS airspace datasets ──────────────────────────────────────────────
+# All three are public, key-less, and return GeoJSON when asked nicely.
+# We cache them server-side so repeated map loads don't hammer the FAA, and
+# so the chat agent's `airspace_lookup` tool can answer point queries from
+# memory in microseconds. SUA + Class are updated on the FAA's 56-day cycle;
+# TFRs are dynamic so we re-pull every 30 minutes.
+FAA_DATASETS: dict[str, dict[str, Any]] = {
+    "sua": {
+        "url": (
+            "https://services6.arcgis.com/ssFJjBXIUyZDrSYZ/ArcGIS/rest/"
+            "services/Special_Use_Airspace/FeatureServer/0/query"
+        ),
+        "params": {
+            "where": "1=1",
+            "outFields": "*",
+            "f": "geojson",
+            "resultRecordCount": 4000,
+        },
+        "ttl_s": 24 * 3600,
+        "label": "Special Use Airspace",
+    },
+    "classes": {
+        # The Class_Airspace layer holds 6,000+ polygons and the FAA's
+        # ArcGIS instance is *catastrophically* slow on `IN` queries (>2 min)
+        # even with trimmed outFields, but a single-value `=` query returns
+        # in ~10s. So we ask in parallel for each class we care about and
+        # merge the results in fetch_airspace(). Class E is intentionally
+        # skipped — it's 4,300+ polygons and ruins the chart.
+        "url": (
+            "https://services6.arcgis.com/ssFJjBXIUyZDrSYZ/ArcGIS/rest/"
+            "services/Class_Airspace/FeatureServer/0/query"
+        ),
+        "fanout": [
+            {"where": "CLASS='B'"},
+            {"where": "CLASS='C'"},
+            {"where": "CLASS='D'"},
+            {"where": "TYPE_CODE='MODE-C'"},
+        ],
+        "params": {
+            "outFields": "TYPE_CODE,CLASS,LOCAL_TYPE,IDENT,ICAO_ID,NAME,"
+                          "UPPER_VAL,UPPER_UOM,UPPER_CODE,"
+                          "LOWER_VAL,LOWER_UOM,LOWER_CODE",
+            "f": "geojson",
+            "resultRecordCount": 2000,
+        },
+        "ttl_s": 24 * 3600,
+        "label": "Class Airspace",
+    },
+    "tfrs": {
+        "url": "https://tfr.faa.gov/geoserver/TFR/ows",
+        "params": {
+            "service": "WFS",
+            "version": "1.1.0",
+            "request": "GetFeature",
+            "typeName": "TFR:V_TFR_LOC",
+            "maxFeatures": 500,
+            "outputFormat": "application/json",
+        },
+        "ttl_s": 30 * 60,
+        "label": "Temporary Flight Restrictions",
+    },
+}
+_airspace_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+_airspace_locks: dict[str, asyncio.Lock] = {k: asyncio.Lock() for k in FAA_DATASETS}
+
 
 # ── Airport dataset ─────────────────────────────────────────────────────────
 
@@ -584,13 +649,203 @@ async def call_openclaw_agent(
 # ── App + lifespan ──────────────────────────────────────────────────────────
 
 
+async def _fetch_one(url: str, params: dict[str, Any], timeout: float = 90.0) -> dict[str, Any]:
+    r = await _http.get(url, params=params, timeout=timeout)
+    r.raise_for_status()
+    data = r.json()
+    if "features" not in data:
+        data = {"type": "FeatureCollection", "features": data.get("features", [])}
+    data.pop("crs", None)
+    return data
+
+
+async def fetch_airspace(name: str) -> dict[str, Any]:
+    """Return cached GeoJSON for a FAA dataset, refreshing past TTL.
+
+    For datasets with a `fanout` list, we issue one upstream request per
+    fanout entry in parallel and merge the FeatureCollections. This is the
+    workaround for FAA layers where `IN`/`OR` queries time out but
+    single-value `=` queries are quick.
+    """
+    spec = FAA_DATASETS.get(name)
+    if spec is None:
+        raise KeyError(name)
+    if _http is None:
+        raise RuntimeError("HTTP client not initialised")
+    async with _airspace_locks[name]:
+        cached = _airspace_cache.get(name)
+        if cached and (time.time() - cached[0]) < spec["ttl_s"]:
+            return cached[1]
+        try:
+            base = dict(spec.get("params", {}))
+            fanout = spec.get("fanout")
+            if fanout:
+                # Tolerate per-shard failures — the FAA endpoint is flaky on
+                # certain class queries and we'd rather show a partial map
+                # than nothing. Each shard gets a generous timeout because
+                # individual queries have been observed to take 30-45s.
+                results = await asyncio.gather(
+                    *[_fetch_one(spec["url"], {**base, **shard}) for shard in fanout],
+                    return_exceptions=True,
+                )
+                merged_features: list[dict[str, Any]] = []
+                ok_count = 0
+                for s in results:
+                    if isinstance(s, Exception):
+                        continue
+                    merged_features.extend(s.get("features") or [])
+                    ok_count += 1
+                if ok_count == 0:
+                    raise results[0] if isinstance(results[0], Exception) else \
+                        RuntimeError("all fanout shards failed")
+                data = {"type": "FeatureCollection", "features": merged_features}
+            else:
+                data = await _fetch_one(spec["url"], base)
+        except httpx.HTTPError as exc:
+            if cached:
+                # Stale-but-correct beats an outage on the chart.
+                return cached[1]
+            raise HTTPException(status_code=502, detail=f"upstream error: {exc}") from exc
+        _airspace_cache[name] = (time.time(), data)
+        return data
+
+
+def _polygon_bbox(coords: list[Any]) -> tuple[float, float, float, float] | None:
+    """Return (minLon, minLat, maxLon, maxLat) for any GeoJSON polygon ring set."""
+    if not coords:
+        return None
+    minLon = minLat = float("inf")
+    maxLon = maxLat = float("-inf")
+
+    def walk(arr: list[Any]) -> None:
+        nonlocal minLon, minLat, maxLon, maxLat
+        for item in arr:
+            if isinstance(item, list) and item and isinstance(item[0], (int, float)):
+                lon, lat = item[0], item[1]
+                if lon < minLon: minLon = lon
+                if lon > maxLon: maxLon = lon
+                if lat < minLat: minLat = lat
+                if lat > maxLat: maxLat = lat
+            elif isinstance(item, list):
+                walk(item)
+
+    walk(coords)
+    if minLon == float("inf"):
+        return None
+    return (minLon, minLat, maxLon, maxLat)
+
+
+def _ring_contains(ring: list[list[float]], lat: float, lon: float) -> bool:
+    """Standard ray-casting point-in-polygon test (longitude=x, latitude=y)."""
+    inside = False
+    n = len(ring)
+    j = n - 1
+    for i in range(n):
+        xi, yi = ring[i][0], ring[i][1]
+        xj, yj = ring[j][0], ring[j][1]
+        if ((yi > lat) != (yj > lat)) and (
+            lon < (xj - xi) * (lat - yi) / ((yj - yi) or 1e-12) + xi
+        ):
+            inside = not inside
+        j = i
+    return inside
+
+
+def _feature_contains(feature: dict[str, Any], lat: float, lon: float) -> bool:
+    geom = feature.get("geometry") or {}
+    gtype = geom.get("type")
+    coords = geom.get("coordinates") or []
+    if gtype == "Polygon":
+        rings = [coords]
+    elif gtype == "MultiPolygon":
+        rings = coords
+    else:
+        return False
+    for poly in rings:
+        if not poly:
+            continue
+        if _ring_contains(poly[0], lat, lon):
+            # A point inside any hole disqualifies it.
+            for hole in poly[1:]:
+                if _ring_contains(hole, lat, lon):
+                    return False
+            return True
+    return False
+
+
+def _feature_within_radius(feature: dict[str, Any], lat: float, lon: float,
+                            radius_km: float) -> bool:
+    """Cheap: does the feature's bbox come within radius_km of the point?"""
+    bb = _polygon_bbox((feature.get("geometry") or {}).get("coordinates") or [])
+    if not bb:
+        return False
+    minLon, minLat, maxLon, maxLat = bb
+    # Clamp the point to the bbox and measure distance to that corner.
+    clampedLon = max(minLon, min(maxLon, lon))
+    clampedLat = max(minLat, min(maxLat, lat))
+    return haversine_km(lat, lon, clampedLat, clampedLon) <= radius_km
+
+
+def _summarize(feature: dict[str, Any], dataset: str) -> dict[str, Any]:
+    """Flatten feature properties into a chat-friendly card."""
+    p = feature.get("properties") or {}
+    out: dict[str, Any] = {"dataset": dataset}
+    if dataset in ("sua", "classes"):
+        out["name"] = p.get("NAME") or p.get("LOCAL_TYPE") or p.get("TYPE_CODE")
+        out["type"] = p.get("TYPE_CODE")
+        out["class"] = p.get("CLASS")
+        upper = p.get("UPPER_VAL")
+        upper_uom = p.get("UPPER_UOM") or "FT"
+        upper_code = p.get("UPPER_CODE") or ""
+        lower = p.get("LOWER_VAL")
+        lower_uom = p.get("LOWER_UOM") or "FT"
+        lower_code = p.get("LOWER_CODE") or ""
+        if upper is not None:
+            out["upper"] = f"{upper} {upper_uom} {upper_code}".strip()
+        if lower is not None:
+            out["lower"] = f"{lower} {lower_uom} {lower_code}".strip()
+        if p.get("CITY"):
+            out["location"] = ", ".join(x for x in [p.get("CITY"), p.get("STATE")] if x)
+        if p.get("TIMESOFUSE"):
+            out["times_of_use"] = p.get("TIMESOFUSE")
+    elif dataset == "tfrs":
+        out["name"] = p.get("TITLE") or p.get("NOTAM_KEY")
+        out["state"] = p.get("STATE")
+        out["notam"] = p.get("NOTAM_KEY")
+        if p.get("LAST_MODIFICATION_DATETIME"):
+            out["updated"] = p.get("LAST_MODIFICATION_DATETIME")
+    return out
+
+
+async def _prewarm_airspace() -> None:
+    """Populate the FAA cache at boot so the first browser toggle is fast.
+
+    The Class_Airspace upstream is genuinely slow (60–120s cold) and the
+    `openshell forward` between host and sandbox times out at 30s, so we
+    do this work once at startup. Failures are logged and swallowed —
+    the per-endpoint handlers will retry on demand if the cache is empty.
+    """
+    for name in FAA_DATASETS:
+        try:
+            await fetch_airspace(name)
+        except Exception as exc:
+            print(f"[prewarm] {name}: {exc!r}")
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     global _http
     _http = httpx.AsyncClient(http2=False)
+    # Kick off prewarm in the background so app startup isn't blocked.
+    prewarm_task = asyncio.create_task(_prewarm_airspace())
     try:
         yield
     finally:
+        prewarm_task.cancel()
+        try:
+            await prewarm_task
+        except (asyncio.CancelledError, Exception):
+            pass
         await _http.aclose()
         _http = None
 
@@ -666,6 +921,65 @@ async def api_airport(code: str):
     if a is None:
         raise HTTPException(status_code=404, detail="airport not found")
     return a
+
+
+@app.get("/api/airspace/lookup")
+async def api_airspace_lookup(
+    lat: float = Query(..., ge=-90, le=90),
+    lon: float = Query(..., ge=-180, le=180),
+    radius_km: float = Query(default=50.0, gt=0, le=2000),
+    datasets: str = Query(default="sua,tfrs"),
+) -> dict[str, Any]:
+    """What airspace restrictions are at or near this point?
+
+    Used by the OpenClaw chat agent when it's reasoning about a specific
+    flight or airport ("is N12345 cutting through restricted airspace?").
+    Returns two buckets:
+      - `containing`: features whose polygons contain the point
+      - `nearby`:     features whose bbox is within `radius_km`
+    """
+    wanted = {d.strip() for d in datasets.split(",") if d.strip()}
+    unknown = wanted - set(FAA_DATASETS)
+    if unknown:
+        raise HTTPException(400, f"unknown datasets: {sorted(unknown)}")
+    containing: list[dict[str, Any]] = []
+    nearby: list[dict[str, Any]] = []
+    for name in wanted:
+        try:
+            data = await fetch_airspace(name)
+        except HTTPException:
+            continue
+        for feat in data.get("features", []):
+            if _feature_contains(feat, lat, lon):
+                containing.append(_summarize(feat, name))
+            elif _feature_within_radius(feat, lat, lon, radius_km):
+                nearby.append(_summarize(feat, name))
+    # Cap the response size so the LLM context stays reasonable.
+    return {
+        "lat": lat, "lon": lon, "radius_km": radius_km,
+        "containing": containing[:50],
+        "nearby": nearby[:50],
+        "counts": {"containing": len(containing), "nearby": len(nearby)},
+    }
+
+
+@app.get("/api/airspace/{name}")
+async def api_airspace(name: str) -> JSONResponse:
+    """Cached GeoJSON proxy for one of the FAA datasets."""
+    if name not in FAA_DATASETS:
+        raise HTTPException(404, f"unknown dataset '{name}'. "
+                                  f"Try one of: {sorted(FAA_DATASETS)}")
+    data = await fetch_airspace(name)
+    cached = _airspace_cache.get(name)
+    age = int(time.time() - cached[0]) if cached else 0
+    return JSONResponse(
+        content=data,
+        headers={
+            "Cache-Control": f"public, max-age={max(60, FAA_DATASETS[name]['ttl_s'] - age)}",
+            "X-Dataset-Label": FAA_DATASETS[name]["label"],
+            "X-Dataset-Age-S": str(age),
+        },
+    )
 
 
 @app.get("/api/analyze")

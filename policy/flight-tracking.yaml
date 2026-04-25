@@ -5,6 +5,8 @@
 # The sandbox-side FastAPI server (server.py) needs outbound access to:
 #   - opensky-network.org:443        (live aircraft state vectors)
 #   - auth.opensky-network.org:443   (OAuth2 client_credentials token mint)
+#   - services6.arcgis.com:443       (FAA AIS Special Use + Class airspace)
+#   - tfr.faa.gov:443                (FAA Temporary Flight Restrictions WFS)
 #
 # Inference traffic (api -> Nemotron) is already governed by OpenShell's
 # gateway-managed inference route configured via `openshell inference set`,
@@ -37,6 +39,21 @@ network_policies:
         tls: terminate
         rules:
           - allow: { method: POST, path: "/auth/realms/opensky-network/protocol/openid-connect/token" }
+      - host: services6.arcgis.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        tls: terminate
+        rules:
+          - allow: { method: GET, path: "/ssFJjBXIUyZDrSYZ/ArcGIS/rest/services/Special_Use_Airspace/FeatureServer/0/query*" }
+          - allow: { method: GET, path: "/ssFJjBXIUyZDrSYZ/ArcGIS/rest/services/Class_Airspace/FeatureServer/0/query*" }
+      - host: tfr.faa.gov
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        tls: terminate
+        rules:
+          - allow: { method: GET, path: "/geoserver/TFR/ows*" }
     binaries:
       - { path: /usr/bin/python3 }
       - { path: /usr/bin/python3.11 }

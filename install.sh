@@ -159,6 +159,23 @@ desired = {
                            'path': '/auth/realms/opensky-network/protocol/openid-connect/token'}},
             ],
         },
+        {
+            'host': 'services6.arcgis.com', 'port': 443, 'protocol': 'rest',
+            'tls': 'terminate', 'enforcement': 'enforce',
+            'rules': [
+                {'allow': {'method': 'GET',
+                           'path': '/ssFJjBXIUyZDrSYZ/ArcGIS/rest/services/Special_Use_Airspace/FeatureServer/0/query*'}},
+                {'allow': {'method': 'GET',
+                           'path': '/ssFJjBXIUyZDrSYZ/ArcGIS/rest/services/Class_Airspace/FeatureServer/0/query*'}},
+            ],
+        },
+        {
+            'host': 'tfr.faa.gov', 'port': 443, 'protocol': 'rest',
+            'tls': 'terminate', 'enforcement': 'enforce',
+            'rules': [
+                {'allow': {'method': 'GET', 'path': '/geoserver/TFR/ows*'}},
+            ],
+        },
     ],
     'binaries': [
         {'path': '/usr/bin/python3'},

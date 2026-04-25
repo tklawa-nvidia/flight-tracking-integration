@@ -33,6 +33,8 @@ GET  /api/flights?bbox=west,south,east,north
 GET  /api/airports?bbox=...&limit=N
 GET  /api/airport/{IATA_or_ICAO}
 GET  /api/analyze?airport=IAD&radius_km=80
+GET  /api/airspace/{sua|classes|tfrs}                       # full GeoJSON FeatureCollection
+GET  /api/airspace/lookup?lat=...&lon=...&radius_km=50&datasets=sua,tfrs
 ```
 
 ### Write (drives the map for any connected browsers)
@@ -40,7 +42,7 @@ GET  /api/analyze?airport=IAD&radius_km=80
 ```
 POST /api/map/goto       {"target":"IAD","zoom":9}
 POST /api/map/arcs       {"airport":"IAD","radius_km":80}
-POST /api/map/layer      {"layer":"arcs","visible":true}     # layer ∈ {flights, airports, arcs, trails}
+POST /api/map/layer      {"layer":"arcs","visible":true}     # layer ∈ {flights, airports, arcs, trails, sua, classes, tfrs, weather}
 POST /api/map/highlight  {"flight":"UAL123" | "a1b2c3"}      # callsign or ICAO24
 POST /api/map/command    {"type":"...","payload":{...}}      # generic broadcast
 ```
@@ -59,6 +61,41 @@ curl -s "http://127.0.0.1:18890/api/analyze?airport=IAD&radius_km=80"
 Then summarise the analysis JSON back to the user in 3–5 short bullets:
 total airborne, vertical-mode mix (climb/cruise/descent), top countries of
 origin, any notable squawks (7500/7600/7700).
+
+## Airspace reasoning
+
+The map can render three FAA AIS layers: Special Use Airspace (`sua`),
+Class B/C/D shells (`classes`), and active Temporary Flight Restrictions
+(`tfrs`). All three are pulled through `/api/airspace/{name}` and cached
+server-side; you don't need to touch the FAA endpoints directly.
+
+When the user asks anything like "any restricted airspace near KIAD?",
+"is N12345 routing through a TFR?", or "what's that pulsing red blob
+near Vegas?", call `/api/airspace/lookup`:
+
+```bash
+# what's at or near KIAD?
+curl -s "http://127.0.0.1:18890/api/airspace/lookup?lat=38.94&lon=-77.46&radius_km=80"
+
+# does the user want to see SUAs while you analyse them?
+curl -sX POST http://127.0.0.1:18890/api/map/layer \
+     -H 'Content-Type: application/json' \
+     -d '{"layer":"sua","visible":true}'
+```
+
+The lookup response has two buckets:
+- `containing` — features whose polygon contains the point (the aircraft
+  or airport is *inside* this airspace). Mention these first.
+- `nearby`     — features whose bounding box is within `radius_km`. Use
+  these to flag hazards the user is approaching.
+
+Each entry includes `name`, `type` (P=Prohibited, R=Restricted, W=Warning,
+A=Alert, M=MOA, N=National Security Area), altitude floor/ceiling, and
+times-of-use when published. Respect those: a restricted area that's
+"0800-2200 DAILY" is only relevant inside that window.
+
+When you describe a TFR, surface its NOTAM key so the user can look it up
+on tfr.faa.gov.
 
 ## bbox convention
 

@@ -12,6 +12,7 @@ const {
   ArcLayer,
   TripsLayer,
   PathLayer,
+  GeoJsonLayer,
   FlyToInterpolator,
   TextLayer,
 } = deck;
@@ -19,7 +20,8 @@ const {
 // Loud sanity check — if deck.gl's UMD bundle ever drops one of these
 // exports we'll know immediately rather than silently failing to render.
 for (const [name, ref] of Object.entries({
-  MapboxOverlay, ScatterplotLayer, IconLayer, ArcLayer, TripsLayer, PathLayer, TextLayer,
+  MapboxOverlay, ScatterplotLayer, IconLayer, ArcLayer, TripsLayer, PathLayer,
+  GeoJsonLayer, TextLayer,
 })) {
   if (!ref) console.error(`deck.gl export missing: ${name}`);
 }
@@ -45,7 +47,19 @@ const state = {
     trails: false,
     paths: true,         // breadcrumb paths shown automatically when zoomed in
     weather: false,
+    sua: false,          // FAA Special Use Airspace
+    classes: false,      // Class B/C/D shells
+    tfrs: true,          // Temporary Flight Restrictions (default on — they're rare and important)
   },
+  airspace: {
+    sua: null,           // GeoJSON FeatureCollection or null until fetched
+    classes: null,
+    tfrs: null,
+    fetchedAt: { sua: 0, classes: 0, tfrs: 0 },
+  },
+  // pulsePhase advances 0..2π in the animate() loop and drives the
+  // breathing alpha/width on prohibited/restricted/active airspace strokes.
+  pulsePhase: 0,
   bbox: null,
   lastFetchedAt: 0,
   inFlight: false,
@@ -227,12 +241,161 @@ function renderPos(f, nowMs) {
   return [dr[0] + f.correction[0] * decay, dr[1] + f.correction[1] * decay];
 }
 
+// ── Airspace styling ─────────────────────────────────────────────────────
+// Color palette tuned for the dark basemap. We keep fills very low alpha so
+// they read as "hint" tint and rely on bright strokes for legibility. Types
+// in PULSING_TYPES get a breathing stroke alpha + width modulated by
+// state.pulsePhase to draw the eye to active hazards.
+//
+// SUA TYPE_CODE values (per FAA AIS docs):
+//   P = Prohibited   R = Restricted   W = Warning   A = Alert
+//   M = MOA          N = National Security Area     C = CFA
+const SUA_STYLE = {
+  P: { fill: [255,  64,  76, 30], stroke: [255,  96, 110, 230], pulse: true },
+  R: { fill: [255, 124,  64, 25], stroke: [255, 156,  88, 220], pulse: true },
+  W: { fill: [255, 196,  64, 22], stroke: [255, 208, 110, 200], pulse: false },
+  A: { fill: [120, 220, 140, 18], stroke: [160, 240, 180, 200], pulse: false },
+  M: { fill: [240, 220,  88, 20], stroke: [255, 235, 110, 200], pulse: false },
+  N: { fill: [200, 100, 255, 22], stroke: [220, 140, 255, 220], pulse: true },
+  C: { fill: [180, 220, 255, 18], stroke: [200, 230, 255, 180], pulse: false },
+  _: { fill: [180, 200, 220, 16], stroke: [200, 220, 240, 180], pulse: false },
+};
+
+// CLASS airspace shells. Class B = magenta, C = blue, D = teal, MODE-C = neon.
+// FAA AIS encodes the actual class in `properties.CLASS` (B/C/D/E) and the
+// shell type in `TYPE_CODE` ("CLASS" or "MODE-C"). We key off CLASS first so
+// the colour matches the chart symbology pilots already know.
+const CLASS_STYLE = {
+  B: { fill: [233, 100, 200, 14], stroke: [255, 124, 220, 200] },
+  C: { fill: [120, 170, 255, 14], stroke: [148, 188, 255, 200] },
+  D: { fill: [120, 230, 220, 14], stroke: [150, 240, 230, 200] },
+  E: { fill: [180, 200, 220, 10], stroke: [200, 220, 240, 140] },
+  'MODE-C': { fill: [255, 180, 100,  8], stroke: [255, 210, 130, 140] },
+  _: { fill: [180, 200, 220,  8], stroke: [200, 220, 240, 130] },
+};
+
+// TFRs always pulse — they're hazardous and dynamic by definition.
+const TFR_STYLE = {
+  fill: [255, 64, 96, 50],
+  stroke: [255, 100, 130, 240],
+  pulse: true,
+};
+
+function suaStyleFor(feature) {
+  const code = (feature?.properties?.TYPE_CODE || '').trim().toUpperCase();
+  return SUA_STYLE[code] || SUA_STYLE._;
+}
+
+function classStyleFor(feature) {
+  const p = feature?.properties || {};
+  const t = (p.TYPE_CODE || '').trim().toUpperCase();
+  if (t === 'MODE-C') return CLASS_STYLE['MODE-C'];
+  const c = (p.CLASS || '').trim().toUpperCase();
+  return CLASS_STYLE[c] || CLASS_STYLE._;
+}
+
+// Pulse intensity in [0..1], driven by state.pulsePhase. We map it to two
+// channels: a stroke-width multiplier (1.0..1.8) and an alpha multiplier
+// (0.65..1.0). Both are floor-clamped so non-pulsing styles stay legible.
+function pulseWidth(base) { return base * (1 + 0.4 * (1 + Math.sin(state.pulsePhase)) / 2); }
+function pulseAlpha(a)    { return Math.round(a * (0.65 + 0.35 * (1 + Math.sin(state.pulsePhase)) / 2)); }
+
 // ── Layer assembly ───────────────────────────────────────────────────────
 
 function buildLayers() {
   const layers = [];
   const flights = Array.from(state.flights.values());
   const zoom = state.map ? state.map.getZoom() : 3;
+
+  // ── Airspace (rendered first so it sits below flights/airports) ────────
+  if (state.layerVisibility.classes && state.airspace.classes) {
+    layers.push(
+      new GeoJsonLayer({
+        id: 'airspace-classes',
+        data: state.airspace.classes,
+        stroked: true,
+        filled: true,
+        pickable: true,
+        getFillColor: (f) => classStyleFor(f).fill,
+        getLineColor: (f) => classStyleFor(f).stroke,
+        getLineWidth: 1.5,
+        lineWidthUnits: 'pixels',
+        lineWidthMinPixels: 1,
+      })
+    );
+  }
+
+  if (state.layerVisibility.sua && state.airspace.sua) {
+    // Two passes so the static fills don't churn while the strokes pulse:
+    //   1) filled polygons, never re-evaluated per frame
+    //   2) animated stroke on the same data, with pulsePhase as the only
+    //      updateTrigger so deck.gl recomputes line attrs only.
+    layers.push(
+      new GeoJsonLayer({
+        id: 'airspace-sua-fill',
+        data: state.airspace.sua,
+        stroked: false,
+        filled: true,
+        pickable: true,
+        getFillColor: (f) => suaStyleFor(f).fill,
+      })
+    );
+    layers.push(
+      new GeoJsonLayer({
+        id: 'airspace-sua-stroke',
+        data: state.airspace.sua,
+        stroked: true,
+        filled: false,
+        pickable: false,
+        getLineColor: (f) => {
+          const s = suaStyleFor(f);
+          if (!s.pulse) return s.stroke;
+          const [r, g, b, a] = s.stroke;
+          return [r, g, b, pulseAlpha(a)];
+        },
+        getLineWidth: (f) => (suaStyleFor(f).pulse ? pulseWidth(1.6) : 1.4),
+        lineWidthUnits: 'pixels',
+        lineWidthMinPixels: 1,
+        updateTriggers: {
+          getLineColor: state.pulsePhase,
+          getLineWidth: state.pulsePhase,
+        },
+      })
+    );
+  }
+
+  if (state.layerVisibility.tfrs && state.airspace.tfrs) {
+    layers.push(
+      new GeoJsonLayer({
+        id: 'airspace-tfrs-fill',
+        data: state.airspace.tfrs,
+        stroked: false,
+        filled: true,
+        pickable: true,
+        getFillColor: TFR_STYLE.fill,
+      })
+    );
+    layers.push(
+      new GeoJsonLayer({
+        id: 'airspace-tfrs-stroke',
+        data: state.airspace.tfrs,
+        stroked: true,
+        filled: false,
+        pickable: false,
+        getLineColor: () => {
+          const [r, g, b, a] = TFR_STYLE.stroke;
+          return [r, g, b, pulseAlpha(a)];
+        },
+        getLineWidth: () => pulseWidth(2.0),
+        lineWidthUnits: 'pixels',
+        lineWidthMinPixels: 1.5,
+        updateTriggers: {
+          getLineColor: state.pulsePhase,
+          getLineWidth: state.pulsePhase,
+        },
+      })
+    );
+  }
 
   if (state.layerVisibility.airports && state.airportsInView.length) {
     layers.push(
@@ -403,14 +566,18 @@ function refreshLayers() {
 
 let _lastRenderTs = 0;
 const RENDER_INTERVAL_MS = 50; // ~20 fps
+const PULSE_PERIOD_MS = 2400;  // breathing cycle for restricted/active airspace
 
 function animate(nowTs) {
   if (nowTs - _lastRenderTs >= RENDER_INTERVAL_MS) {
-    if (state.layerVisibility.flights && state.flights.size > 0) {
-      refreshLayers();
-    } else if (state.layerVisibility.trails && state.selectedFlightId) {
-      refreshLayers();
-    }
+    state.pulsePhase = (nowTs / PULSE_PERIOD_MS) * Math.PI * 2;
+    const lv = state.layerVisibility;
+    const needRefresh =
+      (lv.flights && state.flights.size > 0) ||
+      (lv.trails && state.selectedFlightId) ||
+      (lv.sua && state.airspace.sua) ||
+      (lv.tfrs && state.airspace.tfrs);
+    if (needRefresh) refreshLayers();
     _lastRenderTs = nowTs;
   }
   requestAnimationFrame(animate);
@@ -423,11 +590,45 @@ function handleDeckClick(info) {
     closeDrawer();
     return;
   }
-  if (info.layer && info.layer.id === 'flights') {
+  const lid = info.layer?.id || '';
+  if (lid === 'flights') {
     selectFlight(info.object);
-  } else if (info.layer && (info.layer.id === 'airports' || info.layer.id === 'airport-labels')) {
+  } else if (lid === 'airports' || lid === 'airport-labels') {
     selectAirport(info.object);
+  } else if (lid.startsWith('airspace-')) {
+    selectAirspace(info.object, lid);
   }
+}
+
+function selectAirspace(feature, layerId) {
+  const p = feature?.properties || {};
+  const isSua = layerId.startsWith('airspace-sua');
+  const isClass = layerId === 'airspace-classes';
+  const isTfr = layerId.startsWith('airspace-tfrs');
+  const eyebrow = isTfr ? 'TFR' : isClass ? 'Class Airspace' : 'Special Use Airspace';
+  const fmtAlt = (val, uom, code) =>
+    val != null ? `${val} ${uom || 'FT'} ${code || ''}`.trim() : '—';
+  const grid = [];
+  if (isTfr) {
+    grid.push(['Title', p.TITLE || '—']);
+    grid.push(['NOTAM', p.NOTAM_KEY || '—']);
+    grid.push(['State', p.STATE || '—']);
+    if (p.LAST_MODIFICATION_DATETIME) grid.push(['Updated', p.LAST_MODIFICATION_DATETIME]);
+  } else {
+    grid.push(['Designator', p.NAME || p.IDENT || '—']);
+    if (p.LOCAL_TYPE || p.TYPE_CODE) grid.push(['Type', p.LOCAL_TYPE || p.TYPE_CODE]);
+    if (p.CLASS) grid.push(['Class', p.CLASS]);
+    grid.push(['Ceiling', fmtAlt(p.UPPER_VAL, p.UPPER_UOM, p.UPPER_CODE)]);
+    grid.push(['Floor', fmtAlt(p.LOWER_VAL, p.LOWER_UOM, p.LOWER_CODE)]);
+    if (p.CITY || p.STATE) grid.push(['Location', [p.CITY, p.STATE].filter(Boolean).join(', ')]);
+    if (p.TIMESOFUSE) grid.push(['Times of use', p.TIMESOFUSE]);
+    if (p.CONT_AGENT) grid.push(['Authority', p.CONT_AGENT]);
+  }
+  openDrawer({
+    eyebrow,
+    title: p.NAME || p.TITLE || p.IDENT || 'Airspace',
+    grid: grid.length ? grid : [['Properties', JSON.stringify(p).slice(0, 200)]],
+  });
 }
 
 function selectFlight(f) {
@@ -908,6 +1109,81 @@ function wireLayerToggles() {
       }
     });
   }
+  // Airspace toggles
+  for (const [key, label] of [
+    ['sua', 'Restricted airspace'],
+    ['classes', 'Class B/C/D'],
+    ['tfrs', 'Active TFRs'],
+  ]) {
+    const el = document.getElementById(`layer-${key}`);
+    if (!el) continue;
+    el.addEventListener('change', async (e) => {
+      state.layerVisibility[key] = e.target.checked;
+      if (e.target.checked) {
+        try {
+          await ensureAirspace(key);
+          const fc = state.airspace[key];
+          const n = fc?.features?.length ?? 0;
+          toast(`${label}: ${n} feature${n === 1 ? '' : 's'} loaded`);
+        } catch (err) {
+          console.warn(`failed to load airspace ${key}`, err);
+          toast(`${label}: failed to load`);
+          e.target.checked = false;
+          state.layerVisibility[key] = false;
+        }
+      }
+      refreshLayers();
+    });
+  }
+}
+
+// ── Tab switcher ─────────────────────────────────────────────────────────
+function wireTabs() {
+  const buttons = document.querySelectorAll('.tab-btn');
+  const panels = {
+    layers: document.getElementById('tab-layers'),
+    nemoclaw: document.getElementById('tab-nemoclaw'),
+    airspace: document.getElementById('tab-airspace'),
+  };
+  buttons.forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const target = btn.dataset.tab;
+      buttons.forEach((b) => {
+        const active = b.dataset.tab === target;
+        b.classList.toggle('active', active);
+        b.setAttribute('aria-selected', active ? 'true' : 'false');
+      });
+      for (const [k, panel] of Object.entries(panels)) {
+        if (!panel) continue;
+        const active = k === target;
+        panel.classList.toggle('active', active);
+        if (active) panel.removeAttribute('hidden');
+        else panel.setAttribute('hidden', '');
+      }
+      // Chat needs its log scrolled to bottom every time it becomes visible
+      // (otherwise long answers received while the tab was hidden look cut off).
+      if (target === 'nemoclaw') {
+        const log = document.getElementById('chat-log');
+        if (log) log.scrollTop = log.scrollHeight;
+      }
+    });
+  });
+}
+
+// ── Airspace (FAA AIS) ───────────────────────────────────────────────────
+// We pull GeoJSON via the local /api/airspace/* proxies which cache the
+// upstream FAA endpoints. SUA + Class refresh hourly client-side; TFRs are
+// dynamic so we re-fetch every five minutes.
+const AIRSPACE_TTL_MS = { sua: 3600 * 1000, classes: 3600 * 1000, tfrs: 5 * 60 * 1000 };
+
+async function ensureAirspace(name) {
+  const now = Date.now();
+  const fetched = state.airspace.fetchedAt[name] || 0;
+  if (state.airspace[name] && (now - fetched) < AIRSPACE_TTL_MS[name]) return;
+  const r = await fetch(`/api/airspace/${name}`);
+  if (!r.ok) throw new Error(`airspace ${name}: HTTP ${r.status}`);
+  state.airspace[name] = await r.json();
+  state.airspace.fetchedAt[name] = now;
 }
 
 // ── Weather (RainViewer) ─────────────────────────────────────────────────
@@ -1072,7 +1348,14 @@ function handleBusMessage(msg) {
         state.layerVisibility[msg.layer] = !!msg.visible;
         const cb = document.getElementById(`layer-${msg.layer}`);
         if (cb) cb.checked = !!msg.visible;
-        refreshLayers();
+        // Airspace layers need their GeoJSON loaded before they can render.
+        if (msg.visible && ['sua', 'classes', 'tfrs'].includes(msg.layer)) {
+          ensureAirspace(msg.layer)
+            .then(refreshLayers)
+            .catch((err) => console.warn(`agent-toggled airspace ${msg.layer} failed`, err));
+        } else {
+          refreshLayers();
+        }
       }
       break;
     }
@@ -1186,6 +1469,7 @@ elChatForm.addEventListener('submit', async (e) => {
 (async function boot() {
   initMap();
   await new Promise((resolve) => state.map.once('load', resolve));
+  wireTabs();
   wireLayerToggles();
   wireLiveControls();
   connectWs();
@@ -1194,4 +1478,21 @@ elChatForm.addEventListener('submit', async (e) => {
   // Pre-warm the RainViewer manifest so the first weather toggle is instant.
   ensureWeatherManifest();
   setTimeout(weatherTick, WEATHER_REFRESH_MS);
+  // TFRs default to ON (rare + important). SUA + Class are off until the
+  // user toggles them — they're chatty and visually heavy at country zoom.
+  if (state.layerVisibility.tfrs) {
+    ensureAirspace('tfrs')
+      .then(() => {
+        const n = state.airspace.tfrs?.features?.length ?? 0;
+        if (n > 0) toast(`${n} active TFR${n === 1 ? '' : 's'} loaded`);
+        refreshLayers();
+      })
+      .catch((err) => console.warn('TFR preload failed', err));
+  }
+  // Refresh TFRs every 5 min while the page is open.
+  setInterval(() => {
+    if (state.layerVisibility.tfrs) {
+      ensureAirspace('tfrs').then(refreshLayers).catch(() => {});
+    }
+  }, 5 * 60 * 1000);
 })();

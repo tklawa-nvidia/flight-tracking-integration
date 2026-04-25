@@ -11,7 +11,7 @@
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Manrope:wght@400;500;700;800&display=swap" rel="stylesheet" />
 
   <link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/styles.css?v=10" />
+  <link rel="stylesheet" href="/static/styles.css?v=12" />
 </head>
 <body>
   <div id="app">
@@ -75,42 +75,66 @@
         </div>
       </section>
 
-      <section class="layers">
-        <div class="layers-title">Layers</div>
-        <label class="toggle"><input type="checkbox" id="layer-flights" checked /><span>Live aircraft</span></label>
-        <label class="toggle"><input type="checkbox" id="layer-airports" checked /><span>Airports</span></label>
-        <label class="toggle"><input type="checkbox" id="layer-paths" checked /><span>Flight paths <em>(zoom in)</em></span></label>
-        <label class="toggle"><input type="checkbox" id="layer-arcs" /><span>Inbound arcs</span></label>
-        <label class="toggle"><input type="checkbox" id="layer-trails" /><span>Selected trail</span></label>
-        <label class="toggle"><input type="checkbox" id="layer-weather" /><span>Weather <em>(radar + clouds)</em></span></label>
-      </section>
+      <section class="rail-tabs">
+        <div class="tab-buttons" role="tablist">
+          <button type="button" class="tab-btn active" role="tab" data-tab="layers" aria-selected="true">Layers</button>
+          <button type="button" class="tab-btn" role="tab" data-tab="nemoclaw" aria-selected="false">NemoClaw</button>
+          <button type="button" class="tab-btn" role="tab" data-tab="airspace" aria-selected="false">FAA airspace</button>
+        </div>
 
-      <section class="chat">
-        <div class="chat-title">Copilot</div>
-        <div class="chat-log" id="chat-log">
-          <div class="msg msg-bot welcome">
-            <div class="msg-content">
-              Connected to your OpenClaw agent. Ask anything — it can drive the map (try "go to IAD and analyse traffic") or just answer questions.
-            </div>
+        <div class="tab-panel active" id="tab-layers" role="tabpanel">
+          <label class="toggle"><input type="checkbox" id="layer-flights" checked /><span>Live aircraft</span></label>
+          <label class="toggle"><input type="checkbox" id="layer-airports" checked /><span>Airports</span></label>
+          <label class="toggle"><input type="checkbox" id="layer-paths" checked /><span>Flight paths <em>(zoom in)</em></span></label>
+          <label class="toggle"><input type="checkbox" id="layer-arcs" /><span>Inbound arcs</span></label>
+          <label class="toggle"><input type="checkbox" id="layer-trails" /><span>Selected trail</span></label>
+          <label class="toggle"><input type="checkbox" id="layer-weather" /><span>Weather <em>(radar + clouds)</em></span></label>
+          <div class="rail-footer">
+            Data: OpenSky Network · Airports: OpenFlights · Tiles: openfreemap.org
           </div>
         </div>
-        <div class="chat-suggestions">
-          <button class="chip" data-prompt="Go to IAD and analyse traffic">Go to IAD &amp; analyse</button>
-          <button class="chip" data-prompt="Show inbound arcs to JFK">Inbound to JFK</button>
-          <button class="chip" data-prompt="What's flying near LAX right now?">Flights near LAX</button>
-          <button class="chip" data-prompt="Any unusual squawks near LHR?">Unusual squawks LHR</button>
-        </div>
-        <form class="chat-input" id="chat-form" autocomplete="off">
-          <input type="text" id="chat-text" placeholder="Ask FlightOps…" autocomplete="off" />
-          <button type="submit" id="chat-send" aria-label="Send">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M3.4 20.6 21 12 3.4 3.4 3.3 9.8 17 12 3.3 14.2z"/></svg>
-          </button>
-        </form>
-      </section>
 
-      <footer class="rail-footer">
-        Data: OpenSky Network · Airports: OpenFlights · Tiles: openfreemap.org
-      </footer>
+        <div class="tab-panel" id="tab-nemoclaw" role="tabpanel" hidden>
+          <div class="chat">
+            <div class="chat-log" id="chat-log">
+              <div class="msg msg-bot welcome">
+                <div class="msg-content">
+                  Connected to your OpenClaw agent. Ask anything — it can drive the map (try "go to IAD and analyse traffic") or reason about FAA airspace ("any restricted airspace near KIAD?").
+                </div>
+              </div>
+            </div>
+            <div class="chat-suggestions">
+              <button class="chip" data-prompt="Go to IAD and analyse traffic">Go to IAD &amp; analyse</button>
+              <button class="chip" data-prompt="Show inbound arcs to JFK">Inbound to JFK</button>
+              <button class="chip" data-prompt="What's flying near LAX right now?">Flights near LAX</button>
+              <button class="chip" data-prompt="Any active TFRs in the Northeast?">Active TFRs NE</button>
+              <button class="chip" data-prompt="Any restricted airspace within 80 km of Las Vegas?">Restricted near LAS</button>
+            </div>
+            <form class="chat-input" id="chat-form" autocomplete="off">
+              <input type="text" id="chat-text" placeholder="Ask NemoClaw…" autocomplete="off" />
+              <button type="submit" id="chat-send" aria-label="Send">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M3.4 20.6 21 12 3.4 3.4 3.3 9.8 17 12 3.3 14.2z"/></svg>
+              </button>
+            </form>
+          </div>
+        </div>
+
+        <div class="tab-panel" id="tab-airspace" role="tabpanel" hidden>
+          <p class="tab-blurb">FAA AIS data — proxied through the sandbox and exposed to the chat agent for reasoning ("is N12345 routing through restricted airspace?").</p>
+          <label class="toggle"><input type="checkbox" id="layer-tfrs" checked /><span class="sw-tfr">Active TFRs <em>(pulsing)</em></span></label>
+          <label class="toggle"><input type="checkbox" id="layer-sua" /><span class="sw-sua">Restricted &amp; SUA</span></label>
+          <label class="toggle"><input type="checkbox" id="layer-classes" /><span class="sw-class">Class B/C/D shells</span></label>
+          <div class="legend">
+            <div><span class="dot dot-prohibited"></span>Prohibited</div>
+            <div><span class="dot dot-restricted"></span>Restricted</div>
+            <div><span class="dot dot-moa"></span>MOA</div>
+            <div><span class="dot dot-warning"></span>Warning</div>
+            <div><span class="dot dot-class-b"></span>Class B</div>
+            <div><span class="dot dot-class-c"></span>Class C</div>
+          </div>
+          <div class="rail-footer">FAA AIS · tfr.faa.gov · services6.arcgis.com</div>
+        </div>
+      </section>
     </aside>
 
     <main class="map-stage">
@@ -138,6 +162,6 @@
   <!-- Map + viz stack: load MapLibre first, then deck.gl, in classic script tags -->
   <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
   <script src="https://unpkg.com/deck.gl@9.0.38/dist.min.js"></script>
-  <script type="module" src="/static/app.js?v=10"></script>
+  <script type="module" src="/static/app.js?v=12"></script>
 </body>
 </html>
