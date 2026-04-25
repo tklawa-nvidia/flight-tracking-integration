@@ -886,6 +886,15 @@ function applyWeather() {
   //   {host}{path}/{size}/{z}/{x}/{y}/{color}/{options}.png
   // For radar:     color 4 (universal blue), options 1_1 (smooth + snow)
   // For satellite: color 0 (b/w IR), options 0_0
+  //
+  // Native RainViewer tile coverage:
+  //   - radar:     up to z=12
+  //   - satellite: up to z=8
+  // We mark `maxzoom` on the source so MapLibre overzooms (resamples the
+  // last available level) instead of hammering 404s when the user zooms
+  // past those native levels — this is what keeps the overlay visible at
+  // city-level zoom. We then taper opacity with zoom so the inevitable
+  // blur is subtle rather than washed-out.
   const size = 256;
 
   const sat = (m.satellite?.infrared || []).slice(-1)[0];
@@ -895,11 +904,23 @@ function applyWeather() {
       type: 'raster',
       tiles: [`${m.host}${sat.path}/${size}/{z}/{x}/{y}/0/0_0.png`],
       tileSize: size,
+      maxzoom: 8,
       attribution: 'Clouds: RainViewer',
     });
     state.map.addLayer({
       id, type: 'raster', source: id,
-      paint: { 'raster-opacity': 0.45 },
+      paint: {
+        'raster-opacity': [
+          'interpolate', ['linear'], ['zoom'],
+          0,  0.30,
+          5,  0.28,
+          8,  0.22,
+          12, 0.16,
+          16, 0.12,
+        ],
+        'raster-resampling': 'linear',
+        'raster-fade-duration': 200,
+      },
     });
     state.weather.layerIds.push(id);
   }
@@ -911,11 +932,24 @@ function applyWeather() {
       type: 'raster',
       tiles: [`${m.host}${radar.path}/${size}/{z}/{x}/{y}/4/1_1.png`],
       tileSize: size,
+      maxzoom: 12,
       attribution: 'Radar: RainViewer',
     });
     state.map.addLayer({
       id, type: 'raster', source: id,
-      paint: { 'raster-opacity': 0.7 },
+      paint: {
+        'raster-opacity': [
+          'interpolate', ['linear'], ['zoom'],
+          0,  0.45,
+          5,  0.42,
+          9,  0.38,
+          12, 0.32,
+          15, 0.26,
+          18, 0.22,
+        ],
+        'raster-resampling': 'linear',
+        'raster-fade-duration': 200,
+      },
     });
     state.weather.layerIds.push(id);
   }

@@ -11,10 +11,13 @@ Design notes
 - Runs entirely inside the OpenShell sandbox. The browser reaches it through
   `openshell forward start <sandbox> 0.0.0.0:18890` (the install script
   configures this).
-- OpenSky is reachable anonymously (10s cadence, bbox <= 25 sq deg). If
-  OPENSKY_USERNAME / OPENSKY_PASSWORD are set we use HTTP Basic to lift the
-  rate limit to 5s. Responses are cached briefly in-process to avoid
-  hammering the API when several browsers are open.
+- OpenSky is reachable anonymously at ~400 credits/day. If
+  OPENSKY_CLIENT_ID / OPENSKY_CLIENT_SECRET are set we run the OAuth2
+  client-credentials flow against auth.opensky-network.org and use the
+  resulting bearer token for /states/all calls — that lifts the daily
+  budget to ~4,000 credits. (HTTP Basic was removed in March 2026.)
+  Responses are cached briefly in-process to avoid hammering the API when
+  several browsers are open.
 - The chat panel does *not* call inference directly. It exec's
   `openclaw agent --json` so OpenClaw owns auth, model selection, skill
   routing, and conversation memory — exactly the way the TUI works. The
@@ -48,6 +51,15 @@ STATIC_DIR = APP_DIR / "static"
 DATA_DIR = STATIC_DIR / "data"
 
 OPENSKY_URL = "https://opensky-network.org/api/states/all"
+OPENSKY_TOKEN_URL = (
+    "https://auth.opensky-network.org/auth/realms/opensky-network/"
+    "protocol/openid-connect/token"
+)
+OPENSKY_CLIENT_ID = os.getenv("OPENSKY_CLIENT_ID", "").strip()
+OPENSKY_CLIENT_SECRET = os.getenv("OPENSKY_CLIENT_SECRET", "").strip()
+# Legacy basic-auth env vars are still read so existing installs keep
+# working, but OpenSky removed Basic auth in March 2026 — these now only
+# apply to internal forks/mirrors that still accept it.
 OPENSKY_USER = os.getenv("OPENSKY_USERNAME", "").strip()
 OPENSKY_PASS = os.getenv("OPENSKY_PASSWORD", "").strip()
 OPENSKY_CACHE_TTL = 8.0  # seconds — slightly under anonymous 10s rate limit
@@ -155,10 +167,78 @@ _cache = OpenSkyCache()
 _http: httpx.AsyncClient | None = None
 
 
-def _opensky_auth_header() -> dict[str, str]:
+class OpenSkyTokenManager:
+    """OAuth2 client_credentials token manager for the OpenSky REST API.
+
+    The /states/all endpoint accepts the bearer token issued by Keycloak at
+    auth.opensky-network.org. Tokens are short-lived (typically 30 min) so
+    we cache the current one until shortly before its `expires_in` window
+    elapses, then refresh on demand.
+    """
+
+    LEAD_SECONDS = 60  # refresh this many seconds before expiry
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._token: str | None = None
+        self._expires_at: float = 0.0
+
+    @property
+    def configured(self) -> bool:
+        return bool(OPENSKY_CLIENT_ID and OPENSKY_CLIENT_SECRET)
+
+    async def get(self) -> str | None:
+        if not self.configured:
+            return None
+        if _http is None:
+            return None
+        async with self._lock:
+            if self._token and time.time() < self._expires_at - self.LEAD_SECONDS:
+                return self._token
+            try:
+                r = await _http.post(
+                    OPENSKY_TOKEN_URL,
+                    data={
+                        "grant_type": "client_credentials",
+                        "client_id": OPENSKY_CLIENT_ID,
+                        "client_secret": OPENSKY_CLIENT_SECRET,
+                    },
+                    timeout=15.0,
+                )
+            except httpx.RequestError as exc:
+                # Don't crash the request — fall back to anonymous and let
+                # the caller decide whether to surface the issue.
+                return None
+            if r.status_code != 200:
+                return None
+            try:
+                payload = r.json()
+            except Exception:
+                return None
+            self._token = payload.get("access_token")
+            ttl = float(payload.get("expires_in", 1800))
+            self._expires_at = time.time() + ttl
+            return self._token
+
+
+_opensky_tokens = OpenSkyTokenManager()
+
+
+async def _opensky_auth_header() -> dict[str, str]:
+    """Return the appropriate Authorization header for the OpenSky API.
+
+    Order of preference:
+      1. OAuth2 client_credentials (the only auth OpenSky supports as of
+         March 2026 for new installs).
+      2. Legacy HTTP Basic, kept for backwards compatibility with internal
+         mirrors / older deployments. Only used if OAuth2 isn't configured.
+    """
+    token = await _opensky_tokens.get()
+    if token:
+        return {"Authorization": f"Bearer {token}"}
     if OPENSKY_USER and OPENSKY_PASS:
-        token = base64.b64encode(f"{OPENSKY_USER}:{OPENSKY_PASS}".encode()).decode()
-        return {"Authorization": f"Basic {token}"}
+        encoded = base64.b64encode(f"{OPENSKY_USER}:{OPENSKY_PASS}".encode()).decode()
+        return {"Authorization": f"Basic {encoded}"}
     return {}
 
 
@@ -220,7 +300,7 @@ async def fetch_flights(
         r = await _http.get(
             OPENSKY_URL,
             params=params,
-            headers=_opensky_auth_header(),
+            headers=await _opensky_auth_header(),
             timeout=15.0,
         )
     except httpx.HTTPError as exc:
@@ -524,10 +604,17 @@ app = FastAPI(
 
 @app.get("/api/health")
 async def health() -> dict[str, Any]:
+    if _opensky_tokens.configured:
+        opensky_auth = "oauth2"
+    elif OPENSKY_USER and OPENSKY_PASS:
+        opensky_auth = "basic"
+    else:
+        opensky_auth = "anonymous"
     return {
         "ok": True,
         "airports_loaded": len(AIRPORTS),
-        "opensky_authenticated": bool(OPENSKY_USER and OPENSKY_PASS),
+        "opensky_auth": opensky_auth,
+        "opensky_authenticated": opensky_auth != "anonymous",
         "openclaw_bin": OPENCLAW_BIN,
         "openclaw_available": Path(OPENCLAW_BIN).exists(),
         "openclaw_agent": OPENCLAW_AGENT,

@@ -50,9 +50,11 @@ flight-tracking-integration/
 - Inference key already configured via `nemoclaw onboard` (the installer
   pulls `endpointUrl`, `model`, and the `compatible_api_key` value out of
   `~/.nemoclaw/credentials.json` automatically).
-- Optional: an OpenSky account. Anonymous works at 10 s cadence; setting
-  `OPENSKY_USERNAME` / `OPENSKY_PASSWORD` in `~/.nemoclaw/credentials.json`
-  lifts that to 5 s.
+- Optional: an [OpenSky API client](https://opensky-network.org/manage-account)
+  (Account ▸ API client ▸ "Create new"). Anonymous use gets ~400 credits/day;
+  adding `OPENSKY_CLIENT_ID` / `OPENSKY_CLIENT_SECRET` to
+  `~/.nemoclaw/credentials.json` lifts that to ~4,000/day via OAuth2
+  client_credentials. (OpenSky removed Basic auth in March 2026.)
 
 ## Install
 

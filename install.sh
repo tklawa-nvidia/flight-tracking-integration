@@ -77,23 +77,52 @@ ok "Prerequisites OK"
 ok "Chat will route through OpenClaw (\`openclaw agent --json\`)."
 ok "OpenClaw already owns inference auth via the gateway-managed route."
 
-# Optional OpenSky basic auth (lifts rate limit from 10s -> 5s).
+# OpenSky removed Basic auth in March 2026 in favour of OAuth2 client_credentials.
+# We pull the API client id/secret from ~/.nemoclaw/credentials.json so the
+# secret never leaves the host filesystem (the install script writes a
+# permissioned flight.env into the sandbox; the file is .gitignored). The
+# legacy USERNAME/PASSWORD vars are still read for backwards compatibility
+# with internal mirrors that haven't migrated yet.
+OPENSKY_CLIENT_ID="${OPENSKY_CLIENT_ID:-}"
+OPENSKY_CLIENT_SECRET="${OPENSKY_CLIENT_SECRET:-}"
 OPENSKY_USERNAME="${OPENSKY_USERNAME:-}"
 OPENSKY_PASSWORD="${OPENSKY_PASSWORD:-}"
-if [ -z "$OPENSKY_USERNAME" ] && [ -f "$CREDS_PATH" ]; then
-  OPENSKY_USERNAME=$(python3 -c "
+if [ -f "$CREDS_PATH" ]; then
+  if [ -z "$OPENSKY_CLIENT_ID" ]; then
+    OPENSKY_CLIENT_ID=$(python3 -c "
+import json
+try: print(json.load(open('$CREDS_PATH')).get('OPENSKY_CLIENT_ID',''))
+except: pass
+" 2>/dev/null || true)
+  fi
+  if [ -z "$OPENSKY_CLIENT_SECRET" ]; then
+    OPENSKY_CLIENT_SECRET=$(python3 -c "
+import json
+try: print(json.load(open('$CREDS_PATH')).get('OPENSKY_CLIENT_SECRET',''))
+except: pass
+" 2>/dev/null || true)
+  fi
+  if [ -z "$OPENSKY_USERNAME" ]; then
+    OPENSKY_USERNAME=$(python3 -c "
 import json
 try: print(json.load(open('$CREDS_PATH')).get('OPENSKY_USERNAME',''))
 except: pass
 " 2>/dev/null || true)
-  OPENSKY_PASSWORD=$(python3 -c "
+    OPENSKY_PASSWORD=$(python3 -c "
 import json
 try: print(json.load(open('$CREDS_PATH')).get('OPENSKY_PASSWORD',''))
 except: pass
 " 2>/dev/null || true)
+  fi
 fi
-if [ -z "$OPENSKY_USERNAME" ]; then
-  info "OpenSky: anonymous (10s cadence). Set OPENSKY_USERNAME/PASSWORD to lift rate limit."
+
+if [ -n "$OPENSKY_CLIENT_ID" ] && [ -n "$OPENSKY_CLIENT_SECRET" ]; then
+  ok "OpenSky: OAuth2 client_credentials (~4,000 credits/day)"
+elif [ -n "$OPENSKY_USERNAME" ]; then
+  warn "OpenSky: legacy Basic auth — not supported by OpenSky since March 2026."
+  warn "Add OPENSKY_CLIENT_ID and OPENSKY_CLIENT_SECRET to $CREDS_PATH to upgrade."
+else
+  info "OpenSky: anonymous (~400 credits/day). Add OPENSKY_CLIENT_ID/SECRET to $CREDS_PATH for ~4,000."
 fi
 
 # ── 3. Apply network policy ─────────────────────────────────────────────
@@ -122,6 +151,15 @@ $(echo "$CURRENT_POLICY" | sed -e :a -e '/^\s*$/{$d;N;ba' -e '}')
       - allow:
           method: GET
           path: /api/states/all*
+    - host: auth.opensky-network.org
+      port: 443
+      protocol: rest
+      tls: terminate
+      enforcement: enforce
+      rules:
+      - allow:
+          method: POST
+          path: /auth/realms/opensky-network/protocol/openid-connect/token
     binaries:
     - path: /usr/bin/python3
     - path: /usr/bin/python3.11
@@ -159,6 +197,8 @@ ok "Files staged"
 info "Writing flight.env (kept inside sandbox at $SANDBOX_BASE/flight.env)…"
 
 ssh_sandbox "cat > $SANDBOX_BASE/flight.env" <<EOF
+OPENSKY_CLIENT_ID=$OPENSKY_CLIENT_ID
+OPENSKY_CLIENT_SECRET=$OPENSKY_CLIENT_SECRET
 OPENSKY_USERNAME=$OPENSKY_USERNAME
 OPENSKY_PASSWORD=$OPENSKY_PASSWORD
 FLIGHT_APP_PORT=$PORT
