@@ -11,6 +11,7 @@ const {
   IconLayer,
   ArcLayer,
   TripsLayer,
+  PathLayer,
   FlyToInterpolator,
   TextLayer,
 } = deck;
@@ -18,7 +19,7 @@ const {
 // Loud sanity check — if deck.gl's UMD bundle ever drops one of these
 // exports we'll know immediately rather than silently failing to render.
 for (const [name, ref] of Object.entries({
-  MapboxOverlay, ScatterplotLayer, IconLayer, ArcLayer, TripsLayer, TextLayer,
+  MapboxOverlay, ScatterplotLayer, IconLayer, ArcLayer, TripsLayer, PathLayer, TextLayer,
 })) {
   if (!ref) console.error(`deck.gl export missing: ${name}`);
 }
@@ -26,32 +27,53 @@ for (const [name, ref] of Object.entries({
 // ── State ────────────────────────────────────────────────────────────────
 
 const state = {
-  flights: new Map(),         // id -> {id, lat, lon, heading, alt_m, vel_mps, callsign, ...}
-  flightHistory: new Map(),   // id -> [{lat, lon, t}]   (capped per-id)
-  airportsInView: [],         // last airports response
+  // id -> {id, lat, lon, heading, alt_m, vel_mps, callsign, fixTs, ...}
+  // `fixTs` is performance.now() when we received this fix; used as the t0
+  // for dead-reckoning animation between OpenSky polls.
+  flights: new Map(),
+  // id -> [{lat, lon, t}]   (capped per-id) — actual fixes only, no jitter
+  flightHistory: new Map(),
+  airportsInView: [],
   selectedFlightId: null,
   selectedAirport: null,
-  arcs: [],                   // {from:[lon,lat], to:[lon,lat]}
+  arcs: [],
   arcsAirportCode: null,
   layerVisibility: {
     flights: true,
     airports: true,
     arcs: false,
     trails: false,
+    paths: true,         // breadcrumb paths shown automatically when zoomed in
+    weather: false,
   },
-  bbox: null,                 // last fetched bbox key
+  bbox: null,
   lastFetchedAt: 0,
   inFlight: false,
   ws: null,
   deckOverlay: null,
   map: null,
   animationStart: performance.now(),
+  frameTs: 0,            // bumped every render frame; used as updateTrigger
+  weather: {
+    manifest: null,
+    layerIds: [],        // MapLibre layer/source ids we own
+    nextRefresh: 0,
+  },
 };
 
 const FETCH_INTERVAL_MS = 9_000;       // keep us under OpenSky's anonymous 10s rate
-const TRAIL_WINDOW_MS = 90_000;        // 90s trails
 const FLIGHT_STALE_MS = 60_000;        // drop flights we haven't seen in 60s
 const MAX_HISTORY = 60;
+// Don't extrapolate further than this since the last fix — an aircraft we
+// haven't heard from in 30s is more likely lost than still on its old
+// vector. Beyond this we just freeze the icon at the last fix.
+const DEAD_RECKON_MAX_S = 30;
+// Show breadcrumb paths for every visible flight at this zoom or above.
+const TRAIL_ZOOM_THRESHOLD = 6;
+// RainViewer publishes a JSON manifest of available radar/satellite frames.
+// No key required, ~5min refresh on their side.
+const RAINVIEWER_MANIFEST = 'https://api.rainviewer.com/public/weather-maps.json';
+const WEATHER_REFRESH_MS = 5 * 60 * 1000;
 
 // ── DOM refs ─────────────────────────────────────────────────────────────
 
@@ -137,12 +159,36 @@ function initMap() {
   });
 }
 
+// ── Dead-reckoning ───────────────────────────────────────────────────────
+// OpenSky returns lat/lon/heading/velocity at most every ~10s. To make the
+// planes glide between updates we forward-project the last fix using the
+// reported ground speed and heading. This is just kinematic guessing; we
+// clamp the dt so that when a flight goes silent the icon doesn't sail off
+// the map. The actual fix history (used for breadcrumb paths) is *not*
+// touched — only the rendered position.
+
+function interpolatedLonLat(f) {
+  if (f == null || f.lat == null || f.lon == null) return [f?.lon ?? 0, f?.lat ?? 0];
+  if (f.on_ground) return [f.lon, f.lat];
+  const v = f.vel_mps;
+  if (!v || v <= 0 || f.heading == null || f.fixTs == null) return [f.lon, f.lat];
+  const dt = Math.min(DEAD_RECKON_MAX_S, (performance.now() - f.fixTs) / 1000);
+  if (dt <= 0) return [f.lon, f.lat];
+  const hdg = (f.heading * Math.PI) / 180;
+  // Compass: 0° = N, 90° = E. North component cos, east component sin.
+  const dN = v * Math.cos(hdg) * dt;   // metres north
+  const dE = v * Math.sin(hdg) * dt;   // metres east
+  const dLat = dN / 111320;
+  const dLon = dE / (111320 * Math.cos((f.lat * Math.PI) / 180));
+  return [f.lon + dLon, f.lat + dLat];
+}
+
 // ── Layer assembly ───────────────────────────────────────────────────────
 
 function buildLayers() {
   const layers = [];
-  const now = performance.now();
   const flights = Array.from(state.flights.values());
+  const zoom = state.map ? state.map.getZoom() : 3;
 
   if (state.layerVisibility.airports && state.airportsInView.length) {
     layers.push(
@@ -200,6 +246,38 @@ function buildLayers() {
     );
   }
 
+  // Breadcrumb paths for every visible flight when the user zooms in.
+  // Uses the actual fix history (no interpolation jitter), so the
+  // polylines stay clean while the planes themselves glide smoothly.
+  if (state.layerVisibility.paths && zoom >= TRAIL_ZOOM_THRESHOLD) {
+    const pathData = [];
+    for (const [id, history] of state.flightHistory) {
+      if (history.length < 2) continue;
+      pathData.push({
+        id,
+        path: history.map((p) => [p.lon, p.lat]),
+        selected: id === state.selectedFlightId,
+      });
+    }
+    if (pathData.length) {
+      layers.push(
+        new PathLayer({
+          id: 'flight-paths',
+          data: pathData,
+          getPath: (d) => d.path,
+          getColor: (d) =>
+            d.selected ? [255, 184, 107, 220] : [180, 230, 255, 90],
+          getWidth: (d) => (d.selected ? 2.5 : 1.5),
+          widthMinPixels: 1,
+          widthMaxPixels: 3,
+          jointRounded: true,
+          capRounded: true,
+          updateTriggers: { getColor: state.selectedFlightId, getWidth: state.selectedFlightId },
+        })
+      );
+    }
+  }
+
   if (state.layerVisibility.trails && state.selectedFlightId) {
     const history = state.flightHistory.get(state.selectedFlightId) || [];
     if (history.length >= 2) {
@@ -231,7 +309,10 @@ function buildLayers() {
         // Per-feature getIcon is the most reliable path for data URIs in
         // deck.gl — it avoids the iconAtlas autopack step entirely.
         getIcon: () => PLANE_ICON_DEF,
-        getPosition: (f) => [f.lon, f.lat],
+        // Interpolated position based on heading/velocity for smooth motion
+        // between OpenSky polls. updateTriggers.frameTs forces deck.gl to
+        // recompute the accessor on every animation frame.
+        getPosition: (f) => interpolatedLonLat(f),
         getSize: (f) => (f.id === state.selectedFlightId ? 32 : 20),
         // Plane SVG points UP (0° = north). OpenSky heading is degrees CW
         // from north. deck.gl getAngle is CCW degrees, so we negate.
@@ -248,6 +329,7 @@ function buildLayers() {
         billboard: true,
         pickable: true,
         updateTriggers: {
+          getPosition: state.frameTs,
           getSize: state.selectedFlightId,
           getColor: state.selectedFlightId,
         },
@@ -263,11 +345,23 @@ function refreshLayers() {
   state.deckOverlay.setProps({ layers: buildLayers() });
 }
 
-// ── Animation loop (just to keep the trail current time advancing) ───────
+// ── Animation loop ───────────────────────────────────────────────────────
+// Runs every frame the tab is foregrounded. Bumps state.frameTs which is
+// fed into the IconLayer's updateTriggers so deck.gl re-runs the
+// dead-reckoning accessor for each plane on every frame. We throttle the
+// expensive layer rebuild to ~30 fps — that's smooth enough for aircraft
+// (which move ~250 m/s) and halves the work on weaker GPUs / iGPUs.
 
-function animate() {
-  if (state.layerVisibility.trails && state.selectedFlightId) {
-    refreshLayers();
+let _lastRenderTs = 0;
+const RENDER_INTERVAL_MS = 33;  // ~30 fps
+
+function animate(nowTs) {
+  if (nowTs - _lastRenderTs >= RENDER_INTERVAL_MS) {
+    state.frameTs = nowTs;
+    if (state.flights.size > 0 || state.layerVisibility.trails) {
+      refreshLayers();
+    }
+    _lastRenderTs = nowTs;
   }
   requestAnimationFrame(animate);
 }
@@ -463,6 +557,8 @@ function ingestFlights(flights) {
   const seen = new Set();
   for (const f of flights) {
     seen.add(f.id);
+    // Stamp the fix time so the animation loop knows how far to project.
+    f.fixTs = now;
     state.flights.set(f.id, f);
     let history = state.flightHistory.get(f.id);
     if (!history) {
@@ -517,6 +613,109 @@ function wireLayerToggles() {
     state.layerVisibility.trails = e.target.checked;
     refreshLayers();
   });
+  const elPaths = document.getElementById('layer-paths');
+  if (elPaths) {
+    elPaths.addEventListener('change', (e) => {
+      state.layerVisibility.paths = e.target.checked;
+      refreshLayers();
+    });
+  }
+  const elWeather = document.getElementById('layer-weather');
+  if (elWeather) {
+    elWeather.addEventListener('change', async (e) => {
+      state.layerVisibility.weather = e.target.checked;
+      if (e.target.checked) {
+        await ensureWeatherManifest();
+        applyWeather();
+        toast('Weather: precipitation radar + cloud IR');
+      } else {
+        clearWeather();
+      }
+    });
+  }
+}
+
+// ── Weather (RainViewer) ─────────────────────────────────────────────────
+// Two raster overlays from the same provider:
+//   - infrared satellite  (cloud cover, latest frame)
+//   - precipitation radar (latest past frame; nowcast frames are predicted)
+// Both are free, anonymous, global, and CORS-enabled.
+
+async function ensureWeatherManifest() {
+  const now = Date.now();
+  if (state.weather.manifest && now < state.weather.nextRefresh) return;
+  try {
+    const r = await fetch(RAINVIEWER_MANIFEST, { cache: 'no-store' });
+    if (!r.ok) throw new Error(`status ${r.status}`);
+    state.weather.manifest = await r.json();
+    state.weather.nextRefresh = now + WEATHER_REFRESH_MS;
+  } catch (err) {
+    console.warn('weather manifest fetch failed', err);
+    toast('Weather feed unreachable');
+  }
+}
+
+function applyWeather() {
+  const m = state.weather.manifest;
+  if (!m || !state.map) return;
+  clearWeather();
+  // RainViewer tile URL grammar:
+  //   {host}{path}/{size}/{z}/{x}/{y}/{color}/{options}.png
+  // For radar:     color 4 (universal blue), options 1_1 (smooth + snow)
+  // For satellite: color 0 (b/w IR), options 0_0
+  const size = 256;
+
+  const sat = (m.satellite?.infrared || []).slice(-1)[0];
+  if (sat) {
+    const id = 'wx-clouds';
+    state.map.addSource(id, {
+      type: 'raster',
+      tiles: [`${m.host}${sat.path}/${size}/{z}/{x}/{y}/0/0_0.png`],
+      tileSize: size,
+      attribution: 'Clouds: RainViewer',
+    });
+    state.map.addLayer({
+      id, type: 'raster', source: id,
+      paint: { 'raster-opacity': 0.45 },
+    });
+    state.weather.layerIds.push(id);
+  }
+
+  const radar = (m.radar?.past || []).slice(-1)[0];
+  if (radar) {
+    const id = 'wx-radar';
+    state.map.addSource(id, {
+      type: 'raster',
+      tiles: [`${m.host}${radar.path}/${size}/{z}/{x}/{y}/4/1_1.png`],
+      tileSize: size,
+      attribution: 'Radar: RainViewer',
+    });
+    state.map.addLayer({
+      id, type: 'raster', source: id,
+      paint: { 'raster-opacity': 0.7 },
+    });
+    state.weather.layerIds.push(id);
+  }
+}
+
+function clearWeather() {
+  if (!state.map) return;
+  for (const id of state.weather.layerIds) {
+    if (state.map.getLayer(id)) state.map.removeLayer(id);
+    if (state.map.getSource(id)) state.map.removeSource(id);
+  }
+  state.weather.layerIds = [];
+}
+
+// Periodically swap to the newest RainViewer frame so the radar doesn't go
+// stale during long sessions. Only kicks in when weather is on.
+async function weatherTick() {
+  if (state.layerVisibility.weather) {
+    state.weather.nextRefresh = 0;       // force a refresh
+    await ensureWeatherManifest();
+    applyWeather();
+  }
+  setTimeout(weatherTick, WEATHER_REFRESH_MS);
 }
 
 // ── WebSocket bus (commands from the backend / external skill) ──────────
@@ -682,4 +881,7 @@ elChatForm.addEventListener('submit', async (e) => {
   connectWs();
   schedulePump({ force: true });
   requestAnimationFrame(animate);
+  // Pre-warm the RainViewer manifest so the first weather toggle is instant.
+  ensureWeatherManifest();
+  setTimeout(weatherTick, WEATHER_REFRESH_MS);
 })();

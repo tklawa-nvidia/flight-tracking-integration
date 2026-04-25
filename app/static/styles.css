@@ -233,6 +233,14 @@ html, body, #app {
   box-shadow: 0 0 8px rgba(94, 226, 255, 0.6);
 }
 
+.toggle em {
+  font-style: normal;
+  margin-left: 6px;
+  color: var(--text-faint);
+  font-size: 11px;
+  letter-spacing: 0.02em;
+}
+
 /* ── Chat ───────────────────────────────────────────────────────────────── */
 
 .chat {

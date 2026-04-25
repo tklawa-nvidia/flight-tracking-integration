@@ -11,7 +11,7 @@
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Manrope:wght@400;500;700;800&display=swap" rel="stylesheet" />
 
   <link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/styles.css?v=3" />
+  <link rel="stylesheet" href="/static/styles.css?v=4" />
 </head>
 <body>
   <div id="app">
@@ -53,8 +53,10 @@
         <div class="layers-title">Layers</div>
         <label class="toggle"><input type="checkbox" id="layer-flights" checked /><span>Live aircraft</span></label>
         <label class="toggle"><input type="checkbox" id="layer-airports" checked /><span>Airports</span></label>
+        <label class="toggle"><input type="checkbox" id="layer-paths" checked /><span>Flight paths <em>(zoom in)</em></span></label>
         <label class="toggle"><input type="checkbox" id="layer-arcs" /><span>Inbound arcs</span></label>
         <label class="toggle"><input type="checkbox" id="layer-trails" /><span>Selected trail</span></label>
+        <label class="toggle"><input type="checkbox" id="layer-weather" /><span>Weather <em>(radar + clouds)</em></span></label>
       </section>
 
       <section class="chat">
@@ -110,6 +112,6 @@
   <!-- Map + viz stack: load MapLibre first, then deck.gl, in classic script tags -->
   <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
   <script src="https://unpkg.com/deck.gl@9.0.38/dist.min.js"></script>
-  <script type="module" src="/static/app.js?v=3"></script>
+  <script type="module" src="/static/app.js?v=4"></script>
 </body>
 </html>
