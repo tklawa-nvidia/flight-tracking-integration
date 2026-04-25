@@ -59,9 +59,19 @@ const state = {
     layerIds: [],        // MapLibre layer/source ids we own
     nextRefresh: 0,
   },
+  // OpenSky's anonymous quota is small (~400 credits/day with bbox costs of
+  // 1-4 each) so we let the user dial cadence and pause the live feed
+  // entirely. Any 429 from the server pushes nextAllowedAt out so we don't
+  // just bash the upstream until midnight UTC.
+  live: {
+    paused: false,
+    intervalMs: 10_000,           // user-selectable cadence
+    nextAllowedAt: 0,             // performance.now() floor; raised on 429
+    backoffMs: 60_000,            // current 429 backoff window
+    lastStatus: 'ok',             // 'ok' | 'rate-limit' | 'error' | 'paused' | 'hidden'
+  },
 };
 
-const FETCH_INTERVAL_MS = 9_000;       // keep us under OpenSky's anonymous 10s rate
 const FLIGHT_STALE_MS = 60_000;        // drop flights we haven't seen in 60s
 const MAX_HISTORY = 60;
 // Don't extrapolate further than this since the last fix — an aircraft we
@@ -507,11 +517,28 @@ let pendingPump = false;
 
 function schedulePump({ force = false } = {}) {
   if (pumpTimer) clearTimeout(pumpTimer);
-  if (force) {
-    pumpTimer = setTimeout(pump, 250);
-  } else {
-    pumpTimer = setTimeout(pump, FETCH_INTERVAL_MS);
+  // Respect pause + visibility — neither schedules a fetch.
+  if (state.live.paused) {
+    state.live.lastStatus = 'paused';
+    updateRefreshHud();
+    return;
   }
+  if (document.hidden) {
+    state.live.lastStatus = 'hidden';
+    updateRefreshHud();
+    // We *do* still re-schedule a tick when the tab returns; that's wired
+    // up via the visibilitychange listener in wireLiveControls().
+    return;
+  }
+  const now = performance.now();
+  let delay;
+  if (force) {
+    delay = Math.max(250, state.live.nextAllowedAt - now);
+  } else {
+    delay = Math.max(state.live.intervalMs, state.live.nextAllowedAt - now);
+  }
+  pumpTimer = setTimeout(pump, delay);
+  updateRefreshHud(delay);
 }
 
 async function pump() {
@@ -519,13 +546,17 @@ async function pump() {
     pendingPump = true;
     return;
   }
+  if (state.live.paused || document.hidden) {
+    schedulePump();
+    return;
+  }
   state.inFlight = true;
   try {
     setStatus('live', 'streaming');
     const bboxStr = currentBbox();
     const [flightsRes, airportsRes] = await Promise.all([
-      fetch(`/api/flights?bbox=${bboxStr}`).then((r) => r.json()),
-      fetch(`/api/airports?bbox=${bboxStr}&limit=400`).then((r) => r.json()),
+      fetchOrThrow(`/api/flights?bbox=${bboxStr}`),
+      fetchOrThrow(`/api/airports?bbox=${bboxStr}&limit=400`),
     ]);
 
     ingestFlights(flightsRes.flights || []);
@@ -533,14 +564,28 @@ async function pump() {
 
     elHudFlights.textContent = state.flights.size.toLocaleString();
     elHudAirports.textContent = state.airportsInView.length.toLocaleString();
-    elHudRefresh.textContent = `${Math.round(FETCH_INTERVAL_MS / 1000)}s`;
     state.lastFetchedAt = Date.now();
+    state.live.lastStatus = 'ok';
+    state.live.backoffMs = 60_000;  // recovered → reset backoff window
 
     refreshLayers();
   } catch (err) {
-    console.error('pump failed', err);
-    setStatus('error', 'offline');
-    toast('Live data fetch failed — retrying…');
+    if (err && err.status === 429) {
+      // OpenSky rate-limited us. Push nextAllowedAt out by an exponentially
+      // growing window (capped) so we don't just bash the upstream every
+      // cadence tick. This reset whenever a successful fetch lands.
+      const wait = Math.min(state.live.backoffMs, 5 * 60_000);
+      state.live.nextAllowedAt = performance.now() + wait;
+      state.live.backoffMs = Math.min(state.live.backoffMs * 2, 5 * 60_000);
+      state.live.lastStatus = 'rate-limit';
+      setStatus('error', 'rate limited');
+      toast(`OpenSky rate limit — backing off ${Math.round(wait / 1000)}s`, 4000);
+    } else {
+      console.error('pump failed', err);
+      state.live.lastStatus = 'error';
+      setStatus('error', 'offline');
+      toast('Live data fetch failed — retrying…');
+    }
   } finally {
     state.inFlight = false;
     if (pendingPump) {
@@ -549,6 +594,43 @@ async function pump() {
     } else {
       schedulePump();
     }
+  }
+}
+
+// Tiny fetch wrapper that turns non-2xx into a real Error with a `.status`
+// so the pump's catch can distinguish a 429 from a generic network error.
+async function fetchOrThrow(url) {
+  const r = await fetch(url);
+  if (!r.ok) {
+    const err = new Error(`HTTP ${r.status}`);
+    err.status = r.status;
+    err.body = await r.text().catch(() => '');
+    throw err;
+  }
+  return r.json();
+}
+
+function updateRefreshHud(delayMs) {
+  // Show cadence + a hint about the current state. Driven from the pump so
+  // it stays accurate when the user changes the cadence dropdown or pauses.
+  const sec = Math.round(state.live.intervalMs / 1000);
+  switch (state.live.lastStatus) {
+    case 'paused':
+      elHudRefresh.textContent = 'paused';
+      break;
+    case 'hidden':
+      elHudRefresh.textContent = 'tab hidden';
+      break;
+    case 'rate-limit': {
+      const remaining = Math.max(0, Math.round((state.live.nextAllowedAt - performance.now()) / 1000));
+      elHudRefresh.textContent = `429 · ${remaining}s`;
+      break;
+    }
+    case 'error':
+      elHudRefresh.textContent = 'retrying';
+      break;
+    default:
+      elHudRefresh.textContent = `${sec}s`;
   }
 }
 
@@ -592,6 +674,55 @@ function toast(text, ms = 2500) {
   elToast.classList.add('show');
   clearTimeout(toast._t);
   toast._t = setTimeout(() => elToast.classList.remove('show'), ms);
+}
+
+// ── Live data controls ───────────────────────────────────────────────────
+
+function wireLiveControls() {
+  const elPause = document.getElementById('live-pause');
+  const elCadence = document.getElementById('live-cadence');
+
+  if (elPause) {
+    elPause.addEventListener('click', () => {
+      state.live.paused = !state.live.paused;
+      elPause.classList.toggle('is-active', state.live.paused);
+      elPause.textContent = state.live.paused ? 'Resume' : 'Pause';
+      if (state.live.paused) {
+        if (pumpTimer) clearTimeout(pumpTimer);
+        state.live.lastStatus = 'paused';
+        updateRefreshHud();
+        toast('Live feed paused — planes are frozen at last fix');
+      } else {
+        state.live.lastStatus = 'ok';
+        toast('Live feed resumed');
+        schedulePump({ force: true });
+      }
+    });
+  }
+
+  if (elCadence) {
+    elCadence.value = String(state.live.intervalMs);
+    elCadence.addEventListener('change', () => {
+      const ms = parseInt(elCadence.value, 10);
+      if (!Number.isFinite(ms)) return;
+      state.live.intervalMs = ms;
+      updateRefreshHud();
+      // Re-schedule from now so the new cadence applies immediately.
+      schedulePump();
+    });
+  }
+
+  // Auto-pause when the tab is backgrounded — saves a *lot* of credits over
+  // the course of a day. Resume immediately when it comes back.
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) {
+      if (pumpTimer) clearTimeout(pumpTimer);
+      state.live.lastStatus = 'hidden';
+      updateRefreshHud();
+    } else if (!state.live.paused) {
+      schedulePump({ force: true });
+    }
+  });
 }
 
 // ── Layer toggles ────────────────────────────────────────────────────────
@@ -878,6 +1009,7 @@ elChatForm.addEventListener('submit', async (e) => {
   initMap();
   await new Promise((resolve) => state.map.once('load', resolve));
   wireLayerToggles();
+  wireLiveControls();
   connectWs();
   schedulePump({ force: true });
   requestAnimationFrame(animate);

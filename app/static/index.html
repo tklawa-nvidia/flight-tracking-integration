@@ -11,7 +11,7 @@
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Manrope:wght@400;500;700;800&display=swap" rel="stylesheet" />
 
   <link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/styles.css?v=4" />
+  <link rel="stylesheet" href="/static/styles.css?v=5" />
 </head>
 <body>
   <div id="app">
@@ -47,6 +47,23 @@
             <div class="hud-value" id="hud-refresh">—</div>
           </div>
         </div>
+      </section>
+
+      <section class="live">
+        <div class="layers-title">Live data</div>
+        <div class="live-row">
+          <button class="btn-ghost btn-pill" id="live-pause" type="button">Pause</button>
+          <label class="live-cadence">
+            <span>Every</span>
+            <select id="live-cadence">
+              <option value="10000">10 s</option>
+              <option value="30000">30 s</option>
+              <option value="60000">60 s</option>
+              <option value="120000">2 min</option>
+            </select>
+          </label>
+        </div>
+        <div class="live-hint">Auto-pauses when the tab is hidden. OpenSky has a small free quota — slower cadence stretches it further.</div>
       </section>
 
       <section class="layers">
@@ -112,6 +129,6 @@
   <!-- Map + viz stack: load MapLibre first, then deck.gl, in classic script tags -->
   <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
   <script src="https://unpkg.com/deck.gl@9.0.38/dist.min.js"></script>
-  <script type="module" src="/static/app.js?v=4"></script>
+  <script type="module" src="/static/app.js?v=5"></script>
 </body>
 </html>
