@@ -608,27 +608,19 @@ function flyTo(lon, lat, zoom = 9) {
 }
 
 // ── Chat ────────────────────────────────────────────────────────────────
+// Chat is a thin wrapper over `openclaw agent --json`. OpenClaw owns the
+// conversation state on its side (keyed by session_id), so we only post the
+// latest user message and the session id we got back from the previous turn.
 
-const chatHistory = [];
+let openclawSessionId = null;
 
-function appendMessage(role, content, { tools = [], thinking = false } = {}) {
+function appendMessage(role, content, { thinking = false } = {}) {
   const wrap = document.createElement('div');
   wrap.className = `msg msg-${role}${thinking ? ' msg-thinking' : ''}`;
   const body = document.createElement('div');
   body.className = 'msg-content';
   body.textContent = content;
   wrap.appendChild(body);
-  if (tools.length) {
-    const t = document.createElement('div');
-    t.className = 'msg-tools';
-    tools.forEach((name) => {
-      const c = document.createElement('span');
-      c.className = 'tool-chip';
-      c.textContent = name;
-      t.appendChild(c);
-    });
-    wrap.appendChild(t);
-  }
   elChatLog.appendChild(wrap);
   elChatLog.scrollTop = elChatLog.scrollHeight;
   return wrap;
@@ -647,32 +639,37 @@ elChatForm.addEventListener('submit', async (e) => {
   if (!text) return;
   elChatInput.value = '';
   appendMessage('user', text);
-  chatHistory.push({ role: 'user', content: text });
 
   const thinking = appendMessage('bot', '', { thinking: true });
   thinking.querySelector('.msg-content').innerHTML =
     'thinking <span class="thinking-dots"><span></span><span></span><span></span></span>';
 
+  // OpenClaw turns can take a while when the agent decides to use tools,
+  // so disable the input until the reply lands.
+  elChatInput.disabled = true;
+
   try {
     const res = await fetch('/api/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ messages: chatHistory.slice(-8) }),
+      body: JSON.stringify({ message: text, session_id: openclawSessionId }),
     });
     if (!res.ok) {
       const errBody = await res.text();
       thinking.remove();
-      appendMessage('bot', `LLM call failed (${res.status}). ${errBody.slice(0, 240)}`);
+      appendMessage('bot', `Agent call failed (${res.status}). ${errBody.slice(0, 320)}`);
       return;
     }
     const data = await res.json();
     thinking.remove();
-    const tools = (data.actions || []).map((a) => a.tool);
-    appendMessage('bot', data.reply || '(no reply)', { tools });
-    if (data.reply) chatHistory.push({ role: 'assistant', content: data.reply });
+    if (data.session_id) openclawSessionId = data.session_id;
+    appendMessage('bot', data.reply || '(no reply)');
   } catch (err) {
     thinking.remove();
-    appendMessage('bot', `Network error talking to copilot: ${err.message}`);
+    appendMessage('bot', `Network error talking to OpenClaw: ${err.message}`);
+  } finally {
+    elChatInput.disabled = false;
+    elChatInput.focus();
   }
 });
 

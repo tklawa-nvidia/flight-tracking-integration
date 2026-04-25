@@ -2,27 +2,24 @@
 
 Serves a single-page MapLibre + deck.gl frontend, proxies the OpenSky Network
 API for live aircraft state, exposes a curated OpenFlights airport dataset,
-runs a tool-calling chat against the gateway-configured OpenAI-compatible
-inference endpoint, and broadcasts external map commands to all connected
-browsers over a WebSocket bus.
+forwards the chat panel to OpenClaw's local agent (which already has the
+flight-tracking skill loaded), and broadcasts external map commands to all
+connected browsers over a WebSocket bus.
 
 Design notes
 ------------
 - Runs entirely inside the OpenShell sandbox. The browser reaches it through
   `openshell forward start <sandbox> 0.0.0.0:18890` (the install script
-  configures this). No host-side proxy is involved in this demo — API keys
-  live in the sandbox env (per user request) and outbound traffic is gated
-  by the network policy preset in policy/flight-tracking.yaml.
+  configures this).
 - OpenSky is reachable anonymously (10s cadence, bbox <= 25 sq deg). If
   OPENSKY_USERNAME / OPENSKY_PASSWORD are set we use HTTP Basic to lift the
   rate limit to 5s. Responses are cached briefly in-process to avoid
   hammering the API when several browsers are open.
-- The chat endpoint posts to the existing inference route configured by
-  `openshell inference` (NVIDIA Nemotron via inference-api.nvidia.com in the
-  default install). The LLM is given function-call tools that resolve to
-  internal helpers and broadcast map commands back to the frontend over the
-  WebSocket bus. The same tools are exposed as plain HTTP endpoints so the
-  OpenClaw skill can drive the same surface from Telegram or the dashboard.
+- The chat panel does *not* call inference directly. It exec's
+  `openclaw agent --json` so OpenClaw owns auth, model selection, skill
+  routing, and conversation memory — exactly the way the TUI works. The
+  flight-tracking skill we deploy at install time gives that agent the
+  recipes it needs to drive the map (curl into /api/map/*).
 """
 
 from __future__ import annotations
@@ -32,14 +29,14 @@ import base64
 import json
 import math
 import os
+import shutil
 import time
-from collections.abc import Iterable
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -55,15 +52,12 @@ OPENSKY_USER = os.getenv("OPENSKY_USERNAME", "").strip()
 OPENSKY_PASS = os.getenv("OPENSKY_PASSWORD", "").strip()
 OPENSKY_CACHE_TTL = 8.0  # seconds — slightly under anonymous 10s rate limit
 
-# Inference endpoint — read from env at startup. Defaults match the standard
-# NemoClaw OpenAI-compatible route. Install.sh fills these in from the
-# gateway's stored inference config so the server doesn't need to talk to
-# the gateway at request time.
-INFERENCE_BASE_URL = os.getenv(
-    "INFERENCE_BASE_URL", "https://inference-api.nvidia.com/v1"
-).rstrip("/")
-INFERENCE_API_KEY = os.getenv("INFERENCE_API_KEY", "").strip()
-INFERENCE_MODEL = os.getenv("INFERENCE_MODEL", "nvidia/nvidia/nemotron-3-super-v3").strip()
+# OpenClaw integration — chat is a thin wrapper around `openclaw agent`.
+# The binary lives at /usr/local/bin/openclaw inside the sandbox image; we
+# look it up dynamically in case a future image moves it.
+OPENCLAW_BIN = shutil.which("openclaw") or "/usr/local/bin/openclaw"
+OPENCLAW_AGENT = os.getenv("OPENCLAW_AGENT", "main").strip()
+OPENCLAW_TIMEOUT_S = int(os.getenv("OPENCLAW_TIMEOUT_S", "180"))
 
 DEFAULT_ANALYSIS_RADIUS_KM = 80.0
 EARTH_RADIUS_KM = 6371.0
@@ -285,112 +279,7 @@ class MapBus:
 _bus = MapBus()
 
 
-# ── LLM tool definitions ────────────────────────────────────────────────────
-
-
-CHAT_SYSTEM_PROMPT = """You are FlightOps, a flight-tracking copilot embedded in a live map.
-
-Capabilities:
-- Drive the map: fly to airports, change layers, draw arcs, highlight specific flights.
-- Inspect data: query live aircraft near an airport, summarise traffic, surface anomalies.
-
-Style:
-- Be terse. Pilot-radio cadence. No fluff.
-- When the user names an airport (IATA or ICAO), call goto first so the map moves while you analyse.
-- After analyse_traffic, summarise in 3-5 short bullets: count, mix (climb/cruise/descent), notable callsigns or country mix, anything unusual (squawk 7500/7600/7700, ground stops).
-- Never invent flight numbers. If data is missing, say "no contact" rather than guess.
-"""
-
-
-TOOLS_SCHEMA: list[dict[str, Any]] = [
-    {
-        "type": "function",
-        "function": {
-            "name": "goto",
-            "description": "Fly the map to an airport, city, or coordinate.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "target": {"type": "string", "description": "IATA, ICAO, or free-form name."},
-                    "zoom": {"type": "number", "default": 9},
-                },
-                "required": ["target"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "analyze_traffic",
-            "description": "Summarise live aircraft within a radius of an airport. Returns counts, vertical-mode mix, notable squawks, country mix.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "airport": {"type": "string"},
-                    "radius_km": {"type": "number", "default": DEFAULT_ANALYSIS_RADIUS_KM},
-                },
-                "required": ["airport"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "show_arcs_to_airport",
-            "description": "Draw great-circle arcs from each live aircraft within range to the named airport. Useful for showing inbound traffic patterns.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "airport": {"type": "string"},
-                    "radius_km": {"type": "number", "default": DEFAULT_ANALYSIS_RADIUS_KM},
-                },
-                "required": ["airport"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "set_layer",
-            "description": "Toggle a map layer on or off. Layers: airports, flights, arcs, trails.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "layer": {"type": "string", "enum": ["airports", "flights", "arcs", "trails"]},
-                    "visible": {"type": "boolean"},
-                },
-                "required": ["layer", "visible"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "highlight_flight",
-            "description": "Highlight a single flight by ICAO24 hex or callsign and draw its recent trail.",
-            "parameters": {
-                "type": "object",
-                "properties": {"flight": {"type": "string"}},
-                "required": ["flight"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "search_airports",
-            "description": "Free-text search of the airport directory. Returns up to 6 matches.",
-            "parameters": {
-                "type": "object",
-                "properties": {"query": {"type": "string"}},
-                "required": ["query"],
-            },
-        },
-    },
-]
-
-
-# ── Tool implementations (also exposed via plain HTTP for the skill) ────────
+# ── Tool implementations (exposed via plain HTTP for the skill) ─────────────
 
 
 def _vertical_mode(vrate_mps: float | None) -> str:
@@ -512,102 +401,104 @@ def tool_search_airports(query: str) -> dict[str, Any]:
     return {"ok": True, "matches": matches}
 
 
-TOOL_DISPATCH = {
-    "goto": tool_goto,
-    "analyze_traffic": tool_analyze_traffic,
-    "show_arcs_to_airport": tool_show_arcs_to_airport,
-    "set_layer": tool_set_layer,
-    "highlight_flight": tool_highlight_flight,
-    "search_airports": lambda **kw: asyncio.sleep(0, result=tool_search_airports(**kw)),
-}
-
-
-# ── Chat loop with tool calling ─────────────────────────────────────────────
-
-
-class ChatMessage(BaseModel):
-    role: str
-    content: str = ""
-    name: str | None = None
-    tool_call_id: str | None = None
-    tool_calls: list[dict[str, Any]] | None = None
+# ── OpenClaw bridge ─────────────────────────────────────────────────────────
 
 
 class ChatRequest(BaseModel):
-    messages: list[ChatMessage] = Field(default_factory=list)
+    """Frontend payload. We only need the latest user message and the
+    OpenClaw session id from the previous turn (if any) — the agent itself
+    keeps the full conversation history."""
+
+    message: str
+    session_id: str | None = None
+    thinking: str = "off"  # off | minimal | low | medium | high
 
 
-async def _call_inference(messages: list[dict[str, Any]]) -> dict[str, Any]:
-    if not INFERENCE_API_KEY:
+def _extract_reply(payload: dict[str, Any]) -> tuple[str, str | None]:
+    """Pull the agent's reply text + its session id out of the JSON shape
+    `openclaw agent --json` produces."""
+    result = payload.get("result") or {}
+    payloads = result.get("payloads") or []
+    parts: list[str] = []
+    for p in payloads:
+        text = (p or {}).get("text")
+        if text:
+            parts.append(text)
+    reply = "\n".join(parts).strip() or payload.get("summary", "").strip() or "[no reply]"
+    sid = (((result.get("meta") or {}).get("agentMeta") or {}).get("sessionId")) or None
+    return reply, sid
+
+
+async def call_openclaw_agent(
+    message: str,
+    session_id: str | None = None,
+    thinking: str = "off",
+) -> dict[str, Any]:
+    """Run one agent turn through OpenClaw. The agent has the flight-tracking
+    skill installed (deployed by install.sh) and uses inference via the
+    gateway-managed route, so we don't need any inference credentials of our
+    own."""
+    if not Path(OPENCLAW_BIN).exists():
         raise HTTPException(
             status_code=503,
-            detail="INFERENCE_API_KEY not configured. Re-run install.sh after `nemoclaw onboard`.",
+            detail=f"openclaw binary not found at {OPENCLAW_BIN}",
         )
-    if _http is None:
-        raise RuntimeError("HTTP client not initialised")
 
-    body = {
-        "model": INFERENCE_MODEL,
-        "messages": messages,
-        "tools": TOOLS_SCHEMA,
-        "tool_choice": "auto",
-        "temperature": 0.2,
-        "max_tokens": 600,
-    }
-    r = await _http.post(
-        f"{INFERENCE_BASE_URL}/chat/completions",
-        json=body,
-        headers={"Authorization": f"Bearer {INFERENCE_API_KEY}", "Content-Type": "application/json"},
-        timeout=30.0,
-    )
-    if r.status_code >= 400:
-        raise HTTPException(status_code=r.status_code, detail=r.text[:500])
-    return r.json()
-
-
-async def run_chat(messages: list[dict[str, Any]]) -> dict[str, Any]:
-    """Multi-turn tool-calling loop bounded to 4 tool rounds."""
-    convo: list[dict[str, Any]] = [
-        {"role": "system", "content": CHAT_SYSTEM_PROMPT},
-        *messages,
+    cmd = [
+        OPENCLAW_BIN, "agent",
+        "--agent", OPENCLAW_AGENT,
+        "--message", message,
+        "--json",
+        "--thinking", thinking,
+        "--timeout", str(OPENCLAW_TIMEOUT_S),
     ]
-    actions: list[dict[str, Any]] = []
-    for _ in range(4):
-        response = await _call_inference(convo)
-        choice = response["choices"][0]
-        msg = choice["message"]
-        convo.append(msg)
-        tool_calls = msg.get("tool_calls") or []
-        if not tool_calls:
-            return {"reply": msg.get("content", ""), "actions": actions}
+    if session_id:
+        cmd.extend(["--session-id", session_id])
 
-        for call in tool_calls:
-            name = call["function"]["name"]
-            args_raw = call["function"].get("arguments") or "{}"
-            try:
-                args = json.loads(args_raw)
-            except json.JSONDecodeError:
-                args = {}
-            handler = TOOL_DISPATCH.get(name)
-            if handler is None:
-                tool_result: dict[str, Any] = {"ok": False, "error": f"unknown tool {name}"}
-            else:
-                try:
-                    tool_result = await handler(**args)  # type: ignore[arg-type]
-                except TypeError:
-                    tool_result = handler(**args)  # type: ignore[assignment]
-            actions.append({"tool": name, "args": args, "result": tool_result})
-            convo.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": call["id"],
-                    "name": name,
-                    "content": json.dumps(tool_result, default=str),
-                }
-            )
-    # Hit the budget — return whatever the last assistant message had.
-    last_assistant = next((m for m in reversed(convo) if m.get("role") == "assistant"), None)
-    return {"reply": (last_assistant or {}).get("content", "[tool-call budget exhausted]"), "actions": actions}
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(), timeout=OPENCLAW_TIMEOUT_S + 30
+        )
+    except asyncio.TimeoutError:
+        proc.kill()
+        raise HTTPException(status_code=504, detail="openclaw agent timed out") from None
+
+    if proc.returncode != 0:
+        err = (stderr or b"").decode("utf-8", errors="replace")[-1500:]
+        raise HTTPException(
+            status_code=502,
+            detail=f"openclaw agent exited {proc.returncode}: {err.strip()}",
+        )
+
+    raw = (stdout or b"").decode("utf-8", errors="replace").strip()
+    if not raw:
+        raise HTTPException(status_code=502, detail="openclaw agent produced no output")
+
+    # The CLI prints a few diagnostic lines to stdout before the JSON
+    # document on some versions; isolate the JSON by finding the first '{'.
+    first_brace = raw.find("{")
+    if first_brace < 0:
+        raise HTTPException(status_code=502, detail=f"non-JSON agent output: {raw[:240]}")
+    try:
+        payload = json.loads(raw[first_brace:])
+    except json.JSONDecodeError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"could not parse agent JSON: {exc}",
+        ) from exc
+
+    reply, sid = _extract_reply(payload)
+    return {
+        "reply": reply,
+        "session_id": sid,
+        "status": payload.get("status"),
+        "summary": payload.get("summary"),
+    }
 
 
 # ── App + lifespan ──────────────────────────────────────────────────────────
@@ -637,8 +528,9 @@ async def health() -> dict[str, Any]:
         "ok": True,
         "airports_loaded": len(AIRPORTS),
         "opensky_authenticated": bool(OPENSKY_USER and OPENSKY_PASS),
-        "inference_configured": bool(INFERENCE_API_KEY),
-        "model": INFERENCE_MODEL,
+        "openclaw_bin": OPENCLAW_BIN,
+        "openclaw_available": Path(OPENCLAW_BIN).exists(),
+        "openclaw_agent": OPENCLAW_AGENT,
     }
 
 
@@ -748,17 +640,11 @@ async def api_map_command(body: CommandBody):
 
 @app.post("/api/chat")
 async def api_chat(body: ChatRequest):
-    serialised: list[dict[str, Any]] = []
-    for m in body.messages:
-        entry: dict[str, Any] = {"role": m.role, "content": m.content}
-        if m.name:
-            entry["name"] = m.name
-        if m.tool_call_id:
-            entry["tool_call_id"] = m.tool_call_id
-        if m.tool_calls:
-            entry["tool_calls"] = m.tool_calls
-        serialised.append(entry)
-    return await run_chat(serialised)
+    return await call_openclaw_agent(
+        message=body.message,
+        session_id=body.session_id,
+        thinking=body.thinking,
+    )
 
 
 @app.websocket("/ws/map")

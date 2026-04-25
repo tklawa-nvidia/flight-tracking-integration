@@ -45,12 +45,6 @@ POST /api/map/highlight  {"flight":"UAL123" | "a1b2c3"}      # callsign or ICAO2
 POST /api/map/command    {"type":"...","payload":{...}}      # generic broadcast
 ```
 
-### Chat passthrough (rarely needed from inside this skill)
-
-```
-POST /api/chat  {"messages":[{"role":"user","content":"..."}]}
-```
-
 ## How to drive a typical request
 
 ```bash
@@ -75,7 +69,6 @@ within budget; 200 km is borderline.
 ## Error handling
 
 - 429 from `/api/flights` or `/api/analyze` → wait ≥10 s and retry once. If still 429, tell the user the upstream is rate-limited.
-- 503 from `/api/chat` → the inference key is not configured in this sandbox; tell the user to re-run `flight-tracking-integration/install.sh`.
 - 502 from `/api/flights` → OpenSky upstream is unreachable. Don't retry tightly.
 
 ## Things the skill does NOT do

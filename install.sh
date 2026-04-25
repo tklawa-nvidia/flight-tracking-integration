@@ -73,61 +73,9 @@ openshell sandbox list 2>/dev/null | grep -q "$SANDBOX_NAME" \
   || fail "Sandbox '$SANDBOX_NAME' not found. Run 'nemoclaw onboard' first."
 ok "Prerequisites OK"
 
-# ── 2. Resolve inference + secrets from existing nemoclaw state ─────────
-INFERENCE_API_KEY=""
-INFERENCE_BASE_URL="https://inference-api.nvidia.com/v1"
-INFERENCE_MODEL="nvidia/nvidia/nemotron-3-super-v3"
-
-if [ -f "$ONBOARD_PATH" ]; then
-  INFERENCE_BASE_URL=$(python3 -c "
-import json
-try:
-    d = json.load(open('$ONBOARD_PATH'))
-    print(d.get('endpointUrl','https://inference-api.nvidia.com/v1'))
-except Exception:
-    print('https://inference-api.nvidia.com/v1')
-")
-  INFERENCE_MODEL=$(python3 -c "
-import json
-try:
-    d = json.load(open('$ONBOARD_PATH'))
-    print(d.get('model','nvidia/nvidia/nemotron-3-super-v3'))
-except Exception:
-    print('nvidia/nvidia/nemotron-3-super-v3')
-")
-  CRED_ENV=$(python3 -c "
-import json
-try:
-    d = json.load(open('$ONBOARD_PATH'))
-    print(d.get('credentialEnv','COMPATIBLE_API_KEY'))
-except Exception:
-    print('COMPATIBLE_API_KEY')
-")
-else
-  CRED_ENV="COMPATIBLE_API_KEY"
-fi
-
-if [ -f "$CREDS_PATH" ]; then
-  INFERENCE_API_KEY=$(python3 -c "
-import json
-try:
-    print(json.load(open('$CREDS_PATH')).get('$CRED_ENV',''))
-except Exception:
-    pass
-" 2>/dev/null || true)
-fi
-
-if [ -z "$INFERENCE_API_KEY" ]; then
-  warn "No inference API key found in $CREDS_PATH ($CRED_ENV)."
-  printf "  Paste the inference API key (or leave blank to install without copilot): "
-  read -r INFERENCE_API_KEY
-fi
-
-if [ -n "$INFERENCE_API_KEY" ]; then
-  ok "Inference: $INFERENCE_MODEL via $INFERENCE_BASE_URL"
-else
-  warn "Copilot will be disabled until you set INFERENCE_API_KEY in flight.env."
-fi
+# ── 2. Resolve OpenSky creds (chat goes through OpenClaw — no inference key) ─
+ok "Chat will route through OpenClaw (\`openclaw agent --json\`)."
+ok "OpenClaw already owns inference auth via the gateway-managed route."
 
 # Optional OpenSky basic auth (lifts rate limit from 10s -> 5s).
 OPENSKY_USERNAME="${OPENSKY_USERNAME:-}"
@@ -210,14 +158,12 @@ ok "Files staged"
 # ── 5. flight.env ───────────────────────────────────────────────────────
 info "Writing flight.env (kept inside sandbox at $SANDBOX_BASE/flight.env)…"
 
-# Use a HEREDOC so embedded characters in the API key don't break the shell.
 ssh_sandbox "cat > $SANDBOX_BASE/flight.env" <<EOF
-INFERENCE_BASE_URL=$INFERENCE_BASE_URL
-INFERENCE_MODEL=$INFERENCE_MODEL
-INFERENCE_API_KEY=$INFERENCE_API_KEY
 OPENSKY_USERNAME=$OPENSKY_USERNAME
 OPENSKY_PASSWORD=$OPENSKY_PASSWORD
 FLIGHT_APP_PORT=$PORT
+OPENCLAW_AGENT=main
+OPENCLAW_TIMEOUT_S=180
 EOF
 ssh_sandbox "chmod 600 $SANDBOX_BASE/flight.env" 2>/dev/null
 ok "flight.env written"
