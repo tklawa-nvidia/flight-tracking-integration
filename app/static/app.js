@@ -53,7 +53,6 @@ const state = {
   deckOverlay: null,
   map: null,
   animationStart: performance.now(),
-  frameTs: 0,            // bumped every render frame; used as updateTrigger
   weather: {
     manifest: null,
     layerIds: [],        // MapLibre layer/source ids we own
@@ -169,25 +168,25 @@ function initMap() {
   });
 }
 
-// ── Dead-reckoning ───────────────────────────────────────────────────────
-// OpenSky returns lat/lon/heading/velocity at most every ~10s. To make the
-// planes glide between updates we forward-project the last fix using the
-// reported ground speed and heading. This is just kinematic guessing; we
-// clamp the dt so that when a flight goes silent the icon doesn't sail off
-// the map. The actual fix history (used for breadcrumb paths) is *not*
-// touched — only the rendered position.
+// ── Smooth motion ────────────────────────────────────────────────────────
+// OpenSky updates every ~10s, which makes the planes "snap" between fixes.
+// To smooth that out we (a) compute a predicted *next* position for each
+// flight at ingest time using the reported heading + ground speed, then
+// (b) hand that target to deck.gl's IconLayer with a `transitions` prop
+// that GPU-interpolates from the previous target over the cadence window.
+// No per-frame work, no layer churn.
 
-function interpolatedLonLat(f) {
+function predictedTarget(f, intervalMs) {
   if (f == null || f.lat == null || f.lon == null) return [f?.lon ?? 0, f?.lat ?? 0];
   if (f.on_ground) return [f.lon, f.lat];
   const v = f.vel_mps;
-  if (!v || v <= 0 || f.heading == null || f.fixTs == null) return [f.lon, f.lat];
-  const dt = Math.min(DEAD_RECKON_MAX_S, (performance.now() - f.fixTs) / 1000);
-  if (dt <= 0) return [f.lon, f.lat];
+  if (!v || v <= 0 || f.heading == null) return [f.lon, f.lat];
+  // Project ~one fetch cadence ahead so the plane is still moving when the
+  // next fix lands. Cap the lookahead so a stale flight doesn't drift.
+  const lookS = Math.min(DEAD_RECKON_MAX_S, intervalMs / 1000);
   const hdg = (f.heading * Math.PI) / 180;
-  // Compass: 0° = N, 90° = E. North component cos, east component sin.
-  const dN = v * Math.cos(hdg) * dt;   // metres north
-  const dE = v * Math.sin(hdg) * dt;   // metres east
+  const dN = v * Math.cos(hdg) * lookS;   // metres north
+  const dE = v * Math.sin(hdg) * lookS;   // metres east
   const dLat = dN / 111320;
   const dLon = dE / (111320 * Math.cos((f.lat * Math.PI) / 180));
   return [f.lon + dLon, f.lat + dLat];
@@ -319,10 +318,11 @@ function buildLayers() {
         // Per-feature getIcon is the most reliable path for data URIs in
         // deck.gl — it avoids the iconAtlas autopack step entirely.
         getIcon: () => PLANE_ICON_DEF,
-        // Interpolated position based on heading/velocity for smooth motion
-        // between OpenSky polls. updateTriggers.frameTs forces deck.gl to
-        // recompute the accessor on every animation frame.
-        getPosition: (f) => interpolatedLonLat(f),
+        // Use the per-flight `target` field (filled at ingest time). The
+        // `transitions` prop below tells deck.gl to GPU-interpolate from
+        // the previous target to this one over the fetch cadence — that's
+        // what makes the planes glide instead of snapping.
+        getPosition: (f) => f.target || [f.lon, f.lat],
         getSize: (f) => (f.id === state.selectedFlightId ? 32 : 20),
         // Plane SVG points UP (0° = north). OpenSky heading is degrees CW
         // from north. deck.gl getAngle is CCW degrees, so we negate.
@@ -338,8 +338,17 @@ function buildLayers() {
         sizeMaxPixels: 36,
         billboard: true,
         pickable: true,
+        transitions: {
+          // Linear interpolation of the position attribute over roughly one
+          // fetch interval. Slightly under cadence so the glide finishes
+          // before the next fix lands and re-arms the transition.
+          getPosition: {
+            type: 'interpolation',
+            duration: Math.max(2000, state.live.intervalMs - 500),
+            easing: (t) => t,
+          },
+        },
         updateTriggers: {
-          getPosition: state.frameTs,
           getSize: state.selectedFlightId,
           getColor: state.selectedFlightId,
         },
@@ -356,21 +365,18 @@ function refreshLayers() {
 }
 
 // ── Animation loop ───────────────────────────────────────────────────────
-// Runs every frame the tab is foregrounded. Bumps state.frameTs which is
-// fed into the IconLayer's updateTriggers so deck.gl re-runs the
-// dead-reckoning accessor for each plane on every frame. We throttle the
-// expensive layer rebuild to ~30 fps — that's smooth enough for aircraft
-// (which move ~250 m/s) and halves the work on weaker GPUs / iGPUs.
+// Plane motion itself is animated by deck.gl on the GPU via the IconLayer's
+// `transitions` prop — no JS work needed. We only need this loop to keep
+// the TripsLayer's currentTime advancing for the *selected* flight's
+// fading trail. Ten frames a second is plenty for that.
 
 let _lastRenderTs = 0;
-const RENDER_INTERVAL_MS = 33;  // ~30 fps
+const RENDER_INTERVAL_MS = 100;
 
 function animate(nowTs) {
-  if (nowTs - _lastRenderTs >= RENDER_INTERVAL_MS) {
-    state.frameTs = nowTs;
-    if (state.flights.size > 0 || state.layerVisibility.trails) {
-      refreshLayers();
-    }
+  if (state.layerVisibility.trails && state.selectedFlightId &&
+      nowTs - _lastRenderTs >= RENDER_INTERVAL_MS) {
+    refreshLayers();
     _lastRenderTs = nowTs;
   }
   requestAnimationFrame(animate);
@@ -639,8 +645,12 @@ function ingestFlights(flights) {
   const seen = new Set();
   for (const f of flights) {
     seen.add(f.id);
-    // Stamp the fix time so the animation loop knows how far to project.
     f.fixTs = now;
+    // Predicted position one cadence ahead. The IconLayer transitions
+    // smoothly from the previous target toward this one over the cadence,
+    // so by the time we get here for fix N+1 the plane is roughly at fix N
+    // and we kick off a new glide toward the new prediction.
+    f.target = predictedTarget(f, state.live.intervalMs);
     state.flights.set(f.id, f);
     let history = state.flightHistory.get(f.id);
     if (!history) {
