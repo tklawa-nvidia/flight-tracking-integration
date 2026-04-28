@@ -1,6 +1,6 @@
 ---
 name: flight-tracking
-description: "Live aircraft tracking, airport lookup, and interactive map control for the FlightOps map UI at http://127.0.0.1:18890. Use this skill whenever the user asks about live air traffic, what is flying near an airport, inbound patterns, unusual squawks, METAR weather, NAS status / ground stops, ARTCC boundaries, OR wants the map driven in ANY way (fly to an airport, draw arcs, highlight a flight, RECOLOUR the planes, toggle a layer, filter by phase or squawk, switch to 3D, change METAR colour mode). HARD RULES: (1) ALL data and ALL map control live behind http://127.0.0.1:18890 in this same sandbox. NEVER curl upstream FAA/OpenSky/AWC/adsbdb/hexdb hosts directly — they're firewalled. If a local call fails say 'service unavailable', do not invent a network-outage excuse. (2) ANY request that changes what's drawn on the map REQUIRES issuing the matching POST /api/map/... call FIRST, BEFORE describing the result. Never claim 'I've updated the map to ...' unless you actually issued the POST this turn — the user is looking at a live chart and will see if nothing changed. (3) The aircraft colour scheme has exactly FOUR fixed presets — phase | altitude | vrate | squawk — set via POST /api/map/color {\"mode\":\"<one of four>\"}. Aliases 'elevation', 'flight level', 'rate of climb', 'emergency' are accepted. Do NOT invent custom palettes; describe only what the preset shows: phase = orange family, altitude = single-hue green ramp (mint→deep green, NOT a rainbow), vrate = diverging purple (violet↔magenta), squawk = grey + red/amber for 7500/7600/7700. (4) Other map controls: POST /api/map/metar-color (flt_cat|wind|temp|visibility), POST /api/map/layer, POST /api/map/filter, POST /api/map/goto, POST /api/map/view, POST /api/map/arcs (auto-tilts), POST /api/map/airspace3d. Open the SKILL.md body for examples and field schemas."
+description: "Live aircraft tracking, airport lookup, and interactive map control for the FlightOps map UI at http://127.0.0.1:18890. Use this skill whenever the user asks about live air traffic, what is flying near an airport, inbound patterns, unusual squawks, METAR weather, NAS status / ground stops, ARTCC boundaries, OR wants the map driven in ANY way (fly to an airport, draw arcs, highlight a flight, RECOLOUR the planes, toggle a layer, filter by phase or squawk, switch to 3D, change METAR colour mode). HARD RULES: (1) ALL data and ALL map control live behind http://127.0.0.1:18890 in this same sandbox. NEVER curl upstream FAA/OpenSky/AWC/adsbdb/hexdb hosts directly — they're firewalled. If a local call fails say 'service unavailable', do not invent a network-outage excuse. (2) ANY request that changes what's drawn on the map REQUIRES issuing the matching POST /api/map/... call FIRST, BEFORE describing the result. Never claim 'I've updated the map to ...' unless you actually issued the POST this turn — the user is looking at a live chart and will see if nothing changed. (3) The aircraft colour scheme has exactly FOUR fixed presets — phase | altitude | vrate | squawk — set via POST /api/map/color {\"mode\":\"<one of four>\"}. Aliases 'elevation', 'flight level', 'rate of climb', 'emergency' are accepted. Do NOT invent custom palettes; describe only what the preset shows: phase = orange family, altitude = single-hue green ramp (mint→deep green, NOT a rainbow), vrate = diverging purple (violet↔magenta), squawk = grey + red/amber for 7500/7600/7700. (4) Other map controls: POST /api/map/metar-color (flt_cat|wind|temp|visibility), POST /api/map/layer, POST /api/map/filter, POST /api/map/goto, POST /api/map/view, POST /api/map/arcs (auto-tilts), POST /api/map/airspace3d, POST /api/map/track (ONE-shot 'find this plane and follow it' — preferred over /api/map/highlight + /api/map/view in two calls). (5) EVERY /api/map/* response includes a `delivered` integer = how many browser tabs received the broadcast. If `delivered:0` the dashboard isn't open right now — say 'I issued the command but no map UI is connected to receive it; please open http://127.0.0.1:18890 first', do NOT claim the map updated. The server caches the last sticky command for ~3 minutes, so a tab that opens shortly after will still catch up. Open the SKILL.md body for examples and field schemas."
 ---
 
 # flight-tracking
@@ -135,6 +135,27 @@ POST /api/map/layer      {"layer":"arcs","visible":true}
 #          metar, nas, artcc, navaids}
 
 POST /api/map/highlight  {"flight":"UAL123" | "a1b2c3"}      # callsign or ICAO24
+# Lower-level: just selects the flight + enables the trails layer +
+# tries to fly the camera. Browser may no-op if the bus message
+# arrives before the next /api/flights tick has populated the
+# client-side flight index. Prefer /api/map/track below for the full
+# "find this plane and show it to me" flow.
+
+POST /api/map/track      {"flight":"UAL108" | "a2ca5d"}      # ONE call: lookup + highlight + camera move
+# This is the canonical "find this plane and track it" tool. The
+# server resolves the live flight against the OpenSky feed, then
+# broadcasts BOTH `highlight` (selects + opens drawer + enables
+# trails) AND `view` (camera pan to the plane's current lat/lon)
+# in a single round-trip — atomic from the agent's perspective.
+# If the plane isn't in the live feed the response is
+# {"ok":false,"error":"no live contact for ..."} so the agent
+# learns immediately instead of broadcasting a stale highlight
+# the browser silently ignores.
+# `flight` is auto-classified: 6 hex chars → ICAO24, anything else
+# → callsign. `callsign` and `icao24` fields are also accepted
+# explicitly. Optional pose: zoom (default 10), pitch, bearing.
+# Use this whenever the user asks to "track UAL108", "follow that
+# plane", "find and zoom to the most recent IAD departure", etc.
 
 POST /api/map/color      {"mode":"phase|altitude|vrate|squawk"}
 # colour modes (also accepts aliases like "elevation", "rate of climb",
@@ -248,6 +269,29 @@ origin, any notable squawks (7500/7600/7700).
 
 ## How to look up a specific flight
 
+For "track this plane" / "find UAL123 and zoom in" / "follow that
+flight" requests, use `/api/map/track` — ONE call does the lookup,
+highlight, and camera move. Don't unroll it into separate
+`/api/flights` + `/api/map/highlight` + `/api/map/view` calls; that
+just gives the agent more chances to get distracted between steps
+(and was the original cause of "the agent narrated the position but
+the map never moved").
+
+```bash
+# user: "find UAL108 and track it on the map"
+curl -sX POST http://127.0.0.1:18890/api/map/track \
+     -H 'Content-Type: application/json' \
+     -d '{"flight":"UAL108","zoom":10,"pitch":45}'
+# → {"ok":true,"delivered":1,"flight":{"id":"A2CA5D","callsign":"UAL108",
+#    "lat":39.11,"lon":-76.76,"alt_m":5097,...}}
+# If `delivered` is 0, no browser tab is connected — tell the user
+# to open the dashboard, do NOT claim the map updated.
+```
+
+For "where did this flight come from? / where is it going?" reads
+that don't change the map, the per-flight read endpoints are still
+the right tool:
+
 ```bash
 # user: "where did UAL123 come from?"
 
@@ -263,7 +307,8 @@ curl -s "http://127.0.0.1:18890/api/flight/$ICAO24"
 # 3. (Optional) pull the waypoint track for "where it has been".
 curl -s "http://127.0.0.1:18890/api/flight/$ICAO24/track?time=0"
 
-# 4. Highlight it on the map for any connected browsers.
+# 4. (Optional) put it on the map — but if the user asked you to
+#    "track" or "follow" the plane, use /api/map/track above instead.
 curl -sX POST http://127.0.0.1:18890/api/map/highlight \
      -H 'Content-Type: application/json' \
      -d "{\"flight\":\"$ICAO24\"}"

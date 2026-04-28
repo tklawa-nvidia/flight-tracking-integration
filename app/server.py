@@ -679,24 +679,87 @@ async def fetch_aircraft_track(icao24: str, time_s: int = 0) -> dict[str, Any] |
 # ── WebSocket bus (push map commands to all connected browsers) ─────────────
 
 
+# How long an agent-driven "sticky" map command is replayed to fresh
+# WebSocket connections. Long enough to survive a browser reconnect blip,
+# a uvicorn restart, or a tab-visibility flap mid-conversation. Short
+# enough that a user reloading the page hours later isn't yanked back to
+# wherever the agent last pointed the camera.
+STICKY_TTL_SEC = 180
+
+
+def _sticky_key(message: dict[str, Any]) -> str | None:
+    """Return a slot key for messages that should be replayed on reconnect.
+
+    `goto` and `view` share the `camera` slot because either one fully
+    re-targets the camera — the most recent of either should win. Layers
+    and filters get one slot per layer/mode so toggling 'metar' on doesn't
+    forget that 'tfrs' was also turned on. Returning None opts the message
+    out of replay (chat messages, transient toasts, etc.).
+    """
+    t = message.get("type")
+    if t in ("goto", "view"):
+        return "camera"
+    if t in ("highlight", "color", "metar-color", "airspace3d", "arcs"):
+        return t
+    if t == "layer":
+        layer = message.get("layer")
+        return f"layer:{layer}" if layer else None
+    if t == "filter":
+        mode = message.get("mode")
+        return f"filter:{mode}" if mode else None
+    return None
+
+
 class MapBus:
-    """Fan-out hub for map commands generated outside the browser session."""
+    """Fan-out hub for map commands generated outside the browser session.
+
+    Also remembers the most recent agent-driven map state per "sticky slot"
+    (camera pose, selected flight, layer/color/filter toggles, …) and
+    replays it to any client that reconnects within ``STICKY_TTL_SEC``.
+    Without this, every WebSocket blip silently dropped agent commands —
+    the API still returned `ok` because no clients were subscribed at the
+    instant of broadcast, so the agent had no way to know the message was
+    lost.
+    """
 
     def __init__(self) -> None:
         self._clients: set[WebSocket] = set()
         self._lock = asyncio.Lock()
+        # Keyed by _sticky_key(msg) → (monotonic_set_at, message_dict).
+        self._sticky: dict[str, tuple[float, dict[str, Any]]] = {}
 
     async def connect(self, ws: WebSocket) -> None:
         await ws.accept()
+        now = time.time()
         async with self._lock:
             self._clients.add(ws)
+            # Drop expired entries on every connect — cheap garbage collect
+            # and avoids unbounded growth if the agent keeps spamming the
+            # bus while no client is around.
+            stale = [
+                k for k, (ts, _) in self._sticky.items()
+                if now - ts > STICKY_TTL_SEC
+            ]
+            for k in stale:
+                self._sticky.pop(k, None)
+            replay = [msg for _, (_, msg) in sorted(self._sticky.items())]
+        for msg in replay:
+            try:
+                await ws.send_json(msg)
+            except Exception:
+                # If the just-accepted socket is already dead, give up
+                # quietly — the receive loop will run disconnect().
+                return
 
     async def disconnect(self, ws: WebSocket) -> None:
         async with self._lock:
             self._clients.discard(ws)
 
     async def broadcast(self, message: dict[str, Any]) -> int:
+        key = _sticky_key(message)
         async with self._lock:
+            if key is not None:
+                self._sticky[key] = (time.time(), message)
             targets = list(self._clients)
         delivered = 0
         for ws in targets:
@@ -756,8 +819,8 @@ async def tool_goto(
         payload["pitch"] = float(pitch)
     if bearing is not None:
         payload["bearing"] = float(bearing)
-    await _bus.broadcast(payload)
-    return {"ok": True, **payload, "airport": a}
+    delivered = await _bus.broadcast(payload)
+    return {"ok": True, "delivered": delivered, **payload, "airport": a}
 
 
 async def tool_analyze_traffic(airport: str, radius_km: float = DEFAULT_ANALYSIS_RADIUS_KM) -> dict[str, Any]:
@@ -860,20 +923,127 @@ async def tool_show_arcs_to_airport(
             }
         )
     payload = {"type": "arcs", "airport": a["code"], "arcs": arcs}
-    await _bus.broadcast(payload)
-    return {"ok": True, "count": len(arcs), "airport": a["code"], "tilted": bool(tilt)}
+    delivered = await _bus.broadcast(payload)
+    return {
+        "ok": True,
+        "delivered": delivered,
+        "count": len(arcs),
+        "airport": a["code"],
+        "tilted": bool(tilt),
+    }
 
 
 async def tool_set_layer(layer: str, visible: bool) -> dict[str, Any]:
     payload = {"type": "layer", "layer": layer, "visible": bool(visible)}
-    await _bus.broadcast(payload)
-    return {"ok": True, **payload}
+    delivered = await _bus.broadcast(payload)
+    return {"ok": True, "delivered": delivered, **payload}
 
 
 async def tool_highlight_flight(flight: str) -> dict[str, Any]:
     payload = {"type": "highlight", "flight": flight.strip().upper()}
-    await _bus.broadcast(payload)
-    return {"ok": True, **payload}
+    delivered = await _bus.broadcast(payload)
+    return {"ok": True, "delivered": delivered, **payload}
+
+
+async def tool_track_flight(
+    *,
+    callsign: str | None = None,
+    icao24:   str | None = None,
+    zoom:     float | None = None,
+    pitch:    float | None = None,
+    bearing:  float | None = None,
+) -> dict[str, Any]:
+    """Combined plane-lookup + highlight + camera-move.
+
+    Resolves the live flight against the global OpenSky feed, then issues
+    BOTH a `highlight` broadcast (the browser uses it to set
+    selectedFlightId, enable the trails layer, and open the detail
+    drawer) AND a `view` broadcast carrying the plane's current lat/lon.
+    The double-broadcast matters: the `highlight` handler tries to fly
+    the camera too, but it can no-op for a few seconds if the bus
+    message arrives before the next /api/flights tick has populated the
+    client-side flight index. The follow-up `view` guarantees the camera
+    arrives even in that race.
+
+    Prefer this over driving /api/map/highlight + /api/map/view by hand:
+    one round-trip, atomic from the agent's side, and if the flight
+    isn't in the live feed we tell the agent immediately ("no live
+    contact") instead of silently broadcasting a highlight the browser
+    drops on the floor.
+    """
+    cs   = (callsign or "").strip().upper()
+    hex24 = (icao24 or "").strip().lower()
+    if not cs and not hex24:
+        return {"ok": False, "error": "provide callsign or icao24"}
+
+    feed = await fetch_flights(bbox=None)
+    candidates: list[dict[str, Any]] = feed.get("flights") or []
+
+    matched: dict[str, Any] | None = None
+    if hex24:
+        for f in candidates:
+            if (f.get("id") or "").lower() == hex24 \
+                    or (f.get("icao24") or "").lower() == hex24:
+                matched = f
+                break
+    if matched is None and cs:
+        for f in candidates:
+            if (f.get("callsign") or "").strip().upper() == cs:
+                matched = f
+                break
+
+    if matched is None:
+        return {
+            "ok": False,
+            "error": f"no live contact for callsign={cs!r} icao24={hex24!r}",
+            "hint": (
+                "The plane may not be in OpenSky's current window. Try "
+                "/api/flight/{icao24} for historical route, or "
+                "/api/flights?bbox=... to scan a region for similar "
+                "callsigns."
+            ),
+        }
+
+    flight_id     = (matched.get("id") or matched.get("icao24") or "").upper()
+    callsign_disp = (matched.get("callsign") or "").strip()
+    lat = matched.get("lat")
+    lon = matched.get("lon")
+
+    delivered_h = await _bus.broadcast(
+        {"type": "highlight", "flight": flight_id}
+    )
+
+    view: dict[str, Any] = {"type": "view"}
+    if lat is not None: view["lat"] = float(lat)
+    if lon is not None: view["lon"] = float(lon)
+    view["zoom"] = float(zoom) if zoom is not None else 10.0
+    if pitch   is not None: view["pitch"]   = float(pitch)
+    if bearing is not None: view["bearing"] = float(bearing)
+    delivered_v = await _bus.broadcast(view)
+
+    return {
+        "ok": True,
+        # Either of the two broadcasts hitting at least one client is
+        # success enough — the highlight handler's flyTo will catch up
+        # the rest. We surface the higher of the two so the agent can
+        # warn about an empty bus without false alarms during a brief
+        # client churn.
+        "delivered": max(delivered_h, delivered_v),
+        "flight": {
+            "id":         flight_id,
+            "icao24":     (matched.get("id") or matched.get("icao24") or "").lower(),
+            "callsign":   callsign_disp,
+            "lat":        lat,
+            "lon":        lon,
+            "alt_m":      matched.get("alt_m"),
+            "vrate_mps":  matched.get("vrate_mps"),
+            "heading":    matched.get("heading"),
+            "ground_speed_mps": matched.get("vel_mps") or matched.get("ground_speed_mps"),
+            "on_ground":  matched.get("on_ground"),
+            "country":    matched.get("country"),
+            "squawk":     matched.get("squawk"),
+        },
+    }
 
 
 # Aircraft colour modes the frontend understands. Kept in lock-step with
@@ -921,8 +1091,8 @@ async def tool_set_color_mode(mode: str) -> dict[str, Any]:
             "valid": sorted(COLOR_MODES),
         }
     payload = {"type": "color", "mode": resolved}
-    await _bus.broadcast(payload)
-    return {"ok": True, **payload}
+    delivered = await _bus.broadcast(payload)
+    return {"ok": True, "delivered": delivered, **payload}
 
 
 # ── METAR colour mode (weather station body) ────────────────────────────
@@ -962,8 +1132,8 @@ async def tool_set_metar_color_mode(mode: str) -> dict[str, Any]:
             "valid": sorted(METAR_COLOR_MODES),
         }
     payload = {"type": "metar-color", "mode": resolved}
-    await _bus.broadcast(payload)
-    return {"ok": True, **payload}
+    delivered = await _bus.broadcast(payload)
+    return {"ok": True, "delivered": delivered, **payload}
 
 
 # ── Phase / squawk bucket filters (chip legend) ─────────────────────────
@@ -1089,8 +1259,8 @@ async def tool_set_filter(
                 "valid_buckets": sorted(valid),
             }
 
-    await _bus.broadcast(msg)
-    return {"ok": True, **msg}
+    delivered = await _bus.broadcast(msg)
+    return {"ok": True, "delivered": delivered, **msg}
 
 
 # ── Free-form camera control ────────────────────────────────────────────
@@ -1113,15 +1283,15 @@ async def tool_set_view(
     if bearing is not None: payload["bearing"] = float(bearing)
     if len(payload) == 1:
         return {"ok": False, "error": "provide at least one of lat,lon,zoom,pitch,bearing"}
-    await _bus.broadcast(payload)
-    return {"ok": True, **payload}
+    delivered = await _bus.broadcast(payload)
+    return {"ok": True, "delivered": delivered, **payload}
 
 
 # ── 3D airspace toggle ──────────────────────────────────────────────────
 async def tool_set_airspace3d(enabled: bool) -> dict[str, Any]:
     payload = {"type": "airspace3d", "enabled": bool(enabled)}
-    await _bus.broadcast(payload)
-    return {"ok": True, **payload}
+    delivered = await _bus.broadcast(payload)
+    return {"ok": True, "delivered": delivered, **payload}
 
 
 def tool_search_airports(query: str) -> dict[str, Any]:
@@ -2490,6 +2660,47 @@ class HighlightBody(BaseModel):
 @app.post("/api/map/highlight")
 async def api_map_highlight(body: HighlightBody):
     return await tool_highlight_flight(body.flight)
+
+
+class TrackBody(BaseModel):
+    """Combined plane-lookup + highlight + camera-move.
+
+    Either of `flight`, `callsign`, or `icao24` identifies the target.
+    `flight` is auto-detected: 6 hex chars → ICAO24, anything else →
+    callsign. The optional pose fields override the defaults the
+    server picks (zoom 10, no pitch/bearing change).
+    """
+    flight:   str | None = None
+    callsign: str | None = None
+    icao24:   str | None = None
+    zoom:     float | None = None
+    pitch:    float | None = None
+    bearing:  float | None = None
+
+
+@app.post("/api/map/track")
+async def api_map_track(body: TrackBody):
+    cs  = body.callsign
+    hex24 = body.icao24
+    # Auto-classify a single `flight` token. ICAO24 transponder hex IDs
+    # are six hex digits (e.g. a2ca5d); flight callsigns are
+    # alphanumeric, usually 4–8 chars (e.g. UAL108, AAL2429). A 6-hex
+    # input could in theory collide with a hex-only callsign, but that's
+    # vanishingly rare in the real-world callsign space and ICAO24 is
+    # the more useful default for a tracking flow.
+    if body.flight and not (cs or hex24):
+        v = body.flight.strip()
+        if len(v) == 6 and all(ch in "0123456789abcdefABCDEF" for ch in v):
+            hex24 = v
+        else:
+            cs = v
+    return await tool_track_flight(
+        callsign=cs,
+        icao24=hex24,
+        zoom=body.zoom,
+        pitch=body.pitch,
+        bearing=body.bearing,
+    )
 
 
 class ColorBody(BaseModel):
