@@ -7,14 +7,14 @@
   --text: #d7e3f4;
   --text-dim: #8ea0b9;
   --text-faint: #5d6e88;
-  --accent: #5ee2ff;
+  --accent: #76b900;
   --accent-warm: #ffb86b;
   --accent-warn: #ff5d6c;
-  --accent-soft: rgba(94, 226, 255, 0.16);
-  --grid: rgba(94, 226, 255, 0.05);
+  --accent-soft: rgba(118, 185, 0, 0.16);
+  --grid: rgba(118, 185, 0, 0.05);
   --shadow-sharp: 0 1px 0 rgba(255, 255, 255, 0.04) inset, 0 12px 40px rgba(0, 0, 0, 0.6);
 
-  --rail-w: 380px;
+  --rail-w: 340px;
   --font-display: 'Manrope', system-ui, -apple-system, sans-serif;
   --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
 }
@@ -48,8 +48,12 @@ html, body, #app {
   backdrop-filter: blur(18px) saturate(140%);
   -webkit-backdrop-filter: blur(18px) saturate(140%);
   border-right: 1px solid var(--rail-stroke);
+  /* Brand row + tabs region (which itself holds the active tab panel and
+     fills the remaining height). HUD + Live data are no longer in the
+     rail — they're floating overlays anchored to the map stage so the
+     panel has more room for chat / layer toggles. */
   display: grid;
-  grid-template-rows: auto auto auto 1fr;
+  grid-template-rows: auto 1fr;
   height: 100vh;
   overflow: hidden;
   z-index: 5;
@@ -61,7 +65,7 @@ html, body, #app {
   position: absolute;
   inset: 0;
   background:
-    radial-gradient(800px 400px at -10% -10%, rgba(94, 226, 255, 0.12), transparent 60%),
+    radial-gradient(800px 400px at -10% -10%, rgba(118, 185, 0, 0.12), transparent 60%),
     radial-gradient(600px 400px at 110% 10%, rgba(255, 184, 107, 0.08), transparent 60%),
     linear-gradient(180deg, rgba(255, 255, 255, 0.02), transparent 30%);
   pointer-events: none;
@@ -80,12 +84,14 @@ html, body, #app {
   width: 36px;
   height: 36px;
   border-radius: 10px;
-  background: linear-gradient(135deg, #18324d, #0a1929);
-  border: 1px solid rgba(94, 226, 255, 0.25);
-  color: var(--accent);
+  background: linear-gradient(135deg, #1c3318, #0a1f0a);
+  border: 1px solid rgba(118, 185, 0, 0.38);
+  color: #76b900;
   display: grid;
   place-items: center;
-  box-shadow: 0 0 20px rgba(94, 226, 255, 0.18);
+  box-shadow:
+    0 0 20px rgba(118, 185, 0, 0.32),
+    inset 0 0 12px rgba(118, 185, 0, 0.08);
 }
 
 .brand-text { flex: 1; }
@@ -95,7 +101,7 @@ html, body, #app {
   letter-spacing: 0.06em;
   font-size: 15px;
   text-transform: uppercase;
-  background: linear-gradient(90deg, #ffffff, #5ee2ff 80%);
+  background: linear-gradient(90deg, #ffffff, #76b900 80%);
   -webkit-background-clip: text;
   background-clip: text;
   color: transparent;
@@ -115,8 +121,8 @@ html, body, #app {
   gap: 6px;
   padding: 4px 9px;
   border-radius: 999px;
-  background: rgba(94, 226, 255, 0.08);
-  border: 1px solid rgba(94, 226, 255, 0.22);
+  background: rgba(118, 185, 0, 0.08);
+  border: 1px solid rgba(118, 185, 0, 0.22);
   font-family: var(--font-mono);
   font-size: 10px;
   text-transform: uppercase;
@@ -142,26 +148,38 @@ html, body, #app {
   50% { opacity: 0.45; transform: scale(0.85); }
 }
 
-/* ── HUD ────────────────────────────────────────────────────────────────── */
+/* ── Floating HUD (top-left of the map) ─────────────────────────────────── */
+/* Three small glassy chips anchored to the map stage. They live outside
+   the rail so the rail panel itself can be all chat / layer toggles. */
 
-.hud {
-  padding: 14px 22px;
-  border-bottom: 1px solid var(--rail-stroke);
-  position: relative;
+.map-hud {
+  position: absolute;
+  top: 16px;
+  left: 16px;
+  z-index: 5;
+  display: flex;
+  gap: 8px;
+  padding: 6px;
+  background: rgba(8, 12, 22, 0.62);
+  border: 1px solid var(--rail-stroke);
+  border-radius: 14px;
+  backdrop-filter: blur(18px) saturate(140%);
+  -webkit-backdrop-filter: blur(18px) saturate(140%);
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.4);
+  pointer-events: auto;
 }
 
-.hud-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
-
 .hud-cell {
-  background: linear-gradient(180deg, rgba(255, 255, 255, 0.025), rgba(255, 255, 255, 0));
+  min-width: 70px;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.04), rgba(255, 255, 255, 0));
   border: 1px solid var(--rail-stroke);
   border-radius: 10px;
-  padding: 8px 10px;
+  padding: 6px 10px;
 }
 
 .hud-label {
-  font-size: 10px;
-  letter-spacing: 0.16em;
+  font-size: 9px;
+  letter-spacing: 0.18em;
   text-transform: uppercase;
   color: var(--text-faint);
 }
@@ -169,9 +187,200 @@ html, body, #app {
 .hud-value {
   font-family: var(--font-mono);
   font-weight: 700;
-  font-size: 19px;
-  margin-top: 2px;
+  font-size: 15px;
+  margin-top: 1px;
   color: var(--text);
+  line-height: 1.1;
+}
+
+/* ── Live data status cell ────────────────────────────────────────────── */
+/* Mirrors the header status-pill into the bottom HUD: dot + lower-case
+   label, color-coded by data-status. Drives a soft glow on the whole cell
+   when there's a problem so the eye is drawn without a popup. */
+.hud-status {
+  min-width: 116px;
+  transition: border-color 200ms ease, box-shadow 200ms ease, background 200ms ease;
+}
+
+.hud-status-value {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  text-transform: lowercase;
+  letter-spacing: 0.04em;
+  font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.hud-status-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--accent, #76b900);
+  box-shadow: 0 0 0 2px rgba(118, 185, 0, 0.18);
+  flex: 0 0 auto;
+}
+
+.hud-status[data-status="connecting"]  .hud-status-dot { background: #94a3b8; box-shadow: 0 0 0 2px rgba(148, 163, 184, 0.22); }
+.hud-status[data-status="ok"]          .hud-status-dot { background: #76b900; box-shadow: 0 0 0 2px rgba(118, 185, 0, 0.22); }
+.hud-status[data-status="stale"]       .hud-status-dot { background: #f5a524; box-shadow: 0 0 0 2px rgba(245, 165, 36, 0.28); }
+.hud-status[data-status="rate-limit"]  .hud-status-dot { background: #ef4444; box-shadow: 0 0 0 2px rgba(239, 68, 68, 0.32); animation: hudStatusPulse 1.6s ease-in-out infinite; }
+.hud-status[data-status="error"]       .hud-status-dot { background: #ef4444; box-shadow: 0 0 0 2px rgba(239, 68, 68, 0.32); }
+.hud-status[data-status="paused"]      .hud-status-dot { background: #64748b; box-shadow: 0 0 0 2px rgba(100, 116, 139, 0.22); }
+.hud-status[data-status="hidden"]      .hud-status-dot { background: #64748b; box-shadow: 0 0 0 2px rgba(100, 116, 139, 0.22); }
+.hud-status[data-status="manual"]      .hud-status-dot { background: #38bdf8; box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.28); }
+
+.hud-status[data-status="rate-limit"] {
+  border-color: rgba(239, 68, 68, 0.55);
+  background: linear-gradient(180deg, rgba(239, 68, 68, 0.16), rgba(239, 68, 68, 0.04));
+  box-shadow: 0 0 0 1px rgba(239, 68, 68, 0.25), 0 6px 18px rgba(239, 68, 68, 0.18);
+}
+
+.hud-status[data-status="error"] {
+  border-color: rgba(239, 68, 68, 0.45);
+}
+
+.hud-status[data-status="stale"] {
+  border-color: rgba(245, 165, 36, 0.45);
+}
+
+@keyframes hudStatusPulse {
+  0%, 100% { box-shadow: 0 0 0 2px rgba(239, 68, 68, 0.32), 0 0 0 0 rgba(239, 68, 68, 0.55); }
+  50%      { box-shadow: 0 0 0 2px rgba(239, 68, 68, 0.32), 0 0 0 8px rgba(239, 68, 68, 0); }
+}
+
+/* ── Floating Live data bar (bottom-center of the map) ──────────────────── */
+/* Compact, semi-transparent pill with snapshot/pause + cadence selector
+   + budget readout. Sits on the map so the rail can be reserved for
+   chat / layer controls. */
+
+.live-bar {
+  position: absolute;
+  left: 50%;
+  bottom: 22px;
+  transform: translateX(-50%);
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 16px 8px 18px;
+  border-radius: 999px;
+  background: rgba(8, 12, 22, 0.62);
+  border: 1px solid var(--rail-stroke);
+  backdrop-filter: blur(18px) saturate(140%);
+  -webkit-backdrop-filter: blur(18px) saturate(140%);
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.45);
+  font-size: 12px;
+  pointer-events: auto;
+}
+
+.live-bar-label {
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  padding-right: 4px;
+  border-right: 1px solid var(--rail-stroke);
+}
+
+/* ── Live-bar status pill ────────────────────────────────────────────── */
+/* Replaces the static "Live data" label with a colored-dot + state chip
+   that reflects the current pump status (connecting / live / stale /
+   rate-limited / error / paused / manual). Sits at the left edge of the
+   bottom live-data floating bar so the rate-limit signal is co-located
+   with the controls that throttle it. */
+.live-bar-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 10px 4px 8px;
+  margin-right: 4px;
+  border-right: 1px solid var(--rail-stroke);
+  border-radius: 999px 0 0 999px;
+  transition: background 200ms ease, box-shadow 200ms ease;
+  cursor: default;
+  user-select: none;
+}
+
+.live-bar-status-label {
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.live-bar-status-state {
+  font-family: var(--font-mono);
+  font-weight: 600;
+  font-size: 12px;
+  text-transform: lowercase;
+  letter-spacing: 0.04em;
+  color: var(--text);
+}
+
+.live-bar-status-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: #94a3b8;
+  box-shadow: 0 0 0 2px rgba(148, 163, 184, 0.22);
+  flex: 0 0 auto;
+}
+
+/* Color states — same palette as the (now-retired) header pill so users
+   only need to learn one color language. */
+.live-bar-status[data-status="connecting"] .live-bar-status-dot { background: #94a3b8; box-shadow: 0 0 0 2px rgba(148, 163, 184, 0.22); }
+.live-bar-status[data-status="ok"]         .live-bar-status-dot { background: #76b900; box-shadow: 0 0 0 2px rgba(118, 185, 0, 0.28); }
+.live-bar-status[data-status="stale"]      .live-bar-status-dot { background: #f5a524; box-shadow: 0 0 0 2px rgba(245, 165, 36, 0.30); }
+.live-bar-status[data-status="rate-limit"] .live-bar-status-dot { background: #ef4444; box-shadow: 0 0 0 2px rgba(239, 68, 68, 0.32); animation: liveBarStatusPulse 1.6s ease-in-out infinite; }
+.live-bar-status[data-status="error"]      .live-bar-status-dot { background: #ef4444; box-shadow: 0 0 0 2px rgba(239, 68, 68, 0.32); }
+.live-bar-status[data-status="paused"]     .live-bar-status-dot { background: #64748b; box-shadow: 0 0 0 2px rgba(100, 116, 139, 0.22); }
+.live-bar-status[data-status="hidden"]     .live-bar-status-dot { background: #64748b; box-shadow: 0 0 0 2px rgba(100, 116, 139, 0.22); }
+.live-bar-status[data-status="manual"]     .live-bar-status-dot { background: #38bdf8; box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.30); }
+
+.live-bar-status[data-status="rate-limit"] {
+  background: linear-gradient(180deg, rgba(239, 68, 68, 0.22), rgba(239, 68, 68, 0.08));
+  box-shadow: inset 0 0 0 1px rgba(239, 68, 68, 0.45);
+}
+.live-bar-status[data-status="rate-limit"] .live-bar-status-state { color: #fda4a4; }
+
+.live-bar-status[data-status="error"] {
+  background: linear-gradient(180deg, rgba(239, 68, 68, 0.16), rgba(239, 68, 68, 0.04));
+}
+.live-bar-status[data-status="stale"] {
+  background: linear-gradient(180deg, rgba(245, 165, 36, 0.14), rgba(245, 165, 36, 0.03));
+}
+
+@keyframes liveBarStatusPulse {
+  0%, 100% { box-shadow: 0 0 0 2px rgba(239, 68, 68, 0.32), 0 0 0 0 rgba(239, 68, 68, 0.55); }
+  50%      { box-shadow: 0 0 0 2px rgba(239, 68, 68, 0.32), 0 0 0 9px rgba(239, 68, 68, 0); }
+}
+
+.live-bar .btn-pill {
+  flex: 0 0 auto;
+}
+
+.live-bar .live-cadence {
+  width: auto;
+  border-left: 1px solid var(--rail-stroke);
+  padding-left: 12px;
+}
+
+.live-bar .live-cadence select {
+  min-width: 120px;
+}
+
+.live-budget {
+  font-size: 11px;
+  color: var(--text-faint);
+  border-left: 1px solid var(--rail-stroke);
+  padding-left: 12px;
+}
+
+.live-budget strong {
+  color: var(--text-dim);
+  font-weight: 600;
 }
 
 /* ── Layers ─────────────────────────────────────────────────────────────── */
@@ -223,14 +432,14 @@ html, body, #app {
 }
 
 .toggle input:checked {
-  background: rgba(94, 226, 255, 0.25);
-  border-color: rgba(94, 226, 255, 0.55);
+  background: rgba(118, 185, 0, 0.25);
+  border-color: rgba(118, 185, 0, 0.55);
 }
 
 .toggle input:checked::after {
   transform: translateX(14px);
   background: var(--accent);
-  box-shadow: 0 0 8px rgba(94, 226, 255, 0.6);
+  box-shadow: 0 0 8px rgba(118, 185, 0, 0.6);
 }
 
 .toggle em {
@@ -255,13 +464,29 @@ html, body, #app {
 
 .toggle .sw-tfr,
 .toggle .sw-sua,
-.toggle .sw-class {
+.toggle .sw-class,
+.toggle .sw-ats,
+.toggle .sw-runway,
+.toggle .sw-taxiway,
+.toggle .sw-obstacle,
+.toggle .sw-artcc,
+.toggle .sw-navaid,
+.toggle .sw-metar,
+.toggle .sw-nas {
   position: relative;
   padding-left: 14px;
 }
 .toggle .sw-tfr::before,
 .toggle .sw-sua::before,
-.toggle .sw-class::before {
+.toggle .sw-class::before,
+.toggle .sw-ats::before,
+.toggle .sw-runway::before,
+.toggle .sw-taxiway::before,
+.toggle .sw-obstacle::before,
+.toggle .sw-artcc::before,
+.toggle .sw-navaid::before,
+.toggle .sw-metar::before,
+.toggle .sw-nas::before {
   content: "";
   position: absolute;
   left: 0; top: 50%;
@@ -269,17 +494,121 @@ html, body, #app {
   border-radius: 2px;
   transform: translateY(-50%);
 }
-.toggle .sw-tfr::before   { background: rgba(255, 80, 110, 0.95); box-shadow: 0 0 6px rgba(255, 80, 110, 0.85); animation: pulse-dot 2.4s ease-in-out infinite; }
-.toggle .sw-sua::before   { background: rgba(255, 124,  64, 0.85); }
-.toggle .sw-class::before { background: rgba(120, 170, 255, 0.85); }
+.toggle .sw-tfr::before      { background: rgba(255, 80, 110, 0.95); box-shadow: 0 0 6px rgba(255, 80, 110, 0.85); }
+.toggle .sw-sua::before      { background: rgba(255, 124,  64, 0.85); }
+.toggle .sw-class::before    { background: rgba(120, 170, 255, 0.85); }
+.toggle .sw-ats::before      { background: rgba( 60, 255, 140, 0.95); box-shadow: 0 0 6px rgba(60, 255, 140, 0.45); }
+.toggle .sw-runway::before   { background: rgba(255, 130, 195, 0.95); box-shadow: 0 0 6px rgba(255, 130, 195, 0.45); }
+.toggle .sw-taxiway::before  { background: rgba(120, 230, 150, 0.95); }
+.toggle .sw-obstacle::before { background: rgba(255,  90, 110, 0.95); }
+.toggle .sw-artcc::before    { background: rgba(160, 220, 255, 0.6); border: 1px solid rgba(120, 200, 255, 0.9); border-radius: 50%; }
+.toggle .sw-navaid::before   { background: rgba(255, 240, 130, 0.95); border-radius: 50%; box-shadow: 0 0 5px rgba(255, 240, 130, 0.55); }
+.toggle .sw-metar::before    {
+  background: linear-gradient(135deg,
+    rgba( 80, 220, 130, 0.95) 0 50%,
+    rgba(255, 100, 100, 0.95) 50% 100%);
+  border-radius: 50%;
+}
+.toggle .sw-nas::before      { background: rgba(255, 80, 110, 0.95); box-shadow: 0 0 6px rgba(255, 80, 110, 0.85); border-radius: 50%; }
 
-@keyframes pulse-dot {
-  0%, 100% { opacity: 0.6; box-shadow: 0 0 4px rgba(255, 80, 110, 0.4); }
-  50%      { opacity: 1.0; box-shadow: 0 0 10px rgba(255, 80, 110, 1.0); }
+/* The 3D-extrude toggle gets its own swatch styled like a tiny pillar
+   so the icon hints at extrusion. Same alignment rules as the other
+   sw-* swatches. */
+.toggle .sw-extrude {
+  position: relative;
+  padding-left: 14px;
+}
+.toggle .sw-extrude::before {
+  content: "";
+  position: absolute;
+  left: 0; top: 50%;
+  width: 5px; height: 12px;
+  border-radius: 1px;
+  transform: translateY(-50%);
+  background: linear-gradient(180deg, rgba(118, 185, 0, 0.95), rgba(118, 185, 0, 0.25));
+  box-shadow: 0 0 6px rgba(118, 185, 0, 0.5);
+}
+
+/* ── 3D airspace controls block ───────────────────────────────────────── */
+/* The toggle + slider live in a faint card so the user reads them as a
+   single feature rather than two unrelated rows. The slider is hidden
+   until the toggle is on (via the `.disabled` class added by JS). */
+.airspace-3d {
+  margin: 6px 0 4px;
+  padding: 8px 10px 10px;
+  background: rgba(118, 185, 0, 0.04);
+  border: 1px solid rgba(118, 185, 0, 0.15);
+  border-radius: 8px;
+}
+
+.airspace-3d .vscale {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  font-size: 11px;
+  color: var(--text-dim);
+  transition: opacity 0.15s ease;
+}
+
+.airspace-3d .vscale.disabled {
+  opacity: 0.35;
+  pointer-events: none;
+}
+
+.airspace-3d .vscale label {
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+}
+
+.airspace-3d .vscale input[type="range"] {
+  appearance: none;
+  width: 100%;
+  height: 4px;
+  border-radius: 2px;
+  background: linear-gradient(90deg, rgba(118, 185, 0, 0.15), rgba(118, 185, 0, 0.55));
+  cursor: pointer;
+}
+
+.airspace-3d .vscale input[type="range"]::-webkit-slider-thumb {
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 2px solid rgba(8, 12, 22, 0.85);
+  box-shadow: 0 0 6px rgba(118, 185, 0, 0.55);
+  cursor: pointer;
+}
+
+.airspace-3d .vscale input[type="range"]::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 2px solid rgba(8, 12, 22, 0.85);
+  box-shadow: 0 0 6px rgba(118, 185, 0, 0.55);
+  cursor: pointer;
+}
+
+.airspace-3d .vscale > span {
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+  color: var(--text);
+  min-width: 36px;
+  text-align: right;
+}
+
+.airspace-3d .hint {
+  margin: 8px 0 0;
+  font-size: 10.5px;
+  color: var(--text-faint);
+  line-height: 1.35;
 }
 
 .legend {
-  margin-top: 10px;
+  margin-top: 12px;
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 4px 12px;
@@ -293,32 +622,295 @@ html, body, #app {
   border-radius: 2px;
   vertical-align: -1px;
 }
-.dot-prohibited { background: rgba(255,  64,  76, 0.95); box-shadow: 0 0 4px rgba(255, 96, 110, 0.8); }
-.dot-restricted { background: rgba(255, 124,  64, 0.95); box-shadow: 0 0 4px rgba(255, 156, 88, 0.6); }
-.dot-moa        { background: rgba(255, 220,  88, 0.95); }
-.dot-warning    { background: rgba(255, 196,  64, 0.95); }
-.dot-class-b    { background: rgba(255, 124, 220, 0.95); }
-.dot-class-c    { background: rgba(148, 188, 255, 0.95); }
+.dot-prohibited     { background: rgba(255,  64,  76, 0.95); box-shadow: 0 0 4px rgba(255, 96, 110, 0.8); }
+.dot-restricted     { background: rgba(255, 124,  64, 0.95); box-shadow: 0 0 4px rgba(255, 156, 88, 0.6); }
+.dot-moa            { background: rgba(255, 220,  88, 0.95); }
+.dot-warning        { background: rgba(255, 196,  64, 0.95); }
+.dot-class-b        { background: rgba(255, 124, 220, 0.95); }
+.dot-class-c        { background: rgba(148, 188, 255, 0.95); }
+.dot-open           { background: rgba(120, 230, 150, 0.95); }
+.dot-closed         { background: rgba(255,  90, 110, 0.95); }
+.dot-construction   { background: rgba(255, 170,  80, 0.95); }
+.dot-ats            { background: rgba( 60, 255, 140, 0.95); box-shadow: 0 0 4px rgba(60, 255, 140, 0.6); }
+.dot-obstacle-tall  { background: rgba(255,  80, 110, 0.95); }
+.dot-obstacle-mid   { background: rgba(255, 150,  90, 0.95); }
+.dot-artcc          { background: rgba(160, 220, 255, 0.45); border: 1px solid rgba(120, 200, 255, 0.95); border-radius: 50%; }
+.dot-navaid-vor     { background: rgba(255, 240, 130, 0.95); border-radius: 50%; box-shadow: 0 0 4px rgba(255, 240, 130, 0.6); }
+.dot-navaid-other   { background: rgba(180, 230, 255, 0.85); border-radius: 50%; }
 
-/* ── Live data section ─────────────────────────────────────────────────── */
+/* Aircraft phase-of-flight colours — must stay in sync with planeColor() in
+   app.js so the legend tells the truth. */
+.dot-climb          { background: rgba(255, 214,  72, 1.00); }
+.dot-level-slow     { background: rgba(255, 178,  82, 1.00); }
+.dot-level-fast     { background: rgba(232, 118,  40, 1.00); }
+.dot-descend        { background: rgba(200,  78,  62, 1.00); }
+.dot-ground         { background: rgba(195, 200, 210, 0.95); }
+.dot-selected       { background: rgba(255, 184, 107, 1.00); box-shadow: 0 0 6px rgba(255, 184, 107, 0.7); }
 
-.live {
-  padding: 14px 22px 10px;
-  border-bottom: 1px solid var(--rail-stroke);
+/* Emergency squawk legend — must stay in sync with planeColorSquawk(). */
+.dot-sqk-7500       { background: rgba(255,  70,  90, 1.00); box-shadow: 0 0 6px rgba(255, 90, 110, 0.85); }
+.dot-sqk-7600       { background: rgba(255, 170,  60, 1.00); box-shadow: 0 0 6px rgba(255, 180, 80, 0.7); }
+.dot-sqk-7700       { background: rgba(255,  60,  60, 1.00); box-shadow: 0 0 7px rgba(255, 80, 80, 0.85); }
+.dot-sqk-normal     { background: rgba(150, 165, 185, 0.85); }
+
+/* ── Legend-as-filter chips (phase + squawk modes) ─────────────────────────
+   The phase and squawk legends double as multi-select filters: every chip
+   represents one bucket of aircraft (climb, descent, on-ground, 7500…) and
+   clicking the chip toggles whether that bucket is rendered on the map.
+   Active chips get a thin green outline and crisp white text so the user
+   can see at a glance which buckets are "armed". Inactive chips fade their
+   text and dot — the swatch stays visible (so they remember what they
+   turned off) but reads as muted. Continuous color modes (altitude /
+   vertical rate) don't use these — they keep the original .legend > div
+   rows which are display-only. */
+.legend-filterable {
+  /* The chips look denser than the original two-up grid. Stack them in a
+     single column so the green outlines line up vertically and don't
+     ride into each other on hover. */
+  grid-template-columns: 1fr;
+  gap: 4px;
 }
 
-.live-row {
-  display: flex;
+.legend-chip {
+  /* Inherit the existing legend-row look (dot + text) but make it a real
+     interactive surface — fully styleable button, no native chrome. */
+  appearance: none;
+  -webkit-appearance: none;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  padding: 4px 10px 4px 8px;
+  font: inherit;
+  font-size: 11px;
+  color: var(--text-dim);
+  text-align: left;
+  cursor: pointer;
+  display: inline-flex;
   align-items: center;
-  gap: 8px;
-  margin-bottom: 8px;
-  flex-wrap: wrap;
+  gap: 0;
+  transition:
+    border-color 120ms ease,
+    color 120ms ease,
+    background-color 120ms ease,
+    box-shadow 160ms ease,
+    opacity 160ms ease;
+  user-select: none;
+  -webkit-user-select: none;
 }
 
-.live-row .btn-pill {
-  flex: 1 1 auto;
-  text-align: center;
+.legend-chip .dot {
+  /* Override the default vertical-align: -1px so the dot reads as
+     centered against the larger chip box. Margin-right inherits from
+     the base .legend .dot rule. */
+  vertical-align: 0;
 }
+
+.legend-chip:hover {
+  color: rgba(245, 250, 255, 0.92);
+  background: rgba(255, 255, 255, 0.04);
+}
+
+/* The "armed" state: thin green hairline + white text. We use rgb-with-
+   alpha rather than a hard rgb() so the outline still feels weightless
+   against the dark drawer. The faint inset glow is what sells the
+   "selected" feel without competing with the inner color dot. */
+.legend-chip[data-active="true"] {
+  border-color: rgba(120, 220, 150, 0.85);
+  color: rgba(248, 252, 255, 0.98);
+  box-shadow:
+    0 0 0 1px rgba(120, 220, 150, 0.18),
+    inset 0 0 6px rgba(120, 220, 150, 0.10);
+}
+
+.legend-chip[data-active="true"]:hover {
+  border-color: rgba(150, 240, 175, 1.0);
+  background: rgba(120, 220, 150, 0.08);
+}
+
+/* Disarmed: dim the dot + text, drop the outline entirely. The chip
+   still occupies the same footprint so toggling doesn't reflow the
+   legend; only its weight changes. */
+.legend-chip[data-active="false"] {
+  color: var(--text-faint);
+  opacity: 0.62;
+}
+
+.legend-chip[data-active="false"] .dot {
+  filter: saturate(0.35) brightness(0.72);
+  box-shadow: none;
+}
+
+.legend-chip[data-active="false"]:hover {
+  opacity: 0.85;
+  color: rgba(220, 230, 240, 0.85);
+}
+
+.legend-chip:focus-visible {
+  outline: none;
+  border-color: rgba(150, 240, 175, 1.0);
+  box-shadow:
+    0 0 0 2px rgba(120, 220, 150, 0.35),
+    inset 0 0 6px rgba(120, 220, 150, 0.12);
+}
+
+/* The "Selected" entry that lives alongside the chips isn't a bucket —
+   it's a swatch indicator. Match the chip box dimensions so it lines
+   up visually, but no border, no hover, no pointer. */
+.legend-static {
+  display: inline-flex;
+  align-items: center;
+  padding: 4px 10px 4px 8px;
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+/* Subtle one-line hint that sits at the bottom of a filterable legend.
+   Spans the full row so it doesn't ride alongside a chip. */
+.legend-hint {
+  grid-column: 1 / -1;
+  margin-top: 4px;
+  padding: 0 4px;
+  font-size: 9.5px;
+  letter-spacing: 0.04em;
+  color: var(--text-faint);
+  opacity: 0.78;
+}
+
+/* Continuous gradients for altitude / vertical-rate legends. The CSS
+   gradient endpoints mirror the JS endpoints so the legend visually
+   represents the same colour ramp the icons actually use. */
+.legend .alt-bar,
+.legend .vr-bar {
+  display: block;
+  width: 100%;
+  height: 10px;
+  border-radius: 6px;
+  margin-bottom: 4px;
+  border: 1px solid var(--rail-stroke);
+}
+
+.legend .alt-bar {
+  background: linear-gradient(
+    90deg,
+    rgb(220, 250, 225) 0%,
+    rgb(150, 235, 175) 28%,
+    rgb( 60, 210, 110) 65%,
+    rgb( 30, 160,  72) 100%
+  );
+}
+
+.legend .vr-bar {
+  background: linear-gradient(
+    90deg,
+    rgb( 80,  40, 140) 0%,
+    rgb(160, 120, 200) 30%,
+    rgb(225, 220, 235) 50%,
+    rgb(220, 130, 230) 70%,
+    rgb(210,  60, 230) 100%
+  );
+}
+
+.legend .alt-scale,
+.legend .vr-scale {
+  display: flex;
+  justify-content: space-between;
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  color: var(--text-faint);
+  grid-column: 1 / -1;
+  margin: -2px 0 6px;
+}
+
+/* The altitude & vertical-rate legends need the gradient bar to span
+   the whole row instead of sitting in a 2-column grid cell. */
+.legend.legend-altitude > div:first-child,
+.legend.legend-vrate > div:first-child {
+  grid-column: 1 / -1;
+}
+
+/* ── METAR colour-mode legends ─────────────────────────────────────────────
+   Mirrors the .alt-bar / .vr-bar gradient stops of the aircraft colour
+   modes so the picker reads as one consistent control surface. The
+   accordion structure (.cm-row / .cm-head / .cm-body) is inherited
+   wholesale; only the colour swatches are bespoke per mode. */
+
+.legend .dot-met-vfr  { background: rgb( 80, 220, 130); }
+.legend .dot-met-mvfr { background: rgb( 80, 160, 240); }
+.legend .dot-met-ifr  { background: rgb(255, 100, 100); }
+.legend .dot-met-lifr { background: rgb(220, 100, 220); }
+
+.legend .met-wind-bar,
+.legend .met-temp-bar,
+.legend .met-vis-bar {
+  display: block;
+  width: 100%;
+  height: 10px;
+  border-radius: 6px;
+  margin-bottom: 4px;
+  border: 1px solid var(--rail-stroke);
+}
+.legend .met-wind-bar {
+  background: linear-gradient(
+    90deg,
+    rgb(140, 160, 180) 0%,
+    rgb(120, 200, 235) 18%,
+    rgb( 90, 220, 150) 36%,
+    rgb(240, 220,  90) 56%,
+    rgb(255, 150,  70) 78%,
+    rgb(255,  90,  90) 100%
+  );
+}
+.legend .met-temp-bar {
+  background: linear-gradient(
+    90deg,
+    rgb(120, 130, 220) 0%,
+    rgb( 90, 180, 235) 18%,
+    rgb(120, 220, 240) 32%,
+    rgb(120, 230, 170) 48%,
+    rgb(220, 230, 120) 64%,
+    rgb(255, 170,  90) 82%,
+    rgb(255,  90,  80) 100%
+  );
+}
+.legend .met-vis-bar {
+  background: linear-gradient(
+    90deg,
+    rgb(220, 100, 220) 0%,
+    rgb(255, 100, 100) 18%,
+    rgb(255, 180,  90) 38%,
+    rgb(255, 220, 110) 58%,
+    rgb(120, 220, 150) 100%
+  );
+}
+
+.legend .met-wind-scale,
+.legend .met-temp-scale,
+.legend .met-vis-scale {
+  display: flex;
+  justify-content: space-between;
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  color: var(--text-faint);
+  grid-column: 1 / -1;
+  margin: -2px 0 6px;
+}
+
+.legend.legend-metar-wind > div:first-child,
+.legend.legend-metar-temp > div:first-child,
+.legend.legend-metar-vis  > div:first-child {
+  grid-column: 1 / -1;
+}
+
+/* The METAR mode "active" dot in the accordion head should reflect the
+   currently selected mode's signature colour. Without per-mode tints
+   every row's status dot looks identical, defeating the point of the
+   group's coloured collapse-state. */
+.cm-row:has(input[value="flt_cat"]:checked) .cm-dot     { background: rgb( 80, 220, 130); }
+.cm-row:has(input[value="wind"]:checked) .cm-dot        { background: rgb(120, 200, 235); }
+.cm-row:has(input[value="temp"]:checked) .cm-dot        { background: rgb(220, 230, 120); }
+.cm-row:has(input[value="visibility"]:checked) .cm-dot  { background: rgb(120, 220, 150); }
+
+/* ── Live data controls (now lives inside .live-bar) ───────────────────── */
 
 .btn-pill {
   border-radius: 999px;
@@ -373,19 +965,142 @@ html, body, #app {
 }
 
 .live-cadence select:focus {
-  outline: 1px solid rgba(94, 226, 255, 0.55);
+  outline: 1px solid rgba(118, 185, 0, 0.55);
   outline-offset: 1px;
 }
 
-.live-hint {
-  font-size: 11px;
-  line-height: 1.5;
-  color: var(--text-faint);
+/* ── Aircraft colour-mode picker (accordion) ────────────────────────────── */
+/* Stacked rows; clicking a row both selects that colour mode AND expands
+   the row to show its legend inline. State is held by the radio inside
+   each row, so `:has(input:checked)` drives both the highlight and the
+   accordion expand purely in CSS — JS just listens for `change`. */
+
+.color-modes {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 6px 0 12px;
 }
 
-.live-hint strong {
-  color: var(--text-dim);
+.cm-row {
+  position: relative;
+  display: block;
+  background: rgba(255, 255, 255, 0.025);
+  border: 1px solid var(--rail-stroke);
+  border-radius: 10px;
+  cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease;
+  overflow: hidden;
+  user-select: none;
+}
+
+.cm-row:hover {
+  background: rgba(255, 255, 255, 0.04);
+  border-color: rgba(118, 185, 0, 0.3);
+}
+
+/* The native radio is hidden but kept in the DOM for accessibility +
+   keyboard nav. The visible "dot" mirrors its checked state. */
+.cm-row > input[type="radio"] {
+  position: absolute;
+  appearance: none;
+  width: 0;
+  height: 0;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.cm-head {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 12px 14px;
+}
+
+.cm-dot {
+  flex-shrink: 0;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 1px solid var(--rail-stroke);
+  background: rgba(255, 255, 255, 0.04);
+  transition: border-color 0.15s ease, background 0.15s ease, box-shadow 0.15s ease;
+}
+
+.cm-text {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.cm-chev {
+  flex-shrink: 0;
+  font-size: 11px;
+  color: var(--text-faint);
+  transition: transform 0.2s ease, color 0.2s ease;
+}
+
+.cm-title {
+  font-size: 12.5px;
   font-weight: 600;
+  color: var(--text);
+  letter-spacing: 0.02em;
+  line-height: 1.15;
+}
+
+.cm-sub {
+  font-size: 10.5px;
+  color: var(--text-faint);
+  letter-spacing: 0.02em;
+  line-height: 1.3;
+}
+
+/* Selected row: accent border + active dot + flipped chevron +
+   expanded body. The two-stage grid-template-rows trick (0fr → 1fr)
+   animates the body's auto-computed height without us having to know
+   it ahead of time. */
+.cm-row:has(input[type="radio"]:checked) {
+  border-color: rgba(118, 185, 0, 0.55);
+  background: rgba(118, 185, 0, 0.07);
+}
+
+.cm-row:has(input[type="radio"]:checked) .cm-dot {
+  border-color: var(--accent);
+  background:
+    radial-gradient(circle, var(--accent) 0 3.5px, transparent 4px),
+    rgba(118, 185, 0, 0.12);
+  box-shadow: 0 0 10px rgba(118, 185, 0, 0.55);
+}
+
+.cm-row:has(input[type="radio"]:checked) .cm-chev {
+  transform: rotate(180deg);
+  color: var(--accent);
+}
+
+.cm-body {
+  display: grid;
+  grid-template-rows: 0fr;
+  transition: grid-template-rows 0.22s ease;
+}
+
+.cm-body-inner {
+  min-height: 0;
+  overflow: hidden;
+}
+
+.cm-row:has(input[type="radio"]:checked) .cm-body {
+  grid-template-rows: 1fr;
+}
+
+/* Tighten the legend a hair when it sits inside an accordion body, and
+   add a soft separator above so it reads as "details about the row
+   above". */
+.cm-body-inner .legend {
+  margin: 0;
+  padding: 10px 14px 14px;
+  border-top: 1px dashed var(--rail-stroke);
 }
 
 /* ── Chat ───────────────────────────────────────────────────────────────── */
@@ -422,9 +1137,9 @@ html, body, #app {
 }
 .tab-btn:hover { color: var(--text); background: rgba(255, 255, 255, 0.025); }
 .tab-btn.active {
-  color: var(--accent);
-  border-bottom-color: var(--accent);
-  background: linear-gradient(180deg, rgba(94, 226, 255, 0.08), transparent 70%);
+  color: #76b900;
+  border-bottom-color: #76b900;
+  background: linear-gradient(180deg, rgba(118, 185, 0, 0.10), transparent 70%);
 }
 
 .tab-panel {
@@ -503,8 +1218,8 @@ html, body, #app {
 }
 
 .msg-user .msg-content {
-  background: linear-gradient(135deg, rgba(94, 226, 255, 0.18), rgba(94, 226, 255, 0.06));
-  border-color: rgba(94, 226, 255, 0.35);
+  background: linear-gradient(135deg, rgba(118, 185, 0, 0.18), rgba(118, 185, 0, 0.06));
+  border-color: rgba(118, 185, 0, 0.35);
   align-self: flex-end;
   max-width: 90%;
   border-bottom-right-radius: 4px;
@@ -527,6 +1242,76 @@ html, body, #app {
   font-size: 12px;
 }
 
+/* Markdown rendering inside bot replies. Tight vertical rhythm so
+   the chat doesn't feel like a Word document — generous side padding
+   and small headings keep emphasis without dominating the panel. */
+.msg-bot .msg-content > *:first-child { margin-top: 0; }
+.msg-bot .msg-content > *:last-child  { margin-bottom: 0; }
+.msg-bot .msg-content p {
+  margin: 0 0 8px;
+}
+.msg-bot .msg-content p:last-child { margin-bottom: 0; }
+.msg-bot .msg-content h3 {
+  font-size: 13px;
+  font-weight: 600;
+  margin: 10px 0 4px;
+  letter-spacing: 0.01em;
+  color: rgba(245, 250, 255, 0.96);
+}
+.msg-bot .msg-content h4 {
+  font-size: 12px;
+  font-weight: 600;
+  margin: 8px 0 3px;
+  letter-spacing: 0.01em;
+  color: rgba(240, 248, 255, 0.92);
+}
+.msg-bot .msg-content ul,
+.msg-bot .msg-content ol {
+  margin: 4px 0 8px;
+  padding-left: 18px;
+}
+.msg-bot .msg-content li {
+  margin: 0 0 2px;
+  line-height: 1.45;
+}
+.msg-bot .msg-content li:last-child { margin-bottom: 0; }
+.msg-bot .msg-content strong {
+  color: rgba(255, 255, 255, 0.97);
+  font-weight: 600;
+}
+.msg-bot .msg-content em {
+  color: rgba(245, 250, 255, 0.88);
+  font-style: italic;
+}
+.msg-bot .msg-content code {
+  background: rgba(255, 255, 255, 0.06);
+  padding: 1px 4px;
+  border-radius: 4px;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+}
+.msg-bot .msg-content pre {
+  background: rgba(0, 0, 0, 0.32);
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  margin: 6px 0;
+  overflow-x: auto;
+}
+.msg-bot .msg-content pre code {
+  background: transparent;
+  padding: 0;
+  border: 0;
+}
+.msg-bot .msg-content a {
+  color: rgba(120, 220, 255, 0.96);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  text-decoration-thickness: 1px;
+}
+.msg-bot .msg-content a:hover {
+  color: rgba(180, 240, 255, 1);
+}
+
 .msg-tools {
   margin-top: 6px;
   display: flex;
@@ -541,9 +1326,9 @@ html, body, #app {
   letter-spacing: 0.1em;
   padding: 2px 6px;
   border-radius: 6px;
-  border: 1px solid rgba(94, 226, 255, 0.3);
+  border: 1px solid rgba(118, 185, 0, 0.3);
   color: var(--accent);
-  background: rgba(94, 226, 255, 0.08);
+  background: rgba(118, 185, 0, 0.08);
 }
 
 .msg-thinking .msg-content {
@@ -586,7 +1371,7 @@ html, body, #app {
   cursor: pointer;
   transition: border-color 0.15s ease, color 0.15s ease, background 0.15s ease;
 }
-.chip:hover { color: var(--accent); border-color: rgba(94, 226, 255, 0.45); background: rgba(94, 226, 255, 0.07); }
+.chip:hover { color: var(--accent); border-color: rgba(118, 185, 0, 0.45); background: rgba(118, 185, 0, 0.07); }
 
 .chat-input {
   display: grid;
@@ -610,13 +1395,13 @@ html, body, #app {
 }
 
 .chat-input input[type="text"]:focus {
-  border-color: rgba(94, 226, 255, 0.6);
-  background: rgba(94, 226, 255, 0.05);
+  border-color: rgba(118, 185, 0, 0.6);
+  background: rgba(118, 185, 0, 0.05);
 }
 
 .chat-input button {
-  background: linear-gradient(135deg, #5ee2ff, #2da2c7);
-  color: #001722;
+  background: linear-gradient(135deg, #76b900, #4f7d00);
+  color: #0a1f0a;
   border: none;
   border-radius: 10px;
   padding: 0 14px;
@@ -627,7 +1412,7 @@ html, body, #app {
   transition: transform 0.12s ease, box-shadow 0.12s ease;
 }
 
-.chat-input button:hover { transform: translateY(-1px); box-shadow: 0 4px 14px rgba(94, 226, 255, 0.35); }
+.chat-input button:hover { transform: translateY(-1px); box-shadow: 0 4px 14px rgba(118, 185, 0, 0.40); }
 .chat-input button:disabled { opacity: 0.55; cursor: not-allowed; transform: none; }
 
 .rail-footer {
@@ -757,11 +1542,19 @@ html, body, #app {
   gap: 8px;
 }
 
+/* The "Show trail" / "Arcs to nearest airport" actions are aircraft-only.
+   Hide them when the drawer is showing an airport, METAR station, NAS
+   advisory, or airspace feature. The default (no data-kind set) also
+   hides them — safer fallback if a caller forgets to set the kind. */
+.detail-drawer:not([data-kind="aircraft"]) .drawer-actions {
+  display: none;
+}
+
 .btn-ghost {
   flex: 1;
-  background: rgba(94, 226, 255, 0.08);
-  border: 1px solid rgba(94, 226, 255, 0.3);
-  color: var(--accent);
+  background: rgba(118, 185, 0, 0.10);
+  border: 1px solid rgba(118, 185, 0, 0.35);
+  color: #76b900;
   border-radius: 8px;
   padding: 8px 10px;
   font-size: 11.5px;
@@ -769,28 +1562,159 @@ html, body, #app {
   cursor: pointer;
   transition: background 0.15s ease, border-color 0.15s ease;
 }
-.btn-ghost:hover { background: rgba(94, 226, 255, 0.18); }
+.btn-ghost:hover { background: rgba(118, 185, 0, 0.20); border-color: rgba(118, 185, 0, 0.55); }
 
 /* ── Toast ──────────────────────────────────────────────────────────────── */
 
+/* Anchored bottom-right so the floating live-bar in the bottom-centre
+   is never obscured. The 24px right inset matches the live-bar's own
+   bottom inset for visual rhythm. */
 .toast {
   position: absolute;
-  left: 50%;
+  right: 24px;
   bottom: 24px;
-  transform: translate(-50%, 12px);
+  transform: translate(0, 12px);
   background: rgba(8, 12, 22, 0.92);
-  border: 1px solid rgba(94, 226, 255, 0.35);
+  border: 1px solid rgba(118, 185, 0, 0.35);
   color: var(--text);
   padding: 9px 14px;
   border-radius: 10px;
   font-size: 12px;
   letter-spacing: 0.04em;
+  max-width: 360px;
   opacity: 0;
   transition: opacity 0.2s ease, transform 0.2s ease;
   pointer-events: none;
   z-index: 7;
 }
-.toast.show { opacity: 1; transform: translate(-50%, 0); }
+.toast.show { opacity: 1; transform: translate(0, 0); }
+
+/* METAR / NAS hover popup — anchored to the cursor by deck.gl's hover
+   handler. Translucent dark card with a coloured top stripe so the user
+   can see the VFR/IFR category at a glance even in their peripheral
+   vision. */
+.map-popup {
+  position: absolute;
+  pointer-events: none;
+  background: rgba(8, 12, 22, 0.94);
+  border: 1px solid rgba(118, 185, 0, 0.32);
+  color: var(--text);
+  padding: 10px 12px;
+  border-radius: 10px;
+  font-size: 12px;
+  line-height: 1.45;
+  max-width: 320px;
+  z-index: 6;
+  transform: translate(8px, 8px);
+  opacity: 0;
+  transition: opacity 0.12s ease;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.45);
+}
+.map-popup.show { opacity: 1; }
+.map-popup .pop-title {
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  margin-bottom: 4px;
+}
+.map-popup .pop-cat {
+  display: inline-block;
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  font-size: 10px;
+  font-weight: 700;
+  padding: 1px 6px;
+  border-radius: 999px;
+  margin-left: 6px;
+  vertical-align: 1px;
+  letter-spacing: 0.06em;
+}
+.map-popup .pop-cat.vfr  { background: rgba( 80, 220, 130, 0.22); color: rgba(120, 250, 170, 1); }
+.map-popup .pop-cat.mvfr { background: rgba( 80, 160, 240, 0.22); color: rgba(130, 200, 255, 1); }
+.map-popup .pop-cat.ifr  { background: rgba(255, 100, 100, 0.22); color: rgba(255, 150, 150, 1); }
+.map-popup .pop-cat.lifr { background: rgba(220, 100, 220, 0.22); color: rgba(245, 160, 245, 1); }
+.map-popup .pop-raw {
+  margin-top: 6px;
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  font-size: 10.5px;
+  color: var(--text-faint);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.map-popup .pop-rows { margin-top: 4px; }
+.map-popup .pop-rows .row { display: flex; gap: 8px; }
+.map-popup .pop-rows .row .k { color: var(--text-faint); min-width: 64px; }
+.map-popup .pop-event {
+  border-left: 2px solid rgba(255, 80, 110, 0.85);
+  padding: 2px 0 2px 8px;
+  margin-top: 6px;
+}
+.map-popup .pop-event.delay     { border-color: rgba(255, 196,  64, 0.95); }
+.map-popup .pop-event.advisory  { border-color: rgba(120, 170, 255, 0.85); }
+.map-popup .pop-event.closure   { border-color: rgba(255,  64,  76, 1.00); }
+.map-popup .pop-event .kind {
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  font-size: 10px;
+  font-weight: 700;
+  color: rgba(255, 184, 107, 1);
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+/* Drawer enrichment for aircraft registry — small photo + neat metadata
+   under the standard drawer-grid. Renders as a single full-width card so
+   it doesn't break the existing two-column drawer-grid layout. */
+.drawer-registry {
+  margin-top: 12px;
+  padding: 10px;
+  border: 1px solid rgba(118, 185, 0, 0.18);
+  border-radius: 10px;
+  background: rgba(20, 26, 40, 0.55);
+}
+.drawer-registry .reg-head {
+  display: flex; align-items: center; gap: 10px;
+  margin-bottom: 6px;
+}
+.drawer-registry .reg-tag {
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  font-weight: 700;
+  font-size: 13px;
+  color: rgba(255, 240, 200, 1);
+  letter-spacing: 0.05em;
+}
+.drawer-registry .reg-photo {
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  object-fit: cover;
+  border-radius: 6px;
+  margin-top: 6px;
+  background: rgba(0, 0, 0, 0.3);
+}
+.drawer-registry .reg-rows .row { display: flex; gap: 8px; margin-top: 2px; font-size: 12px; }
+.drawer-registry .reg-rows .row .k { color: var(--text-faint); min-width: 72px; }
+
+/* Airport-level NAS advisory chip rendered inside the airport drawer.
+   The same severity scale used on the chart's airport dots (info →
+   advisory → delay → ground_stop → closure) drives the chip colour. */
+.drawer-nas {
+  margin-top: 10px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  font-size: 12px;
+  border: 1px solid rgba(255, 196, 64, 0.4);
+  background: rgba(60, 40, 0, 0.45);
+}
+.drawer-nas.severity-ground_stop { border-color: rgba(255, 80, 110, 0.7); background: rgba(70, 12, 22, 0.6); }
+.drawer-nas.severity-closure     { border-color: rgba(255, 64, 76, 0.95); background: rgba(80, 8, 16, 0.7); }
+.drawer-nas.severity-delay       { border-color: rgba(255, 196, 64, 0.6); }
+.drawer-nas.severity-advisory    { border-color: rgba(120, 170, 255, 0.55); background: rgba(20, 30, 60, 0.6); }
+.drawer-nas .nas-kind {
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: rgba(255, 184, 107, 1);
+  margin-right: 8px;
+}
 
 /* ── Responsive (collapse rail on narrow screens) ───────────────────────── */
 
@@ -798,4 +1722,148 @@ html, body, #app {
   #app { grid-template-columns: 1fr; }
   .rail { position: absolute; top: 0; left: 0; right: 0; height: 60vh; border-right: none; border-bottom: 1px solid var(--rail-stroke); }
   .map-stage { margin-top: 60vh; height: 40vh; }
+}
+
+/* ── NAS Status pills ──────────────────────────────────────────────────────
+   DOM-rendered tags floating over each affected airport. Rounded translucent
+   pill on a frosted backdrop with a colour-tinted glow that pulses at a
+   severity-specific cadence. The container itself is transparent and
+   pointer-events:none, so deck.gl picking still works under empty space;
+   each pill restores pointer-events:auto so it can be clicked / hovered.
+   We position pills with translate3d(x,y,0) on every map move; the visual
+   anchor offset (-50% horizontal, -120% vertical) lifts them above the
+   actual airport and centres them. */
+.nas-overlay {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 5;
+  opacity: 0;
+  transition: opacity 0.18s ease;
+}
+.nas-overlay.show { opacity: 1; }
+
+.nas-tag {
+  /* Position is driven entirely by the JS-set `transform`. We use
+     translate(calc(<px> - 50%), calc(<py> - 100%)) so the pill is
+     centred horizontally on the airport and lifted just above it,
+     with the percentages resolved against the pill's own bounding
+     box (so it stays centred regardless of pill width / device DPI). */
+  position: absolute;
+  top: 0;
+  left: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px 4px 8px;
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  border-radius: 999px;
+  background: rgba(18, 24, 36, 0.62);
+  -webkit-backdrop-filter: blur(6px) saturate(140%);
+  backdrop-filter: blur(6px) saturate(140%);
+  color: #fff;
+  font: 700 10.5px/1 'JetBrains Mono', ui-monospace, monospace;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  cursor: pointer;
+  pointer-events: auto;
+  will-change: transform, box-shadow;
+}
+
+.nas-tag .nas-tag-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+  box-shadow: 0 0 6px currentColor;
+  flex: none;
+}
+.nas-tag .nas-tag-text { color: #fff; }
+.nas-tag .nas-tag-code { color: rgba(255, 255, 255, 0.66); font-weight: 600; }
+
+/* Severity colour ramp. Each rule sets a CSS variable for the dot/glow
+   tint plus an animation tied to that severity's intensity. */
+.nas-tag.sev-info,
+.nas-tag.sev-advisory {
+  color: rgba(120, 170, 255, 1);
+  border-color: rgba(120, 170, 255, 0.55);
+  background: rgba(28, 50, 90, 0.55);
+  animation: nas-pulse-soft 2.4s ease-in-out infinite;
+}
+.nas-tag.sev-delay {
+  color: rgba(255, 196, 64, 1);
+  border-color: rgba(255, 196, 64, 0.65);
+  background: rgba(70, 50, 18, 0.62);
+  animation: nas-pulse-mid 1.8s ease-in-out infinite;
+}
+.nas-tag.sev-ground_stop {
+  color: rgba(255, 110, 130, 1);
+  border-color: rgba(255, 110, 130, 0.85);
+  background: rgba(70, 18, 28, 0.66);
+  animation: nas-pulse-hard 1.05s ease-in-out infinite;
+}
+.nas-tag.sev-closure {
+  color: rgba(255, 80, 96, 1);
+  border-color: rgba(255, 80, 96, 0.9);
+  background: rgba(70, 12, 18, 0.72);
+  animation: nas-pulse-hard 0.85s ease-in-out infinite;
+}
+
+.nas-tag:hover {
+  filter: brightness(1.15);
+  border-color: rgba(255, 255, 255, 0.55);
+}
+
+/* Glow animations — three intensities. The colour comes from the
+   element's `color` (set per severity above) so a single keyframe set
+   recolours automatically via currentColor. */
+@keyframes nas-pulse-soft {
+  0%, 100% {
+    box-shadow:
+      0 0 0 1px rgba(255, 255, 255, 0.06),
+      0 0 10px 0 color-mix(in srgb, currentColor 35%, transparent),
+      0 0 20px 2px color-mix(in srgb, currentColor 18%, transparent);
+  }
+  50% {
+    box-shadow:
+      0 0 0 1px rgba(255, 255, 255, 0.10),
+      0 0 16px 1px color-mix(in srgb, currentColor 55%, transparent),
+      0 0 30px 4px color-mix(in srgb, currentColor 28%, transparent);
+  }
+}
+@keyframes nas-pulse-mid {
+  0%, 100% {
+    box-shadow:
+      0 0 0 1px rgba(255, 255, 255, 0.10),
+      0 0 14px 1px color-mix(in srgb, currentColor 55%, transparent),
+      0 0 26px 3px color-mix(in srgb, currentColor 28%, transparent);
+  }
+  50% {
+    box-shadow:
+      0 0 0 1px rgba(255, 255, 255, 0.16),
+      0 0 22px 3px color-mix(in srgb, currentColor 80%, transparent),
+      0 0 44px 8px color-mix(in srgb, currentColor 40%, transparent);
+  }
+}
+@keyframes nas-pulse-hard {
+  0%, 100% {
+    box-shadow:
+      0 0 0 1px rgba(255, 255, 255, 0.14),
+      0 0 16px 2px color-mix(in srgb, currentColor 70%, transparent),
+      0 0 30px 4px color-mix(in srgb, currentColor 35%, transparent);
+  }
+  50% {
+    box-shadow:
+      0 0 0 1px rgba(255, 255, 255, 0.22),
+      0 0 28px 4px color-mix(in srgb, currentColor 95%, transparent),
+      0 0 56px 10px color-mix(in srgb, currentColor 55%, transparent);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .nas-tag {
+    animation-duration: 6s !important;
+    animation-timing-function: linear !important;
+  }
 }
