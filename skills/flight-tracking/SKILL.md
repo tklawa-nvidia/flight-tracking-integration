@@ -1,6 +1,6 @@
 ---
 name: flight-tracking
-description: "Live aircraft tracking, airport lookup, and interactive map control for the FlightOps map UI at http://127.0.0.1:18890. Use this skill whenever the user asks about live air traffic, what is flying near an airport, inbound patterns, unusual squawks, METAR weather, NAS status / ground stops, ARTCC boundaries, OR wants the map driven in ANY way (fly to an airport, draw arcs, highlight a flight, RECOLOUR the planes, toggle a layer, filter by phase or squawk, switch to 3D, change METAR colour mode). HARD RULES: (1) ALL data and ALL map control live behind http://127.0.0.1:18890 in this same sandbox. NEVER curl upstream FAA/OpenSky/AWC/adsbdb/hexdb hosts directly — they're firewalled. If a local call fails say 'service unavailable', do not invent a network-outage excuse. (2) ANY request that changes what's drawn on the map REQUIRES issuing the matching POST /api/map/... call FIRST, BEFORE describing the result. Never claim 'I've updated the map to ...' unless you actually issued the POST this turn — the user is looking at a live chart and will see if nothing changed. (3) The aircraft colour scheme has exactly FOUR fixed presets — phase | altitude | vrate | squawk — set via POST /api/map/color {\"mode\":\"<one of four>\"}. Aliases 'elevation', 'flight level', 'rate of climb', 'emergency' are accepted. Do NOT invent custom palettes; describe only what the preset shows: phase = orange family, altitude = single-hue green ramp (mint→deep green, NOT a rainbow), vrate = diverging purple (violet↔magenta), squawk = grey + red/amber for 7500/7600/7700. (4) Other map controls: POST /api/map/metar-color (flt_cat|wind|temp|visibility), POST /api/map/layer, POST /api/map/filter, POST /api/map/goto, POST /api/map/view, POST /api/map/arcs (auto-tilts), POST /api/map/airspace3d, POST /api/map/track (ONE-shot 'find this plane and follow it' — preferred over /api/map/highlight + /api/map/view in two calls). (5) EVERY /api/map/* response includes a `delivered` integer = how many browser tabs received the broadcast. If `delivered:0` the dashboard isn't open right now — say 'I issued the command but no map UI is connected to receive it; please open http://127.0.0.1:18890 first', do NOT claim the map updated. The server caches the last sticky command for ~3 minutes, so a tab that opens shortly after will still catch up. Open the SKILL.md body for examples and field schemas."
+description: "Live aircraft tracking, airport lookup, and interactive map control for the FlightOps map UI at http://127.0.0.1:18890. Use this skill whenever the user asks about live air traffic, what is flying near an airport, inbound patterns, unusual squawks, METAR weather, NAS status / ground stops, ARTCC boundaries, OR wants the map driven in ANY way (fly to an airport, draw arcs, highlight a flight, RECOLOUR the planes, toggle a layer, filter by phase or squawk, switch to 3D, change METAR colour mode). HARD RULES: (1) ALL data and ALL map control live behind http://127.0.0.1:18890 in this same sandbox. NEVER curl upstream FAA/OpenSky/AWC/adsbdb/hexdb hosts directly — they're firewalled. If a local call fails say 'service unavailable', do not invent a network-outage excuse. (2) ANY request that changes what's drawn on the map REQUIRES issuing the matching POST /api/map/... call FIRST, BEFORE describing the result. Never claim 'I've updated the map to ...' unless you actually issued the POST this turn — the user is looking at a live chart and will see if nothing changed. (3) The aircraft colour scheme has exactly FOUR fixed presets — phase | altitude | vrate | squawk — set via POST /api/map/color {\"mode\":\"<one of four>\"}. Aliases 'elevation', 'flight level', 'rate of climb', 'emergency' are accepted. Do NOT invent custom palettes; describe only what the preset shows: phase = orange family, altitude = single-hue green ramp (mint→deep green, NOT a rainbow), vrate = diverging purple (violet↔magenta), squawk = grey + red/amber for 7500/7600/7700. (4) Other map controls: POST /api/map/metar-color (flt_cat|wind|temp|visibility), POST /api/map/layer, POST /api/map/filter, POST /api/map/goto, POST /api/map/view, POST /api/map/arcs (auto-tilts), POST /api/map/airspace3d, POST /api/map/track (ONE-shot 'find this plane and follow it' — preferred over /api/map/highlight + /api/map/view in two calls). (5) EVERY /api/map/* response includes a `delivered` integer = how many browser tabs received the broadcast. If `delivered:0` the dashboard isn't open right now — say 'I issued the command but no map UI is connected to receive it; please open http://127.0.0.1:18890 first', do NOT claim the map updated. The server caches the last sticky command for ~3 minutes, so a tab that opens shortly after will still catch up. (6) For 'find a flight matching X and track it' (e.g. 'what just left IAD heading to TPA, zoom on it'), use the find→track pattern: GET /api/flights/find?departing=IAD&arriving=TPA picks candidates server-side, then POST /api/map/track {\"flight\":\"<id from find>\"} drives the camera. NEVER loop over /api/route/<callsign> per live flight — that's hundreds of HTTP calls inside a tool exec and will time out. Open the SKILL.md body for examples and field schemas."
 ---
 
 # flight-tracking
@@ -287,6 +287,82 @@ curl -sX POST http://127.0.0.1:18890/api/map/track \
 # If `delivered` is 0, no browser tab is connected — tell the user
 # to open the dashboard, do NOT claim the map updated.
 ```
+
+## How to find AND track ("the most recent IAD departure heading to Tampa")
+
+Two-step pattern: **find → pick → track**. Discovery is server-side
+via `GET /api/flights/find` so the agent never has to loop over
+/api/route per live callsign (which used to take hundreds of calls
+and time out the chat turn — never do that).
+
+```bash
+# user: "what just left IAD heading to Tampa? zoom in on it"
+
+# 1. FIND — server picks candidates by departing/arriving airport,
+#    auto-applies climb-phase + heading-toward-arriving filters,
+#    and (because both departing and arriving were given) confirms
+#    the route against adsbdb in parallel for the top candidates.
+curl -s "http://127.0.0.1:18890/api/flights/find?departing=IAD&arriving=TPA&limit=5"
+# → {"ok":true,"count":1,"filters":{...},
+#    "flights":[{"id":"a2ca5d","callsign":"UAL108","lat":...,"lon":...,
+#                "alt_m":5097,"vrate_mps":12.3,"heading":188,
+#                "distance_from_center_km":34,"heading_misalign_deg":7,
+#                "route_match":"confirmed",
+#                "route":{"origin":{"iata":"IAD"},"destination":{"iata":"TPA"},...}}]}
+
+# 2. PICK the first/most-recent — it's already sorted by `latest`
+#    when departing or arriving is set. (Other orders: closest,
+#    lowest_alt, fastest_climb, aligned.)
+
+# 3. TRACK — pass the resolved id (or callsign) to /api/map/track.
+curl -sX POST http://127.0.0.1:18890/api/map/track \
+     -H 'Content-Type: application/json' \
+     -d '{"flight":"a2ca5d","zoom":10,"pitch":45}'
+```
+
+Other useful `find` shapes:
+
+```bash
+# Live read-only "what flights are going IAD→TPA right now?"
+GET /api/flights/find?departing=IAD&arriving=TPA
+
+# All flights climbing out of IAD (no destination filter)
+GET /api/flights/find?departing=IAD&phase=climb
+
+# Anything emergency squawking near JFK
+GET /api/flights/find?near=JFK&radius_km=80&phase=airborne&order=closest
+
+# Fastest climbers right now in CONUS (no airport anchor)
+GET /api/flights/find?phase=climb&order=fastest_climb&limit=5
+```
+
+Filter cheat sheet (all optional, AND'd together):
+
+| param           | example          | notes                                                   |
+|-----------------|------------------|---------------------------------------------------------|
+| `departing`     | `IAD` `KIAD`     | airport code/name; defines the search bbox + bearing    |
+| `arriving`      | `TPA` `Tampa`    | derives heading filter; enables route confirmation      |
+| `near`          | `JFK`            | search center if no `departing`                         |
+| `radius_km`     | `120`            | default 150                                             |
+| `phase`         | `climb` `cruise` | aliases: departing, arriving, level, takeoff, landing…  |
+| `min_alt_m`     | `1500`           | below ≈ 5,000 ft is a useful "still climbing" gate      |
+| `max_alt_m`     | `6000`           |                                                          |
+| `heading_deg`   | `90`             | overrides departing→arriving auto-derived bearing       |
+| `heading_tol_deg` | `45`           | default ±35°                                            |
+| `since_seconds` | `600`            | last_seen within the last N seconds                     |
+| `confirm_route` | `true` `false`   | default true if departing or arriving is set           |
+| `order`         | `latest`         | latest, closest, lowest_alt, fastest_climb, aligned     |
+| `limit`         | `10`             | 1–50                                                    |
+
+DO NOT loop `/api/route/<cs>` over every live callsign. The fan-out
+above (with `confirm_route=true`) does it server-side, capped at 20
+in parallel, with caching. If the server can't reach adsbdb on a
+given turn, the geometric heuristic still returns candidates — they
+just carry `route_match:"not-confirmed"` and you should tell the
+user "best geometric guess; route confirmation unavailable" rather
+than fabricating a confirmed match.
+
+## How to look up a specific flight
 
 For "where did this flight come from? / where is it going?" reads
 that don't change the map, the per-flight read endpoints are still

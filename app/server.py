@@ -36,7 +36,7 @@ import shutil
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
@@ -328,6 +328,32 @@ def bbox_from_center(lat: float, lon: float, radius_km: float) -> tuple[float, f
     dlat = radius_km / 111.0
     dlon = radius_km / (111.0 * max(math.cos(math.radians(lat)), 0.01))
     return (lat - dlat, lat + dlat, lon - dlon, lon + dlon)
+
+
+def bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Initial great-circle bearing from (lat1, lon1) toward (lat2, lon2), degrees [0, 360).
+
+    Used by `/api/flights/find` to score how well a live aircraft's
+    reported heading matches the bearing toward a hypothetical
+    destination — i.e. "is this plane that just left IAD actually
+    pointed at Tampa, or is it just airborne in the same neighborhood?"
+    """
+    p1 = math.radians(lat1)
+    p2 = math.radians(lat2)
+    dl = math.radians(lon2 - lon1)
+    y = math.sin(dl) * math.cos(p2)
+    x = math.cos(p1) * math.sin(p2) - math.sin(p1) * math.cos(p2) * math.cos(dl)
+    return (math.degrees(math.atan2(y, x)) + 360.0) % 360.0
+
+
+def heading_misalignment_deg(reported_heading: float, target_bearing: float) -> float:
+    """Smallest absolute difference between two compass headings (0..180°).
+
+    `(290 - 10)` should be 80°, not 280°. We want the wrap-around
+    minimum so a heading of 10° is "close" to a bearing of 350°.
+    """
+    diff = (reported_heading - target_bearing + 540.0) % 360.0 - 180.0
+    return abs(diff)
 
 
 # ── OpenSky proxy with simple in-process cache ──────────────────────────────
@@ -1043,6 +1069,309 @@ async def tool_track_flight(
             "country":    matched.get("country"),
             "squawk":     matched.get("squawk"),
         },
+    }
+
+
+# ── Flight discovery: find live flights matching a route / heuristic ─────
+# This is the "look up first, then track" half of the find→pick→track
+# pattern. Without it, the agent's only path to "what just left IAD
+# heading to TPA?" was to fetch /api/flights and call /api/route per
+# callsign — hundreds of HTTP calls inside a tool exec, hangs the
+# turn, and the chat ends up rendering an empty assistant message
+# as "completed". Pushing the matching server-side keeps the agent's
+# tool calls under one second.
+
+# Defaults chosen to match how a controller naturally describes a
+# departure: ~150 km radius captures planes within ~10 minutes of
+# wheels-up at common climb rates; +/-35° heading tolerance forgives
+# initial turn-out vectors before the plane is fully on course.
+_FIND_DEFAULT_RADIUS_KM = 150.0
+_FIND_DEFAULT_HEADING_TOL_DEG = 35.0
+_FIND_DEFAULT_LIMIT = 10
+# Cap on parallel /api/route lookups when `confirm_route=true`. Each
+# call hits adsbdb.com (already rate-limited per egress IP); 20 keeps
+# us under the limit for cold caches without blowing the 1s budget.
+_FIND_MAX_ROUTE_CONFIRM = 20
+
+_FIND_PHASE_PREDICATES: dict[str, Callable[[dict[str, Any]], bool]] = {
+    "ground":   lambda f: bool(f.get("on_ground")),
+    "airborne": lambda f: not bool(f.get("on_ground")),
+    "climb":    lambda f: not bool(f.get("on_ground")) and (f.get("vrate_mps") or 0) >  1.5,
+    "descent":  lambda f: not bool(f.get("on_ground")) and (f.get("vrate_mps") or 0) < -1.5,
+    "cruise":   lambda f: not bool(f.get("on_ground")) and abs(f.get("vrate_mps") or 0) <= 1.5,
+    "level":    lambda f: not bool(f.get("on_ground")) and abs(f.get("vrate_mps") or 0) <= 1.5,
+}
+_FIND_PHASE_ALIASES = {
+    "departing": "climb", "takeoff": "climb", "climbing": "climb",
+    "arriving":  "descent", "landing": "descent", "descending": "descent",
+    "level":     "cruise",
+}
+
+
+async def tool_find_flights(
+    *,
+    departing:        str | None = None,
+    arriving:         str | None = None,
+    near:             str | None = None,
+    radius_km:        float | None = None,
+    phase:            str | None = None,
+    min_alt_m:        float | None = None,
+    max_alt_m:        float | None = None,
+    heading_deg:      float | None = None,
+    heading_tol_deg:  float | None = None,
+    since_seconds:    float | None = None,
+    confirm_route:    bool | None = None,
+    order:            str | None = None,
+    limit:            int | None = None,
+) -> dict[str, Any]:
+    """Discover live flights matching a route filter or heuristic.
+
+    Composable pre-step for `/api/map/track`: the agent calls this to
+    pick a flight ID, then calls `/api/map/track {flight: <id>}` with
+    the result. Never tries to do all of the search + map control in
+    one call — keeps each tool call atomic and lets the agent show
+    candidate matches to the user before committing the camera.
+
+    Filters are AND'd together. All are optional; a call with no
+    filters is equivalent to a CONUS scan with no ordering preference.
+
+    Heuristics applied when both `departing` and `arriving` are given
+    (the most common shape):
+      * Search bbox = circle of `radius_km` around the departing
+        airport's lat/lon (so we don't scan the whole CONUS feed).
+      * Default `phase` = "climb" (a plane "leaving IAD" is nearly
+        always still in the climb-out phase).
+      * Default `heading_deg` = great-circle bearing from departing
+        to arriving; default tolerance ±35°.
+      * Default `order` = "latest" (latest `last_seen` wins ties).
+      * `confirm_route` defaults true: top candidates are enriched
+        with /api/route in parallel and the response includes the
+        adsbdb route data for cross-checking.
+    """
+    departing_a = find_airport(departing) if departing else None
+    if departing and departing_a is None:
+        return {"ok": False, "error": f"unknown departing airport {departing!r}"}
+    arriving_a = find_airport(arriving) if arriving else None
+    if arriving and arriving_a is None:
+        return {"ok": False, "error": f"unknown arriving airport {arriving!r}"}
+    near_a = find_airport(near) if near else None
+    if near and near_a is None:
+        return {"ok": False, "error": f"unknown near airport {near!r}"}
+
+    radius = float(radius_km) if radius_km is not None else _FIND_DEFAULT_RADIUS_KM
+
+    # Pick a search center for the bbox (and for distance scoring).
+    center = near_a or departing_a
+    if center is not None:
+        bbox = bbox_from_center(center["lat"], center["lon"], radius)
+    else:
+        bbox = None
+
+    feed = await fetch_flights(bbox=bbox)
+    candidates: list[dict[str, Any]] = list(feed.get("flights") or [])
+
+    # Phase filter — accepts our canonical four plus the natural-language
+    # aliases the SKILL.md tells the agent it can pass through verbatim.
+    phase_default = "climb" if (departing_a is not None and arriving_a is not None) else None
+    phase_key: str | None = None
+    if phase:
+        key = (phase or "").strip().lower()
+        phase_key = _FIND_PHASE_ALIASES.get(key, key) if key else None
+    elif phase_default:
+        phase_key = phase_default
+    if phase_key:
+        pred = _FIND_PHASE_PREDICATES.get(phase_key)
+        if pred is None:
+            return {
+                "ok": False,
+                "error": f"unknown phase {phase!r}",
+                "valid_phases": sorted(set(_FIND_PHASE_PREDICATES) | set(_FIND_PHASE_ALIASES)),
+            }
+        candidates = [f for f in candidates if pred(f)]
+
+    if min_alt_m is not None:
+        candidates = [f for f in candidates if (f.get("alt_m") or 0) >= float(min_alt_m)]
+    if max_alt_m is not None:
+        candidates = [f for f in candidates if (f.get("alt_m") or 0) <= float(max_alt_m)]
+    if since_seconds is not None:
+        cutoff = time.time() - float(since_seconds)
+        candidates = [f for f in candidates if (f.get("last_seen") or 0) >= cutoff]
+
+    # Heading filter — explicit value wins; otherwise derive from
+    # departing→arriving great-circle bearing if both are known.
+    target_bearing: float | None = None
+    if heading_deg is not None:
+        target_bearing = float(heading_deg) % 360.0
+    elif departing_a is not None and arriving_a is not None:
+        target_bearing = bearing_deg(
+            departing_a["lat"], departing_a["lon"],
+            arriving_a["lat"],  arriving_a["lon"],
+        )
+    tol = float(heading_tol_deg) if heading_tol_deg is not None else _FIND_DEFAULT_HEADING_TOL_DEG
+    if target_bearing is not None:
+        scored: list[dict[str, Any]] = []
+        for f in candidates:
+            h = f.get("heading")
+            if h is None:
+                continue
+            misalign = heading_misalignment_deg(float(h), target_bearing)
+            if misalign <= tol:
+                f = {**f, "_heading_misalign_deg": misalign}
+                scored.append(f)
+        candidates = scored
+
+    # Distance from departing airport (or `near`). Useful for scoring
+    # "is this plane actually leaving X or just transiting overhead?".
+    if center is not None:
+        for f in candidates:
+            f["_distance_km"] = haversine_km(
+                f["lat"], f["lon"], center["lat"], center["lon"],
+            )
+
+    # Optional route confirmation against adsbdb. Only call up to
+    # _FIND_MAX_ROUTE_CONFIRM in parallel — adsbdb is per-egress-IP
+    # rate-limited and we already cache 5 minutes of results.
+    do_route = (
+        confirm_route if confirm_route is not None
+        else (departing_a is not None or arriving_a is not None)
+    )
+    if do_route and candidates:
+        # Pick the top candidates by recency for confirmation; we sort
+        # the full set later, but we don't want to run /api/route on a
+        # list of 80 flights even though the user only cares about ~5.
+        prelim_sort = sorted(
+            candidates,
+            key=lambda f: (f.get("last_seen") or 0),
+            reverse=True,
+        )[: _FIND_MAX_ROUTE_CONFIRM]
+        callsigns = [
+            (f.get("callsign") or "").strip().upper() for f in prelim_sort
+        ]
+        async def _route(cs: str) -> tuple[str, dict[str, Any] | None]:
+            if not cs:
+                return cs, None
+            try:
+                res = await api_route(cs)
+            except HTTPException:
+                return cs, None
+            return cs, res if res.get("found") else None
+        tasks = [_route(cs) for cs in callsigns]
+        route_results = await asyncio.gather(*tasks, return_exceptions=True)
+        route_by_cs: dict[str, dict[str, Any]] = {}
+        for r in route_results:
+            if isinstance(r, tuple):
+                cs, payload = r
+                if payload:
+                    route_by_cs[cs] = payload
+        for f in candidates:
+            cs = (f.get("callsign") or "").strip().upper()
+            if cs in route_by_cs:
+                f["route"] = route_by_cs[cs]
+        # If departing/arriving were specified AND we confirmed routes,
+        # tighten the candidate list to those whose route matches.
+        # Geometric matches without route confirmation still count as
+        # weak hits — keep them on the list but flag them.
+        confirmed: list[dict[str, Any]] = []
+        weak:      list[dict[str, Any]] = []
+        for f in candidates:
+            r = f.get("route")
+            ok = True
+            if r and (departing_a or arriving_a):
+                origin_iata = ((r.get("origin") or {}).get("iata") or "").upper()
+                origin_icao = ((r.get("origin") or {}).get("icao") or "").upper()
+                dest_iata   = ((r.get("destination") or {}).get("iata") or "").upper()
+                dest_icao   = ((r.get("destination") or {}).get("icao") or "").upper()
+                if departing_a is not None:
+                    want = {(departing_a.get("code") or "").upper(),
+                            (departing_a.get("icao") or "").upper(),
+                            (departing_a.get("iata") or "").upper()}
+                    want.discard("")
+                    if not (want & {origin_iata, origin_icao}):
+                        ok = False
+                if ok and arriving_a is not None:
+                    want = {(arriving_a.get("code") or "").upper(),
+                            (arriving_a.get("icao") or "").upper(),
+                            (arriving_a.get("iata") or "").upper()}
+                    want.discard("")
+                    if not (want & {dest_iata, dest_icao}):
+                        ok = False
+                f["_route_match"] = "confirmed" if ok else "wrong-route"
+                if ok:
+                    confirmed.append(f)
+            else:
+                f["_route_match"] = "not-confirmed"
+                weak.append(f)
+        # If we got at least one route-confirmed match, prefer those —
+        # those are real "scheduled IAD→TPA" hits. Else fall back to
+        # the geometric matches and let the agent disclaim accordingly.
+        if confirmed:
+            candidates = confirmed + weak  # confirmed first; weak as backup
+        # else: leave candidates as-is, all geometric
+
+    # Sort candidates by `order`. Default depends on the query shape.
+    order_key = (order or "").strip().lower() or (
+        "latest" if (departing_a or arriving_a) else "closest"
+    )
+    if order_key == "latest":
+        candidates.sort(key=lambda f: (f.get("last_seen") or 0), reverse=True)
+    elif order_key in ("closest", "closest_to_origin", "nearest"):
+        candidates.sort(key=lambda f: (f.get("_distance_km") if f.get("_distance_km") is not None else 1e9))
+    elif order_key in ("lowest_alt", "low_alt", "lowest"):
+        candidates.sort(key=lambda f: (f.get("alt_m") if f.get("alt_m") is not None else 1e9))
+    elif order_key in ("fastest_climb", "climb"):
+        candidates.sort(key=lambda f: (f.get("vrate_mps") or 0), reverse=True)
+    elif order_key in ("aligned", "best_aligned"):
+        candidates.sort(key=lambda f: f.get("_heading_misalign_deg", 999))
+    else:
+        return {
+            "ok": False,
+            "error": f"unknown order {order!r}",
+            "valid_orders": ["latest", "closest", "lowest_alt", "fastest_climb", "aligned"],
+        }
+
+    lim = int(limit) if limit is not None else _FIND_DEFAULT_LIMIT
+    candidates = candidates[: max(1, lim)]
+
+    return {
+        "ok": True,
+        "count": len(candidates),
+        "filters": {
+            "departing": (departing_a or {}).get("code"),
+            "arriving":  (arriving_a or {}).get("code"),
+            "near":      (near_a or {}).get("code"),
+            "radius_km": radius,
+            "phase":     phase_key,
+            "heading_deg":     target_bearing,
+            "heading_tol_deg": tol if target_bearing is not None else None,
+            "min_alt_m": min_alt_m,
+            "max_alt_m": max_alt_m,
+            "since_seconds": since_seconds,
+            "order":     order_key,
+            "limit":     lim,
+            "confirm_route": bool(do_route),
+        },
+        "flights": [
+            {
+                "id":         (f.get("id") or "").lower(),
+                "icao24":     (f.get("id") or "").lower(),
+                "callsign":   (f.get("callsign") or "").strip(),
+                "lat":        f.get("lat"),
+                "lon":        f.get("lon"),
+                "alt_m":      f.get("alt_m"),
+                "vrate_mps":  f.get("vrate_mps"),
+                "heading":    f.get("heading"),
+                "ground_speed_mps": f.get("vel_mps"),
+                "on_ground":  f.get("on_ground"),
+                "country":    f.get("country"),
+                "squawk":     f.get("squawk"),
+                "last_seen":  f.get("last_seen"),
+                "distance_from_center_km": f.get("_distance_km"),
+                "heading_misalign_deg":    f.get("_heading_misalign_deg"),
+                "route_match":             f.get("_route_match"),
+                "route":                   f.get("route"),
+            }
+            for f in candidates
+        ],
     }
 
 
@@ -1809,6 +2138,47 @@ async def api_flights(
 ):
     parsed = _parse_bbox(bbox)
     return await fetch_flights(parsed)
+
+
+@app.get("/api/flights/find")
+async def api_flights_find(
+    departing:        str   | None = Query(default=None, description="airport code/name (origin filter)"),
+    arriving:         str   | None = Query(default=None, description="airport code/name (destination filter)"),
+    near:             str   | None = Query(default=None, description="airport code/name (search center)"),
+    radius_km:        float | None = Query(default=None, ge=10, le=2000,
+                                            description="search radius around departing/near (default 150)"),
+    phase:            str   | None = Query(default=None,
+                                            description="climb|cruise|descent|ground|airborne; aliases: departing, arriving, level…"),
+    min_alt_m:        float | None = Query(default=None, ge=0,    description="minimum altitude in metres"),
+    max_alt_m:        float | None = Query(default=None, ge=0,    description="maximum altitude in metres"),
+    heading_deg:      float | None = Query(default=None, ge=0, lt=360,
+                                            description="explicit heading filter (otherwise derived from departing→arriving great-circle bearing)"),
+    heading_tol_deg:  float | None = Query(default=None, ge=0, le=180,
+                                            description="tolerance for heading filter (default ±35°)"),
+    since_seconds:    float | None = Query(default=None, ge=0,
+                                            description="only flights with last_seen within the last N seconds"),
+    confirm_route:    bool  | None = Query(default=None,
+                                            description="cross-check matching candidates against /api/route (defaults to true when departing or arriving is given)"),
+    order:            str   | None = Query(default=None,
+                                            description="latest | closest | lowest_alt | fastest_climb | aligned"),
+    limit:            int   | None = Query(default=None, ge=1, le=50, description="max results (default 10)"),
+):
+    """Discover live flights matching a route filter or heuristic.
+
+    Companion to `/api/map/track`: the agent calls this first to pick a
+    flight ID, then calls `/api/map/track` with the result. Doing the
+    matching server-side is the whole point — it stops the agent from
+    looping over `/api/route/<callsign>` per live flight, which used
+    to take hundreds of HTTP calls and time out the chat turn.
+    """
+    return await tool_find_flights(
+        departing=departing, arriving=arriving, near=near,
+        radius_km=radius_km, phase=phase,
+        min_alt_m=min_alt_m, max_alt_m=max_alt_m,
+        heading_deg=heading_deg, heading_tol_deg=heading_tol_deg,
+        since_seconds=since_seconds, confirm_route=confirm_route,
+        order=order, limit=limit,
+    )
 
 
 @app.get("/api/flight/{icao24}")
