@@ -48,7 +48,19 @@
                 </div>
               </div>
             </div>
-            <div class="chat-suggestions">
+            <div class="chat-suggestions-wrap" id="chat-suggestions-wrap" data-collapsed="false">
+              <button type="button"
+                      class="chat-suggestions-toggle"
+                      id="chat-suggestions-toggle"
+                      aria-expanded="true"
+                      aria-controls="chat-suggestions"
+                      title="Show / hide prompt suggestions">
+                <svg class="chat-suggestions-chev" width="10" height="10" viewBox="0 0 12 12" aria-hidden="true">
+                  <path d="M2 4 L6 8 L10 4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+                <span>Prompt suggestions</span>
+              </button>
+            <div class="chat-suggestions" id="chat-suggestions">
               <button class="chip" data-prompt="Go to IAD and analyse traffic">Go to IAD &amp; analyse</button>
               <button class="chip" data-prompt="Show inbound arcs to JFK">Inbound to JFK</button>
               <button class="chip" data-prompt="What's flying near LAX right now?">Flights near LAX</button>
@@ -63,12 +75,24 @@
               <button class="chip" data-prompt="Show ARTCC boundaries and tell me which Center owns Denver">Which Center owns DEN?</button>
               <button class="chip" data-prompt="Show NAVAIDs around IAD so I can see the inbound approach fixes">NAVAIDs near IAD</button>
             </div>
+            </div>
             <form class="chat-input" id="chat-form" autocomplete="off">
               <input type="text" id="chat-text" placeholder="Ask NemoClaw…" autocomplete="off" />
               <button type="submit" id="chat-send" aria-label="Send">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M3.4 20.6 21 12 3.4 3.4 3.3 9.8 17 12 3.3 14.2z"/></svg>
               </button>
             </form>
+            <div class="chat-toolbar" role="toolbar" aria-label="Chat trace options">
+              <span class="chat-toolbar-label">Show:</span>
+              <button type="button"
+                      class="chat-toggle"
+                      id="chat-toggle-tools"
+                      aria-pressed="false"
+                      title="Stream tool calls + their results under each reply, live">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a4 4 0 0 1 5.7 5.7L9.7 22.7l-5.7-5.7L14.7 6.3z"/><path d="m9 11 4 4"/></svg>
+                <span>Tool calls</span>
+              </button>
+            </div>
           </div>
         </div>
 
@@ -319,6 +343,16 @@
           <div class="rail-footer">FAA AIS · tfr.faa.gov · aviationweather.gov · nasstatus.faa.gov · adsbdb.com</div>
         </div>
       </section>
+      <!-- Drag handle: hover to highlight, drag to resize the rail.
+           Width is persisted to localStorage and clamped to the
+           bounds defined in app.js (RAIL_MIN_PX … RAIL_MAX_PX). -->
+      <div class="rail-resizer"
+           id="rail-resizer"
+           role="separator"
+           aria-orientation="vertical"
+           aria-label="Resize side panel"
+           tabindex="0"
+           title="Drag to resize. Double-click to reset."></div>
     </aside>
 
     <main class="map-stage">

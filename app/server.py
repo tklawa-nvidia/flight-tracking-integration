@@ -36,11 +36,11 @@ import shutil
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, AsyncIterator, Callable
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -107,6 +107,14 @@ REGISTRY_CACHE_TTL = 24 * 3600  # registrations rarely change day-to-day
 OPENCLAW_BIN = shutil.which("openclaw") or "/usr/local/bin/openclaw"
 OPENCLAW_AGENT = os.getenv("OPENCLAW_AGENT", "main").strip()
 OPENCLAW_TIMEOUT_S = int(os.getenv("OPENCLAW_TIMEOUT_S", "180"))
+# Where the agent writes its per-session JSONL transcripts. We read
+# these post-call to surface tool calls + thinking back to the chat
+# UI when the user has the "Show tool calls / thinking" toggle on.
+OPENCLAW_AGENT_HOME = os.getenv(
+    "OPENCLAW_AGENT_HOME",
+    f"/sandbox/.openclaw-data/agents/{OPENCLAW_AGENT}",
+).rstrip("/")
+OPENCLAW_SESSIONS_DIR = f"{OPENCLAW_AGENT_HOME}/sessions"
 
 DEFAULT_ANALYSIS_RADIUS_KM = 80.0
 EARTH_RADIUS_KM = 6371.0
@@ -1686,6 +1694,216 @@ def _extract_reply(payload: dict[str, Any]) -> tuple[str, str | None]:
     return reply, sid
 
 
+# Cap on how much of a tool-result body we surface to the chat UI.
+# Some tools (e.g. /api/flights without a bbox, /api/airports CONUS)
+# return >500 KB of JSON which would balloon the chat payload and
+# break the inline rendering. The agent itself sees the full output
+# in its session — the trace is just a UI affordance.
+_TRACE_TEXT_MAX = 1500
+
+
+def _iso_to_ms(ts: Any) -> int | None:
+    if not isinstance(ts, str) or not ts:
+        return None
+    try:
+        from datetime import datetime
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        return int(dt.timestamp() * 1000)
+    except Exception:
+        return None
+
+
+def _truncate(text: str, limit: int = _TRACE_TEXT_MAX) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"\n… [truncated {len(text) - limit} chars]"
+
+
+def _normalize_jsonl_record(record: dict[str, Any], started_at_ms: int) -> list[dict[str, Any]]:
+    """Reduce one parsed line of the agent's session JSONL into zero or
+    more compact UI events ready to be sent to the browser. Returns
+    `[]` for echoed user prompts, lines older than `started_at_ms`,
+    and unrecognised shapes — so callers can feed every line through
+    this helper and get only the interesting bits back.
+
+    Used by both the post-turn batch reader (`_read_turn_events`) and
+    the live NDJSON stream so the wire shape is identical regardless
+    of whether the client is on the streaming or batch path.
+
+    Special case — *planning text*. The Nemotron-3 model never emits
+    explicit "thought" records, but when it's about to invoke a tool
+    it routinely co-emits a short narration in the SAME assistant
+    message, e.g.:
+
+        role: assistant
+        content: [
+            { type: "text",     text: "I'll start by looking up X, then Y…" },
+            { type: "toolCall", arguments: { command: "curl …" } },
+        ]
+
+    That text is the agent's plan (decision-making BEFORE the call),
+    not a final reply. We surface it as `kind: "planning"` so the UI
+    can render it just before the matching tool_call card. An
+    assistant message that contains ONLY a text block is the FINAL
+    reply — that one we drop here because it's already delivered to
+    the client via the streaming endpoint's `done` event.
+    """
+    msg = record.get("message") or {}
+    role = msg.get("role")
+    ts_ms = msg.get("timestamp") or _iso_to_ms(record.get("timestamp"))
+    if not isinstance(ts_ms, (int, float)) or ts_ms < started_at_ms:
+        return []
+    # Skip echoed user prompts — the chat UI already shows that bubble.
+    if role == "user":
+        return []
+    out: list[dict[str, Any]] = []
+    contents = msg.get("content") or []
+    has_tool_call = any(
+        isinstance(c, dict) and c.get("type") == "toolCall" for c in contents
+    )
+    for content in contents:
+        if not isinstance(content, dict):
+            continue
+        t = content.get("type")
+        if t == "text" and role == "assistant":
+            text = (content.get("text") or "").strip()
+            if not text:
+                continue
+            if msg.get("thoughtType"):
+                kind = "thought"
+            elif has_tool_call:
+                kind = "planning"
+            else:
+                # Final-reply text — already delivered via the
+                # subprocess's --json output. Don't double-render.
+                continue
+            out.append({
+                "kind":  kind,
+                "ts_ms": int(ts_ms),
+                "text":  _truncate(text, 4000),
+            })
+        elif t == "toolCall":
+            args = content.get("arguments") or {}
+            # The exec tool wraps a shell command in arguments.command;
+            # surface that verbatim since it's the most useful thing
+            # for a human reading the trace to see.
+            cmd = args.get("command") if isinstance(args, dict) else None
+            out.append({
+                "kind":    "tool_call",
+                "ts_ms":   int(ts_ms),
+                "tool":    content.get("name") or "tool",
+                "call_id": content.get("id"),
+                "command": _truncate(cmd, 2000) if isinstance(cmd, str) else None,
+                "args":    args if not isinstance(cmd, str) else None,
+            })
+        elif t == "toolResult" or role == "toolResult":
+            text = (content.get("text") or "").strip()
+            out.append({
+                "kind":     "tool_result",
+                "ts_ms":    int(ts_ms),
+                "call_id":  content.get("toolCallId") or content.get("id"),
+                "is_error": bool(content.get("isError")),
+                "text":     _truncate(text),
+            })
+    return out
+
+
+def _resolve_session_path(session_id: str | None, started_at_ms: int) -> Path | None:
+    """Return the JSONL file the agent is writing to for THIS turn,
+    or `None` if it hasn't appeared yet.
+
+    With a known `session_id` (i.e. follow-up turn), we point straight
+    at `<sessions_dir>/<session_id>.jsonl`. For the first turn of a
+    session the id is unknown ahead of time, so we scan the sessions
+    directory for any `*.jsonl` whose mtime is >= `started_at_ms`,
+    minus a small grace, and pick the most recently modified — that's
+    the file `openclaw agent` just created.
+    """
+    sessions_dir = Path(OPENCLAW_SESSIONS_DIR)
+    if session_id:
+        p = sessions_dir / f"{session_id}.jsonl"
+        return p if p.exists() else None
+    if not sessions_dir.exists():
+        return None
+    cutoff_s = (started_at_ms - 1500) / 1000.0  # 1.5 s grace
+    best: tuple[float, Path] | None = None
+    try:
+        for p in sessions_dir.glob("*.jsonl"):
+            try:
+                mt = p.stat().st_mtime
+            except OSError:
+                continue
+            if mt < cutoff_s:
+                continue
+            if best is None or mt > best[0]:
+                best = (mt, p)
+    except OSError:
+        return None
+    return best[1] if best else None
+
+
+def _read_new_events(
+    path: Path,
+    started_at_ms: int,
+    offsets: dict[str, int],
+) -> list[dict[str, Any]]:
+    """Read whatever new bytes have appeared in `path` since the last
+    call, parse them as line-delimited JSON, and return normalised UI
+    events. `offsets` is updated in-place so callers can poll this
+    function in a tight loop without re-emitting old lines.
+
+    Partial trailing lines (the agent flushed half a record) are left
+    in the file for next pass — we only advance the offset past the
+    last newline we saw.
+    """
+    out: list[dict[str, Any]] = []
+    key = str(path)
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return out
+    last = offsets.get(key, 0)
+    if size <= last:
+        return out
+    try:
+        with path.open("rb") as fh:
+            fh.seek(last)
+            chunk = fh.read(size - last)
+    except OSError:
+        return out
+    last_nl = chunk.rfind(b"\n")
+    if last_nl < 0:
+        # No complete line yet — wait for next poll.
+        return out
+    consumed = last_nl + 1
+    offsets[key] = last + consumed
+    text = chunk[:consumed].decode("utf-8", errors="replace")
+    for line in text.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except Exception:
+            continue
+        out.extend(_normalize_jsonl_record(rec, started_at_ms))
+    return out
+
+
+def _read_turn_events(session_id: str | None, started_at_ms: int) -> list[dict[str, Any]]:
+    """Read EVERY event for this turn at once. Used by the non-streaming
+    `/api/chat` endpoint after the subprocess returns."""
+    if not session_id:
+        return []
+    path = Path(OPENCLAW_SESSIONS_DIR) / f"{session_id}.jsonl"
+    if not path.exists():
+        return []
+    offsets: dict[str, int] = {}
+    out = _read_new_events(path, started_at_ms, offsets)
+    out.sort(key=lambda r: r.get("ts_ms") or 0)
+    return out
+
+
 async def call_openclaw_agent(
     message: str,
     session_id: str | None = None,
@@ -1711,6 +1929,11 @@ async def call_openclaw_agent(
     ]
     if session_id:
         cmd.extend(["--session-id", session_id])
+
+    # Record turn-start before spawning so the JSONL tail can isolate
+    # exactly the events that belong to THIS turn (the session file
+    # accumulates every previous turn for the same session).
+    started_at_ms = int(time.time() * 1000)
 
     proc = await asyncio.create_subprocess_exec(
         *cmd,
@@ -1750,11 +1973,15 @@ async def call_openclaw_agent(
         ) from exc
 
     reply, sid = _extract_reply(payload)
+    events = _read_turn_events(sid, started_at_ms)
     return {
-        "reply": reply,
+        "reply":      reply,
         "session_id": sid,
-        "status": payload.get("status"),
-        "summary": payload.get("summary"),
+        "status":     payload.get("status"),
+        "summary":    payload.get("summary"),
+        # Per-turn trace: tool calls, tool results, thought blocks. UI
+        # only renders these if the user has the corresponding toggle on.
+        "events":     events,
     }
 
 
@@ -3182,6 +3409,140 @@ async def api_chat(body: ChatRequest):
         session_id=body.session_id,
         thinking=body.thinking,
     )
+
+
+# ── /api/chat/stream — live tool-call & thinking trace ────────────────────
+#
+# The agent CLI itself doesn't have a streaming output mode (only
+# `--json` for batch), but it writes its session JSONL incrementally
+# during the turn. We piggy-back on that file: spawn the subprocess,
+# poll the JSONL while the subprocess is alive, and emit each new
+# event as a line of NDJSON to the client. The final assistant reply
+# (parsed from the subprocess's stdout JSON when it exits) is sent as
+# a `done` event.
+#
+# Wire shape (one JSON object per line, `\n` delimited):
+#   {"type":"event","kind":"tool_call","tool":"exec","command":"curl …"}
+#   {"type":"event","kind":"tool_result","is_error":false,"text":"{ … }"}
+#   {"type":"event","kind":"thought","text":"…"}
+#   {"type":"done","reply":"…","session_id":"…","status":"ok"}
+#   {"type":"error","error":"…"}                        (on failure)
+#
+# The client buffers events until `done` and renders them under the
+# assistant bubble live, regardless of whether the user has the
+# trace-toggles on (off = events arrive but get dropped).
+@app.post("/api/chat/stream")
+async def api_chat_stream(body: ChatRequest):
+    if not Path(OPENCLAW_BIN).exists():
+        raise HTTPException(
+            status_code=503,
+            detail=f"openclaw binary not found at {OPENCLAW_BIN}",
+        )
+
+    started_at_ms = int(time.time() * 1000)
+    queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+
+    cmd = [
+        OPENCLAW_BIN, "agent",
+        "--agent", OPENCLAW_AGENT,
+        "--message", body.message,
+        "--json",
+        "--thinking", body.thinking or "off",
+        "--timeout", str(OPENCLAW_TIMEOUT_S),
+    ]
+    if body.session_id:
+        cmd.extend(["--session-id", body.session_id])
+
+    async def run_and_tail() -> None:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+        # Drain stdout/stderr concurrently into byte buffers so
+        # the subprocess can never block on a full pipe while we're
+        # busy polling the session file.
+        stdout_buf = bytearray()
+        stderr_buf = bytearray()
+
+        async def drain(reader: asyncio.StreamReader, buf: bytearray) -> None:
+            while True:
+                chunk = await reader.read(8192)
+                if not chunk:
+                    return
+                buf.extend(chunk)
+
+        drain_out = asyncio.create_task(drain(proc.stdout, stdout_buf))   # type: ignore[arg-type]
+        drain_err = asyncio.create_task(drain(proc.stderr, stderr_buf))   # type: ignore[arg-type]
+
+        offsets: dict[str, int] = {}
+        deadline = time.time() + OPENCLAW_TIMEOUT_S + 30
+        try:
+            while True:
+                path = _resolve_session_path(body.session_id, started_at_ms)
+                if path is not None:
+                    for ev in _read_new_events(path, started_at_ms, offsets):
+                        await queue.put({"type": "event", **ev})
+                if proc.returncode is not None:
+                    break
+                if time.time() > deadline:
+                    proc.kill()
+                    break
+                await asyncio.sleep(0.20)
+
+            # One last drain in case the subprocess wrote the closing
+            # JSONL records right before exit.
+            await asyncio.gather(drain_out, drain_err)
+            path = _resolve_session_path(body.session_id, started_at_ms)
+            if path is not None:
+                for ev in _read_new_events(path, started_at_ms, offsets):
+                    await queue.put({"type": "event", **ev})
+
+            if proc.returncode != 0:
+                err = bytes(stderr_buf).decode("utf-8", errors="replace")[-1500:]
+                await queue.put({
+                    "type":  "error",
+                    "error": f"agent exited {proc.returncode}: {err.strip()[:500]}",
+                })
+                return
+
+            raw = bytes(stdout_buf).decode("utf-8", errors="replace").strip()
+            first = raw.find("{")
+            if first < 0:
+                await queue.put({"type": "error", "error": "non-JSON agent output"})
+                return
+            try:
+                payload = json.loads(raw[first:])
+            except json.JSONDecodeError as exc:
+                await queue.put({"type": "error", "error": f"bad agent JSON: {exc}"})
+                return
+
+            reply, sid = _extract_reply(payload)
+            await queue.put({
+                "type":       "done",
+                "reply":      reply,
+                "session_id": sid,
+                "status":     payload.get("status"),
+                "summary":    payload.get("summary"),
+            })
+        finally:
+            await queue.put(None)
+
+    task = asyncio.create_task(run_and_tail())
+
+    async def gen() -> AsyncIterator[bytes]:
+        try:
+            while True:
+                msg = await queue.get()
+                if msg is None:
+                    return
+                yield (json.dumps(msg) + "\n").encode("utf-8")
+        finally:
+            if not task.done():
+                task.cancel()
+
+    return StreamingResponse(gen(), media_type="application/x-ndjson")
 
 
 @app.websocket("/ws/map")

@@ -60,6 +60,44 @@ html, body, #app {
   box-shadow: var(--shadow-sharp);
 }
 
+/* Drag handle anchored to the rail's right edge. Wide hit-target
+   (8px) on top of a thin visible line (1px) so it's easy to grab
+   without being visually noisy. Hover/drag swap to NVIDIA green. */
+.rail-resizer {
+  position: absolute;
+  top: 0;
+  right: -4px;
+  width: 8px;
+  height: 100%;
+  cursor: col-resize;
+  z-index: 6;
+  background: transparent;
+  /* Visible line drawn via a centered pseudo so the wider hit-area
+     itself stays invisible. */
+}
+.rail-resizer::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 3px;
+  width: 2px;
+  height: 100%;
+  background: transparent;
+  transition: background 0.15s ease, box-shadow 0.15s ease;
+}
+.rail-resizer:hover::after,
+.rail-resizer:focus-visible::after,
+body.rail-resizing .rail-resizer::after {
+  background: rgba(118, 185, 0, 0.55);
+  box-shadow: 0 0 8px rgba(118, 185, 0, 0.40);
+}
+body.rail-resizing {
+  cursor: col-resize;
+  user-select: none;
+}
+body.rail-resizing iframe,
+body.rail-resizing .map { pointer-events: none; }
+
 .rail::before {
   content: "";
   position: absolute;
@@ -1229,12 +1267,20 @@ html, body, #app {
   align-self: flex-start;
   max-width: 95%;
   border-bottom-left-radius: 4px;
+  /* Body of agent replies — pure white-ish so plain prose reads at
+     the same brightness as **bold** runs (which already use 0.97).
+     The welcome bubble and "Agent working…" placeholder override
+     this back to var(--text-dim) below. */
+  color: rgba(255, 255, 255, 0.96);
 }
 
+.msg-bot .msg-content.welcome,
+.msg-bot.msg-thinking .msg-content {
+  color: var(--text-dim);
+}
 .msg-bot .msg-content.welcome {
   border-style: dashed;
   background: transparent;
-  color: var(--text-dim);
 }
 
 .msg-bot .msg-content code, .msg-bot .msg-content pre {
@@ -1352,11 +1398,54 @@ html, body, #app {
   40% { opacity: 1; transform: translateY(-3px); }
 }
 
+/* Collapsible suggestion-prompt drawer.
+ *
+ * Default state (no user message yet): toggle visible AND chips
+ * visible — the user gets a clear menu of starter prompts.
+ *
+ * After the first user message: chips collapse out and only the
+ * toggle button remains, giving the chat log far more vertical
+ * room. Click the chevron to expand back at any time.
+ */
+.chat-suggestions-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 4px 22px 0;
+}
+.chat-suggestions-toggle {
+  align-self: flex-start;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--font-display);
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  background: transparent;
+  border: none;
+  padding: 2px 6px 2px 0;
+  cursor: pointer;
+  transition: color 0.15s ease;
+}
+.chat-suggestions-toggle:hover { color: var(--text-dim); }
+.chat-suggestions-chev {
+  transition: transform 0.18s ease;
+  color: var(--accent);
+}
+.chat-suggestions-wrap[data-collapsed="true"] .chat-suggestions-chev {
+  transform: rotate(-90deg);
+}
+.chat-suggestions-wrap[data-collapsed="true"] .chat-suggestions {
+  display: none;
+}
+
 .chat-suggestions {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
-  padding: 4px 22px 0;
+  padding: 0;
 }
 
 .chip {
@@ -1372,6 +1461,161 @@ html, body, #app {
   transition: border-color 0.15s ease, color 0.15s ease, background 0.15s ease;
 }
 .chip:hover { color: var(--accent); border-color: rgba(118, 185, 0, 0.45); background: rgba(118, 185, 0, 0.07); }
+
+/* ── Chat trace toolbar (toggle Show tool calls / Show thinking) ──────── */
+/*
+ * Sits BELOW the chat input (between the input and the bottom of
+ * the rail) so it reads as a settings row for the chat itself, not
+ * as another row of suggested prompts. Slightly muted background
+ * and a top border separate it from the form above.
+ */
+.chat-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 22px 14px;
+  /* Negative top margin pulls the toolbar tight against the
+     bottom of `.chat-input` (which has padding-bottom:18px). */
+  margin-top: -8px;
+  border-top: 1px dashed rgba(255, 255, 255, 0.05);
+  background: rgba(0, 0, 0, 0.18);
+}
+.chat-toolbar-label {
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  margin-right: 2px;
+}
+
+.chat-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--font-display);
+  font-size: 11px;
+  font-weight: 500;
+  border: 1px solid var(--rail-stroke);
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--text-faint);
+  border-radius: 999px;
+  padding: 4px 10px 4px 8px;
+  cursor: pointer;
+  transition: color 0.15s ease, border-color 0.15s ease, background 0.15s ease, box-shadow 0.15s ease;
+  user-select: none;
+}
+.chat-toggle svg { stroke: currentColor; }
+.chat-toggle:hover { color: var(--text-dim); border-color: rgba(118, 185, 0, 0.30); }
+.chat-toggle[aria-pressed="true"] {
+  color: var(--accent);
+  border-color: rgba(118, 185, 0, 0.55);
+  background: rgba(118, 185, 0, 0.10);
+  box-shadow: 0 0 0 1px rgba(118, 185, 0, 0.18) inset;
+}
+
+/* ── Tool-call / thinking trace cards inside a bot message ────────────── */
+/*
+ * The trace wrapper is mounted ABOVE the .msg-content row inside an
+ * in-flight bot bubble, so streamed cards stack top-down and the
+ * "Agent working…" spinner stays pinned to the bottom of the
+ * bubble as a "still going" tail. After the turn finishes, the
+ * spinner is swapped for the final reply markdown and the cards
+ * continue to live above it as a per-turn audit trail.
+ */
+.msg-trace {
+  margin-bottom: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.msg-trace:empty { display: none; }
+
+.trace-item {
+  border: 1px solid var(--rail-stroke);
+  background: rgba(255, 255, 255, 0.025);
+  border-radius: 10px;
+  padding: 6px 8px;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--text-dim);
+  /* Each item is collapsed by default; click chevron / header to expand. */
+}
+.trace-item summary {
+  cursor: pointer;
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--font-display);
+  font-size: 11px;
+  letter-spacing: 0.02em;
+  color: var(--text-faint);
+}
+.trace-item summary::-webkit-details-marker { display: none; }
+.trace-item summary::before {
+  content: "▸";
+  font-size: 9px;
+  color: var(--text-faint);
+  transition: transform 0.15s ease;
+  display: inline-block;
+}
+.trace-item[open] summary::before { transform: rotate(90deg); color: var(--accent); }
+
+.trace-item .trace-tag {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 1px 6px;
+  border-radius: 4px;
+  border: 1px solid var(--rail-stroke);
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--text-faint);
+}
+.trace-item.trace-tool .trace-tag      { color: var(--accent);                  border-color: rgba(118, 185, 0, 0.40); background: rgba(118, 185, 0, 0.08); }
+.trace-item.trace-result .trace-tag    { color: rgba(140, 200, 255, 0.92);      border-color: rgba(120, 200, 255, 0.32); background: rgba(120, 200, 255, 0.08); }
+.trace-item.trace-result-err .trace-tag{ color: rgba(255, 140, 140, 0.95);      border-color: rgba(255, 100, 100, 0.40); background: rgba(255, 80, 80, 0.10); }
+.trace-item.trace-planning .trace-tag  { color: rgba(220, 170, 255, 0.95);      border-color: rgba(200, 150, 255, 0.40); background: rgba(180, 120, 255, 0.10); }
+.trace-item.trace-thought .trace-tag   { color: rgba(220, 170, 255, 0.92);      border-color: rgba(200, 150, 255, 0.32); background: rgba(180, 120, 255, 0.08); }
+
+/* Planning bodies are prose, not JSON, so let them wrap normally
+   instead of using the monospace JSON pre styling. */
+.trace-item.trace-planning summary .trace-summary { white-space: normal; color: rgba(245, 240, 255, 0.94); }
+.trace-item.trace-planning pre {
+  font-family: var(--font-display);
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: normal;
+  color: rgba(245, 240, 255, 0.95);
+  background: rgba(180, 120, 255, 0.06);
+  border-color: rgba(200, 150, 255, 0.24);
+}
+
+.trace-item .trace-summary {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-dim);
+}
+
+.trace-item pre {
+  margin: 6px 0 0;
+  padding: 6px 8px;
+  background: rgba(0, 0, 0, 0.32);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 6px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.45;
+  color: rgba(220, 232, 245, 0.92);
+  max-height: 220px;
+  overflow: auto;
+}
 
 .chat-input {
   display: grid;

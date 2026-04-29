@@ -4229,45 +4229,378 @@ document.querySelectorAll('.chip').forEach((btn) => {
   });
 });
 
+// ── Collapsible prompt suggestions ──────────────────────────────────────
+//
+// Default state: chips are visible so the user has a clear menu of
+// starter prompts. After the first user submit we auto-collapse them
+// to a single chevron-button — that way the chat log gets all the
+// vertical room. The user can click the chevron at any time to
+// expand the chips back.
+const elSuggestWrap   = document.getElementById('chat-suggestions-wrap');
+const elSuggestToggle = document.getElementById('chat-suggestions-toggle');
+
+function setSuggestionsCollapsed(collapsed) {
+  if (!elSuggestWrap || !elSuggestToggle) return;
+  elSuggestWrap.dataset.collapsed = collapsed ? 'true' : 'false';
+  elSuggestToggle.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+}
+elSuggestToggle?.addEventListener('click', () => {
+  const isCollapsed = elSuggestWrap?.dataset.collapsed === 'true';
+  setSuggestionsCollapsed(!isCollapsed);
+});
+
+// ── Chat trace toggle ───────────────────────────────────────────────────
+//
+// One pill toggle below the input lets the user opt into seeing the
+// agent's tool calls + tool results streamed live under each reply.
+// Defaults to OFF (cleanest demo) and persists to localStorage so the
+// choice survives refreshes.
+//
+// We DO NOT surface "thinking" here because the inference model
+// OpenClaw uses (Nemotron-3 Super v3) doesn't expose intermediate
+// reasoning to the agent runtime — even with `--thinking high
+// --verbose on` the JSONL only contains tool_call / tool_result /
+// final-text records, no separate thought stream. If a future model
+// exposes reasoning we'll add it back.
+
+const elChatToggleTools = document.getElementById('chat-toggle-tools');
+const CHAT_TRACE_LS_KEY = 'flightops.chatTrace';
+
+const chatTrace = (() => {
+  let saved = {};
+  try { saved = JSON.parse(localStorage.getItem(CHAT_TRACE_LS_KEY) || '{}'); }
+  catch (_e) { saved = {}; }
+  return { showTools: saved.showTools === true };
+})();
+
+function syncChatToggleUI() {
+  if (elChatToggleTools)
+    elChatToggleTools.setAttribute('aria-pressed', chatTrace.showTools ? 'true' : 'false');
+}
+function persistChatToggles() {
+  try { localStorage.setItem(CHAT_TRACE_LS_KEY, JSON.stringify(chatTrace)); }
+  catch (_e) { /* private mode etc. — non-fatal */ }
+}
+elChatToggleTools?.addEventListener('click', () => {
+  chatTrace.showTools = !chatTrace.showTools;
+  syncChatToggleUI();
+  persistChatToggles();
+});
+syncChatToggleUI();
+
+// Build a one-line summary for the collapsed header of a tool-call /
+// tool-result / thought card. We try to extract the most useful
+// fragment (the URL hit by curl, the python file body's first line,
+// etc.) so the user can scan the trace without expanding everything.
+function summariseTraceItem(item) {
+  if (item.kind === 'tool_call') {
+    const cmd = (item.command || '').trim();
+    if (cmd) {
+      const url = cmd.match(/https?:\/\/[^\s'"]+/);
+      if (url) return `${item.tool || 'exec'} · ${url[0]}`;
+      return `${item.tool || 'exec'} · ${cmd.split('\n')[0].slice(0, 90)}`;
+    }
+    if (item.args && typeof item.args === 'object') {
+      const keys = Object.keys(item.args).slice(0, 3).join(', ');
+      return `${item.tool || 'tool'} (${keys})`;
+    }
+    return item.tool || 'tool';
+  }
+  if (item.kind === 'tool_result') {
+    const text = (item.text || '').trim();
+    if (!text) return item.is_error ? 'error (empty)' : 'result (empty)';
+    const first = text.split('\n').find((ln) => ln.trim()) || text;
+    return first.slice(0, 110);
+  }
+  if (item.kind === 'planning' || item.kind === 'thought' || item.kind === 'text') {
+    const t = (item.text || '').trim().split('\n').find((ln) => ln.trim()) || '';
+    return t.slice(0, 120);
+  }
+  return '';
+}
+
+// Build a single trace card and append it to a wrapper. Returns the
+// new card so the caller can later replace its contents (e.g. when
+// the matching tool_result arrives for a tool_call already shown).
+function appendTraceCard(wrap, e) {
+  let cls = 'trace-item';
+  let tag = '';
+  let body = '';
+  if (e.kind === 'tool_call') {
+    cls += ' trace-tool';     tag = 'tool';
+    body = e.command ? e.command : (e.args ? JSON.stringify(e.args, null, 2) : '');
+  } else if (e.kind === 'tool_result') {
+    cls += e.is_error ? ' trace-result-err' : ' trace-result';
+    tag = e.is_error ? 'error' : 'result';
+    body = e.text || '';
+  } else if (e.kind === 'planning') {
+    cls += ' trace-planning';  tag = 'plan';
+    body = e.text || '';
+  } else if (e.kind === 'thought') {
+    cls += ' trace-thought';  tag = 'thinking';
+    body = e.text || '';
+  } else {
+    return null;
+  }
+  const det = document.createElement('details');
+  det.className = cls;
+  // Planning + thinking start expanded so the user can see the
+  // narrative; tool calls/results stay collapsed by default since
+  // their bodies (raw JSON) are bulky.
+  if (e.kind === 'planning' || e.kind === 'thought') det.open = true;
+  const summary = document.createElement('summary');
+  const tagEl = document.createElement('span');
+  tagEl.className = 'trace-tag';
+  tagEl.textContent = tag;
+  const sumEl = document.createElement('span');
+  sumEl.className = 'trace-summary';
+  sumEl.textContent = summariseTraceItem(e);
+  summary.appendChild(tagEl);
+  summary.appendChild(sumEl);
+  det.appendChild(summary);
+  if (body) {
+    const pre = document.createElement('pre');
+    pre.textContent = body;
+    det.appendChild(pre);
+  }
+  wrap.appendChild(det);
+  return det;
+}
+
+// Decide whether an incoming streamed event should be rendered given
+// the user's current toggle state. Returning false drops it on the
+// floor — events still arrive over the wire so toggling on mid-turn
+// can't retro-render past events; that's an acceptable trade-off.
+function shouldShowEvent(e) {
+  if (!e) return false;
+  // Planning narration is part of the agent's "decide what to call"
+  // step, so it lives under the same Tool calls toggle. Surfacing
+  // them together gives the user a coherent "plan → call → result"
+  // story for each step.
+  if (e.kind === 'tool_call' || e.kind === 'tool_result' || e.kind === 'planning') {
+    return chatTrace.showTools;
+  }
+  return false;
+}
+
 elChatForm.addEventListener('submit', async (e) => {
   e.preventDefault();
   const text = elChatInput.value.trim();
   if (!text) return;
   elChatInput.value = '';
+  // Auto-collapse the prompt-suggestions drawer the moment the user
+  // sends their first message so the chat log gets the full panel.
+  setSuggestionsCollapsed(true);
   appendMessage('user', text);
 
-  const thinking = appendMessage('bot', '', { thinking: true });
-  thinking.querySelector('.msg-content').innerHTML =
-    'thinking <span class="thinking-dots"><span></span><span></span><span></span></span>';
+  // Bot bubble layout while the turn is running:
+  //
+  //   ┌── .msg ──────────────────────────────┐
+  //   │  .msg-trace        (streamed cards)  │   ← grows top-down
+  //   │  .msg-content      (Agent working…)  │   ← stays at bottom
+  //   └──────────────────────────────────────┘
+  //
+  // We mount the trace wrapper BEFORE the content node so each new
+  // tool_call / tool_result card lands above the spinner — the
+  // spinner therefore stays visually anchored at the bottom of the
+  // bubble as a live "still going" tail. When the final reply
+  // arrives, the spinner row is replaced in-place by the markdown
+  // and the trace cards remain stacked above it as the audit trail.
+  const bubble = appendMessage('bot', '', { thinking: true });
+  const content = bubble.querySelector('.msg-content');
+  const traceWrap = document.createElement('div');
+  traceWrap.className = 'msg-trace';
+  bubble.insertBefore(traceWrap, content);
+  content.innerHTML =
+    'Agent working <span class="thinking-dots"><span></span><span></span><span></span></span>';
 
-  // OpenClaw turns can take a while when the agent decides to use tools,
-  // so disable the input until the reply lands.
+  // Track the latest tool_call card by its call_id so when the
+  // matching tool_result arrives we can dock it visually beneath
+  // the call. Today we just append both to the same flow — that
+  // keeps the code simple and reads naturally top-down.
+  const toolCardById = new Map();
+
+  // OpenClaw turns can take a while when the agent decides to use
+  // tools, so disable the input until the reply lands.
   elChatInput.disabled = true;
 
   try {
-    const res = await fetch('/api/chat', {
+    const res = await fetch('/api/chat/stream', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message: text, session_id: openclawSessionId }),
+      body: JSON.stringify({
+        message:    text,
+        session_id: openclawSessionId,
+      }),
     });
     if (!res.ok) {
       const errBody = await res.text();
-      thinking.remove();
+      bubble.remove();
       appendMessage('bot', `Agent call failed (${res.status}). ${errBody.slice(0, 320)}`);
       return;
     }
-    const data = await res.json();
-    thinking.remove();
-    if (data.session_id) openclawSessionId = data.session_id;
-    appendMessage('bot', data.reply || '(no reply)', { markdown: true });
+
+    // NDJSON reader: pull from the body stream, split on newlines,
+    // parse each line, dispatch by event type. This is the same
+    // pattern the OpenAI streaming client and `kubectl logs -f` use.
+    const reader  = res.body.getReader();
+    const decoder = new TextDecoder('utf-8');
+    let leftover  = '';
+    let finalDone = null;
+    let finalErr  = null;
+
+    streamLoop: while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      leftover += decoder.decode(value, { stream: true });
+      let idx;
+      while ((idx = leftover.indexOf('\n')) >= 0) {
+        const line = leftover.slice(0, idx).trim();
+        leftover = leftover.slice(idx + 1);
+        if (!line) continue;
+        let msg;
+        try { msg = JSON.parse(line); }
+        catch (_e) { continue; }
+        if (msg.type === 'event') {
+          if (shouldShowEvent(msg)) {
+            const card = appendTraceCard(traceWrap, msg);
+            if (msg.kind === 'tool_call' && msg.call_id && card) {
+              toolCardById.set(msg.call_id, card);
+            }
+            elChatLog.scrollTop = elChatLog.scrollHeight;
+          }
+        } else if (msg.type === 'done') {
+          finalDone = msg;
+          break streamLoop;
+        } else if (msg.type === 'error') {
+          finalErr = msg.error || 'Agent error';
+          break streamLoop;
+        }
+      }
+    }
+
+    if (finalErr) {
+      content.textContent = `Agent error: ${finalErr.slice(0, 320)}`;
+      return;
+    }
+    if (!finalDone) {
+      content.textContent = 'Agent stream ended without a reply.';
+      return;
+    }
+    if (finalDone.session_id) openclawSessionId = finalDone.session_id;
+    content.innerHTML = renderMarkdown(finalDone.reply || '(no reply)');
+    // Drop the `msg-thinking` class so .msg-bot.msg-content gets the
+    // bright body-text color rule meant for finished replies.
+    bubble.classList.remove('msg-thinking');
+    if (!traceWrap.childNodes.length) traceWrap.remove();
+    elChatLog.scrollTop = elChatLog.scrollHeight;
   } catch (err) {
-    thinking.remove();
+    bubble.remove();
     appendMessage('bot', `Network error talking to OpenClaw: ${err.message}`);
   } finally {
     elChatInput.disabled = false;
     elChatInput.focus();
   }
 });
+
+// ── Resizable rail ──────────────────────────────────────────────────────
+//
+// The left panel width is driven by the `--rail-w` CSS variable on
+// :root. Drag the right-edge handle to resize, double-click to reset
+// to the default 340px. Width is clamped so the rail can't get
+// unusably narrow or eat the whole map. The chosen width is persisted
+// to localStorage so it survives refreshes.
+const RAIL_MIN_PX = 280;
+const RAIL_MAX_PX = 720;
+const RAIL_DEFAULT_PX = 340;
+const RAIL_LS_KEY = 'flightops.railWidth';
+
+function applyRailWidth(px) {
+  const clamped = Math.max(RAIL_MIN_PX, Math.min(RAIL_MAX_PX, Math.round(px)));
+  document.documentElement.style.setProperty('--rail-w', `${clamped}px`);
+  // MapLibre measures its container on resize, so let it know the
+  // map stage just changed width. Otherwise the canvas can stay
+  // pinned to the pre-drag width until the next window resize.
+  if (state && state.map && typeof state.map.resize === 'function') {
+    state.map.resize();
+  }
+  return clamped;
+}
+
+(function initRailWidth() {
+  let saved = NaN;
+  try { saved = parseInt(localStorage.getItem(RAIL_LS_KEY) || '', 10); }
+  catch (_e) { /* ignore */ }
+  if (Number.isFinite(saved) && saved >= RAIL_MIN_PX && saved <= RAIL_MAX_PX) {
+    document.documentElement.style.setProperty('--rail-w', `${saved}px`);
+  }
+})();
+
+const elRailResizer = document.getElementById('rail-resizer');
+if (elRailResizer) {
+  let dragging = false;
+  const onMove = (clientX) => {
+    if (!dragging) return;
+    const rect = document.body.getBoundingClientRect();
+    // The rail is the leftmost grid track, so the cursor's distance
+    // from the left edge of the viewport IS the desired width.
+    applyRailWidth(clientX - rect.left);
+  };
+  const stop = () => {
+    if (!dragging) return;
+    dragging = false;
+    document.body.classList.remove('rail-resizing');
+    // Persist the final width.
+    try {
+      const cur = getComputedStyle(document.documentElement)
+        .getPropertyValue('--rail-w').trim();
+      const px = parseInt(cur, 10);
+      if (Number.isFinite(px)) localStorage.setItem(RAIL_LS_KEY, String(px));
+    } catch (_e) { /* ignore */ }
+    window.removeEventListener('mousemove', onMouseMove);
+    window.removeEventListener('mouseup',   stop);
+    window.removeEventListener('touchmove', onTouchMove);
+    window.removeEventListener('touchend',  stop);
+  };
+  const onMouseMove = (ev) => onMove(ev.clientX);
+  const onTouchMove = (ev) => {
+    if (ev.touches && ev.touches[0]) onMove(ev.touches[0].clientX);
+  };
+  elRailResizer.addEventListener('mousedown', (ev) => {
+    ev.preventDefault();
+    dragging = true;
+    document.body.classList.add('rail-resizing');
+    window.addEventListener('mousemove', onMouseMove);
+    window.addEventListener('mouseup',   stop);
+  });
+  elRailResizer.addEventListener('touchstart', (ev) => {
+    if (ev.touches && ev.touches[0]) {
+      dragging = true;
+      document.body.classList.add('rail-resizing');
+      window.addEventListener('touchmove', onTouchMove, { passive: true });
+      window.addEventListener('touchend',  stop);
+    }
+  }, { passive: true });
+  elRailResizer.addEventListener('dblclick', () => {
+    applyRailWidth(RAIL_DEFAULT_PX);
+    try { localStorage.setItem(RAIL_LS_KEY, String(RAIL_DEFAULT_PX)); }
+    catch (_e) { /* ignore */ }
+  });
+  // Keyboard: ←/→ adjust by 16px when the handle is focused, makes
+  // it usable without a mouse.
+  elRailResizer.addEventListener('keydown', (ev) => {
+    if (ev.key !== 'ArrowLeft' && ev.key !== 'ArrowRight') return;
+    ev.preventDefault();
+    const cur = parseInt(
+      getComputedStyle(document.documentElement).getPropertyValue('--rail-w'),
+      10,
+    ) || RAIL_DEFAULT_PX;
+    const step = ev.shiftKey ? 48 : 16;
+    const next = applyRailWidth(cur + (ev.key === 'ArrowRight' ? step : -step));
+    try { localStorage.setItem(RAIL_LS_KEY, String(next)); }
+    catch (_e) { /* ignore */ }
+  });
+}
 
 // ── Boot ─────────────────────────────────────────────────────────────────
 

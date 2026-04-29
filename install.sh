@@ -73,56 +73,182 @@ openshell sandbox list 2>/dev/null | grep -q "$SANDBOX_NAME" \
   || fail "Sandbox '$SANDBOX_NAME' not found. Run 'nemoclaw onboard' first."
 ok "Prerequisites OK"
 
-# ── 2. Resolve OpenSky creds (chat goes through OpenClaw — no inference key) ─
+# ── 2. Resolve OpenSky creds — host-canonical via ~/.nemoclaw/credentials.json ─
+#
+# Source of truth is ~/.nemoclaw/credentials.json on the HOST. We mirror
+# whatever lands here into:
+#   1. the openshell provider `flight-tracking-opensky` (gateway-side
+#      canonical record, used by future credential-injection paths and
+#      makes rotations trivial: edit credentials.json + re-run install.sh)
+#   2. the per-sandbox flight.env (current runtime read path — the
+#      FastAPI server reads OPENSKY_CLIENT_ID/SECRET from its environment
+#      and there's no shell-resolvable resolver for SecretRefs today).
+#
+# Detect-or-prompt UX:
+#   * Both keys present in credentials.json → ask use existing / replace.
+#   * Either missing → prompt for the missing values and persist.
+#   * `OPENSKY_CLIENT_ID=… ./install.sh` env override still wins (for CI).
+#
+# Chat & inference auth route through OpenClaw via `openclaw agent --json`,
+# so we don't need any inference key of our own.
 ok "Chat will route through OpenClaw (\`openclaw agent --json\`)."
 ok "OpenClaw already owns inference auth via the gateway-managed route."
 
-# OpenSky removed Basic auth in March 2026 in favour of OAuth2 client_credentials.
-# We pull the API client id/secret from ~/.nemoclaw/credentials.json so the
-# secret never leaves the host filesystem (the install script writes a
-# permissioned flight.env into the sandbox; the file is .gitignored). The
-# legacy USERNAME/PASSWORD vars are still read for backwards compatibility
-# with internal mirrors that haven't migrated yet.
-OPENSKY_CLIENT_ID="${OPENSKY_CLIENT_ID:-}"
-OPENSKY_CLIENT_SECRET="${OPENSKY_CLIENT_SECRET:-}"
-OPENSKY_USERNAME="${OPENSKY_USERNAME:-}"
-OPENSKY_PASSWORD="${OPENSKY_PASSWORD:-}"
-if [ -f "$CREDS_PATH" ]; then
-  if [ -z "$OPENSKY_CLIENT_ID" ]; then
-    OPENSKY_CLIENT_ID=$(python3 -c "
-import json
-try: print(json.load(open('$CREDS_PATH')).get('OPENSKY_CLIENT_ID',''))
-except: pass
-" 2>/dev/null || true)
+# Read whatever's in credentials.json today (may be empty / missing entirely).
+read_cred() {
+  local key="$1"
+  [ -f "$CREDS_PATH" ] || { echo ""; return; }
+  python3 -c "
+import json, sys
+try:
+    print(json.load(open('$CREDS_PATH')).get('$key','') or '')
+except Exception:
+    pass
+" 2>/dev/null
+}
+SAVED_OPENSKY_CLIENT_ID=$(read_cred OPENSKY_CLIENT_ID)
+SAVED_OPENSKY_CLIENT_SECRET=$(read_cred OPENSKY_CLIENT_SECRET)
+# Legacy Basic-auth vars — kept for back-compat with internal mirrors that
+# haven't migrated to OAuth2 yet. Not prompted, not saved by the new wizard.
+OPENSKY_USERNAME=$(read_cred OPENSKY_USERNAME)
+OPENSKY_PASSWORD=$(read_cred OPENSKY_PASSWORD)
+
+# Env override beats credentials.json (CI / one-shot rotations).
+OPENSKY_CLIENT_ID="${OPENSKY_CLIENT_ID:-$SAVED_OPENSKY_CLIENT_ID}"
+OPENSKY_CLIENT_SECRET="${OPENSKY_CLIENT_SECRET:-$SAVED_OPENSKY_CLIENT_SECRET}"
+
+# Mask helper for status prints — never echo the full secret.
+mask() {
+  local v="${1:-}"
+  local n=${#v}
+  if   [ "$n" -eq 0 ];  then echo "(unset)"
+  elif [ "$n" -le 6 ];  then echo "***"
+  else echo "${v:0:4}…${v: -4} (${n}c)"
   fi
-  if [ -z "$OPENSKY_CLIENT_SECRET" ]; then
-    OPENSKY_CLIENT_SECRET=$(python3 -c "
-import json
-try: print(json.load(open('$CREDS_PATH')).get('OPENSKY_CLIENT_SECRET',''))
-except: pass
-" 2>/dev/null || true)
+}
+
+prompt_for_creds() {
+  printf "    OPENSKY_CLIENT_ID:     "
+  read -r OPENSKY_CLIENT_ID
+  printf "    OPENSKY_CLIENT_SECRET: "
+  # -s suppresses local echo of the secret
+  read -rs OPENSKY_CLIENT_SECRET
+  printf "\n"
+  if [ -z "$OPENSKY_CLIENT_ID" ] || [ -z "$OPENSKY_CLIENT_SECRET" ]; then
+    warn "Both values are required for OAuth2 (~4,000 credits/day)."
+    OPENSKY_CLIENT_ID=""
+    OPENSKY_CLIENT_SECRET=""
   fi
-  if [ -z "$OPENSKY_USERNAME" ]; then
-    OPENSKY_USERNAME=$(python3 -c "
-import json
-try: print(json.load(open('$CREDS_PATH')).get('OPENSKY_USERNAME',''))
-except: pass
-" 2>/dev/null || true)
-    OPENSKY_PASSWORD=$(python3 -c "
-import json
-try: print(json.load(open('$CREDS_PATH')).get('OPENSKY_PASSWORD',''))
-except: pass
-" 2>/dev/null || true)
+}
+
+if [ -n "$OPENSKY_CLIENT_ID" ] && [ -n "$OPENSKY_CLIENT_SECRET" ]; then
+  echo
+  ok "OpenSky credentials found in $CREDS_PATH"
+  printf "    OPENSKY_CLIENT_ID     = %s\n" "$(mask "$OPENSKY_CLIENT_ID")"
+  printf "    OPENSKY_CLIENT_SECRET = %s\n" "$(mask "$OPENSKY_CLIENT_SECRET")"
+  if [ -t 0 ]; then
+    printf "    Use existing, [r]eplace, or [s]kip OpenSky upgrade? [U/r/s] "
+    read -r answer
+    case "${answer:-U}" in
+      r|R)
+        info "Enter new OpenSky OAuth2 credentials:"
+        prompt_for_creds
+        ;;
+      s|S)
+        warn "Skipping OAuth2 — server will fall back to anonymous (~400 credits/day)."
+        OPENSKY_CLIENT_ID=""
+        OPENSKY_CLIENT_SECRET=""
+        ;;
+      *)
+        ok "Using existing credentials"
+        ;;
+    esac
+  else
+    ok "Non-interactive shell — using existing credentials"
+  fi
+else
+  echo
+  warn "No OpenSky OAuth2 credentials in $CREDS_PATH"
+  info "Without them the server falls back to anonymous (~400 credits/day,"
+  info "fast rate-limit hits when running country-wide views)."
+  if [ -t 0 ]; then
+    printf "    Add OAuth2 credentials now? [Y/n] "
+    read -r answer
+    case "${answer:-Y}" in
+      n|N) warn "Skipped — running anonymous." ;;
+      *)   prompt_for_creds ;;
+    esac
   fi
 fi
 
+# Persist new / changed credentials into credentials.json so it stays the
+# single source of truth. We update atomically (tempfile + replace), keep
+# 0600 permissions, and only touch the OpenSky keys (other tools' creds
+# in the same file are left exactly as we found them).
+if [ -n "$OPENSKY_CLIENT_ID" ] && [ -n "$OPENSKY_CLIENT_SECRET" ]; then
+  if [ "$OPENSKY_CLIENT_ID" != "$SAVED_OPENSKY_CLIENT_ID" ] \
+     || [ "$OPENSKY_CLIENT_SECRET" != "$SAVED_OPENSKY_CLIENT_SECRET" ]; then
+    info "Saving credentials to $CREDS_PATH"
+    OPENSKY_CLIENT_ID="$OPENSKY_CLIENT_ID" \
+    OPENSKY_CLIENT_SECRET="$OPENSKY_CLIENT_SECRET" \
+    CREDS_PATH="$CREDS_PATH" \
+    python3 - <<'PY'
+import json, os, tempfile
+p = os.environ['CREDS_PATH']
+os.makedirs(os.path.dirname(p), exist_ok=True)
+try:
+    with open(p) as f:
+        d = json.load(f)
+except Exception:
+    d = {}
+d['OPENSKY_CLIENT_ID']     = os.environ['OPENSKY_CLIENT_ID']
+d['OPENSKY_CLIENT_SECRET'] = os.environ['OPENSKY_CLIENT_SECRET']
+fd, tmp = tempfile.mkstemp(prefix='cred.', dir=os.path.dirname(p) or '.')
+with os.fdopen(fd, 'w') as f:
+    json.dump(d, f, indent=2, sort_keys=True)
+os.chmod(tmp, 0o600)
+os.replace(tmp, p)
+PY
+    ok "credentials.json updated"
+  fi
+fi
+
+# Mirror credentials.json → openshell provider so the gateway has a
+# canonical record. Idempotent: create the provider if it's missing,
+# otherwise update only the credentials. Required even when we still
+# write flight.env into the sandbox today — provider registration is
+# the prerequisite for the future host-side proxy / runtime-resolved
+# secret path that gets the keys fully out of the sandbox.
+sync_openshell_provider() {
+  [ -n "$OPENSKY_CLIENT_ID" ] && [ -n "$OPENSKY_CLIENT_SECRET" ] || return 0
+  if openshell provider get flight-tracking-opensky >/dev/null 2>&1; then
+    info "Updating openshell provider 'flight-tracking-opensky'…"
+    openshell provider update flight-tracking-opensky \
+      --credential "OPENSKY_CLIENT_ID=$OPENSKY_CLIENT_ID" \
+      --credential "OPENSKY_CLIENT_SECRET=$OPENSKY_CLIENT_SECRET" >/dev/null 2>&1 \
+      && ok "Provider 'flight-tracking-opensky' refreshed" \
+      || warn "Provider update failed; gateway record may be stale"
+  else
+    info "Registering openshell provider 'flight-tracking-opensky'…"
+    openshell provider create \
+      --name flight-tracking-opensky --type generic \
+      --credential "OPENSKY_CLIENT_ID=$OPENSKY_CLIENT_ID" \
+      --credential "OPENSKY_CLIENT_SECRET=$OPENSKY_CLIENT_SECRET" >/dev/null 2>&1 \
+      && ok "Provider 'flight-tracking-opensky' created" \
+      || warn "Provider create failed; flight.env will still work but rotation requires re-running this script"
+  fi
+}
+sync_openshell_provider
+
 if [ -n "$OPENSKY_CLIENT_ID" ] && [ -n "$OPENSKY_CLIENT_SECRET" ]; then
   ok "OpenSky: OAuth2 client_credentials (~4,000 credits/day)"
+  ok "  source-of-truth: $CREDS_PATH"
+  ok "  gateway record:  openshell provider 'flight-tracking-opensky'"
 elif [ -n "$OPENSKY_USERNAME" ]; then
   warn "OpenSky: legacy Basic auth — not supported by OpenSky since March 2026."
-  warn "Add OPENSKY_CLIENT_ID and OPENSKY_CLIENT_SECRET to $CREDS_PATH to upgrade."
+  warn "Add OPENSKY_CLIENT_ID/SECRET to $CREDS_PATH to upgrade."
 else
-  info "OpenSky: anonymous (~400 credits/day). Add OPENSKY_CLIENT_ID/SECRET to $CREDS_PATH for ~4,000."
+  info "OpenSky: anonymous (~400 credits/day)."
 fi
 
 # ── 3. Apply network policy ─────────────────────────────────────────────
@@ -225,9 +351,26 @@ ssh_sandbox "chmod +x $SANDBOX_BASE/start.sh $SKILLS_BASE/flight-tracking/script
 ok "Files staged"
 
 # ── 5. flight.env ───────────────────────────────────────────────────────
-info "Writing flight.env (kept inside sandbox at $SANDBOX_BASE/flight.env)…"
+#
+# We render flight.env from credentials.json each install. Any OPENSKY_*
+# value the user replaced is therefore propagated; legacy plaintext that
+# was sitting in flight.env from a previous run is overwritten. The file
+# is chmod 600 (sandbox user only) and never copied or committed.
+#
+# Note: the OPENSKY_* keys still land in this file because the FastAPI
+# server reads them from its process env and OpenClaw's SecretRef
+# resolver isn't shell-accessible (`openclaw config get` redacts
+# secrets). The provider record on the gateway and credentials.json on
+# the host are the canonical store; flight.env is a cache that survives
+# only as long as the sandbox is alive. The follow-up that gets the
+# keys fully out of the sandbox is a host-side `opensky-proxy.py`
+# (planet-proxy pattern) — sandbox would then see only OPENSKY_PROXY_URL.
+info "Writing flight.env (rendered from $CREDS_PATH)…"
 
 ssh_sandbox "cat > $SANDBOX_BASE/flight.env" <<EOF
+# Auto-generated by install.sh — DO NOT EDIT BY HAND.
+# Source of truth: ~/.nemoclaw/credentials.json on the host.
+# Re-run ./install.sh after editing credentials.json to push the change.
 OPENSKY_CLIENT_ID=$OPENSKY_CLIENT_ID
 OPENSKY_CLIENT_SECRET=$OPENSKY_CLIENT_SECRET
 OPENSKY_USERNAME=$OPENSKY_USERNAME
@@ -339,6 +482,12 @@ cat <<EOF
   Logs:        ssh into $SANDBOX_NAME, then tail $SANDBOX_BASE/server.log
   Skill:       /sandbox/.openclaw-data/skills/flight-tracking
   Helper:      \`fly\` CLI inside the sandbox (try: fly goto IAD)
+
+  Secrets:
+    canonical:   $CREDS_PATH        (host, chmod 600)
+    gateway:     openshell provider 'flight-tracking-opensky'
+    sandbox:     $SANDBOX_BASE/flight.env (rendered each install)
+    rotate:      edit credentials.json → re-run ./install.sh
 
   Try in chat:
     "Go to IAD and analyse traffic"
