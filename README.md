@@ -18,16 +18,21 @@ summary lands in your DM.
   same map-control API as the OpenClaw skill — chat or skill, both end up
   on the same surface.
 - One-shot CLI helper `fly goto IAD`, `fly analyze JFK 100`, etc.
-- A network policy preset that allows only `opensky-network.org` outbound
-  from the sandbox-side server. Tile downloads happen in your browser, not
-  the sandbox, so the sandbox never reaches the tile CDN.
+- A **Tier-1 host-side proxy** for OpenSky (the same pattern Planet
+  uses): the sandbox can't reach `opensky-network.org` directly. A
+  small Python daemon (`opensky-proxy.py`) runs on the host, holds the
+  OAuth2 credentials, and forwards the sandbox's calls upstream with a
+  Bearer token attached. The sandbox knows only the proxy URL — the
+  `OPENSKY_CLIENT_ID` / `OPENSKY_CLIENT_SECRET` never enter the
+  sandbox, so a sandbox compromise can't exfiltrate them. Tile
+  downloads happen in your browser, not the sandbox.
 
 ## Repo layout
 
 ```
 flight-tracking-integration/
 ├── app/
-│   ├── server.py              # FastAPI: OpenSky proxy, airports, chat, ws bus
+│   ├── server.py              # FastAPI: flight proxy, airports, chat, ws bus
 │   ├── requirements.txt
 │   └── static/
 │       ├── index.html
@@ -38,10 +43,42 @@ flight-tracking-integration/
 │   ├── SKILL.md               # OpenClaw skill descriptor
 │   └── scripts/fly            # bash CLI helper
 ├── policy/flight-tracking.yaml
+├── opensky-proxy.py           # HOST-side OAuth2-injecting proxy (Tier-1)
 ├── start.sh                   # sandbox-side launcher
 ├── install.sh                 # host-side installer
 └── README.md
 ```
+
+## Architecture: how OpenSky credentials stay out of the sandbox
+
+```
+  ┌──────────────────────────┐                ┌────────────────────────────┐
+  │  HOST (your VM)          │                │  SANDBOX (openshell)       │
+  │                          │                │                            │
+  │  ~/.nemoclaw/            │                │  /sandbox/.openclaw-data/  │
+  │   credentials.json       │                │   flight-tracking/         │
+  │   (chmod 600, host only) │                │     flight.env             │
+  │      │                   │                │       OPENSKY_PROXY_URL=…  │
+  │      ▼                   │                │       (no secrets)         │
+  │   opensky-proxy.py       │  HTTP    ┌─────┤                            │
+  │   :9202                  │◀─────────┤     │  uvicorn server.py         │
+  │   • mints OAuth2 token   │ Bearer   │     │   (binary: /usr/bin/       │
+  │   • caches + refreshes   │ injected │     │    python3 only — policy   │
+  │   • forwards to OpenSky  │          │     │    blocks everything else) │
+  │      │                   │          │     │                            │
+  │      ▼ Bearer            │          │     │   policy:                  │
+  │   opensky-network.org    │          │     │   • <HOST>:9202 ALLOWED    │
+  │                          │          │     │   • opensky-network.org    │
+  │                          │          │     │     BLOCKED                │
+  └──────────────────────────┘          │     └────────────────────────────┘
+                                        │
+            policy enforcement boundary ┘
+```
+
+To rotate the OpenSky key: edit `~/.nemoclaw/credentials.json` on the
+host, re-run `./install.sh <sandbox>`. The sandbox is never touched
+during rotation — the proxy reads creds at request time so the new
+token is minted within seconds.
 
 ## Prerequisites
 

@@ -11,13 +11,19 @@ Design notes
 - Runs entirely inside the OpenShell sandbox. The browser reaches it through
   `openshell forward start <sandbox> 0.0.0.0:18890` (the install script
   configures this).
-- OpenSky is reachable anonymously at ~400 credits/day. If
-  OPENSKY_CLIENT_ID / OPENSKY_CLIENT_SECRET are set we run the OAuth2
-  client-credentials flow against auth.opensky-network.org and use the
-  resulting bearer token for /states/all calls — that lifts the daily
-  budget to ~4,000 credits. (HTTP Basic was removed in March 2026.)
-  Responses are cached briefly in-process to avoid hammering the API when
-  several browsers are open.
+- OpenSky is reached one of two ways:
+    * **Tier-1 host proxy (default)** — `OPENSKY_PROXY_URL` points at a
+      Python daemon running on the host (outside the sandbox) which
+      reads OAuth2 credentials from `~/.nemoclaw/credentials.json`,
+      mints/refreshes bearer tokens, and forwards to opensky-network.org.
+      The sandbox itself never sees the client_id or secret. Mirrors
+      the Planet integration's `planet-proxy.py` pattern.
+    * **Direct (legacy / dev)** — when `OPENSKY_PROXY_URL` is unset and
+      `OPENSKY_CLIENT_ID`/`OPENSKY_CLIENT_SECRET` are present in the
+      env, we run the OAuth2 client_credentials dance ourselves.
+      Anonymous fallback (~400 credits/day) when neither is set.
+  Responses are cached briefly in-process either way so several open
+  browsers don't burn through the daily credit budget.
 - The chat panel does *not* call inference directly. It exec's
   `openclaw agent --json` so OpenClaw owns auth, model selection, skill
   routing, and conversation memory — exactly the way the TUI works. The
@@ -50,9 +56,23 @@ APP_DIR = Path(__file__).resolve().parent
 STATIC_DIR = APP_DIR / "static"
 DATA_DIR = STATIC_DIR / "data"
 
-OPENSKY_URL = "https://opensky-network.org/api/states/all"
-OPENSKY_FLIGHTS_URL = "https://opensky-network.org/api/flights/aircraft"
-OPENSKY_TRACKS_URL = "https://opensky-network.org/api/tracks/all"
+# OpenSky access has two modes:
+#   1. Tier-1 host proxy (preferred). When OPENSKY_PROXY_URL is set the
+#      sandbox calls a Python daemon running on the host. That daemon
+#      reads the OAuth2 client_credentials from
+#      ~/.nemoclaw/credentials.json, mints/refreshes the bearer token,
+#      and forwards to opensky-network.org. The sandbox itself never
+#      sees the client_id/secret — same pattern Planet uses.
+#   2. Direct OAuth2 from inside the sandbox (legacy / dev). Used when
+#      OPENSKY_PROXY_URL is empty AND OPENSKY_CLIENT_ID/SECRET are set
+#      in the process env. Kept so dev loops outside the install.sh
+#      flow still work without standing up the host daemon.
+OPENSKY_PROXY_URL = os.getenv("OPENSKY_PROXY_URL", "").strip().rstrip("/")
+OPENSKY_DIRECT_BASE = "https://opensky-network.org"
+OPENSKY_BASE = OPENSKY_PROXY_URL or OPENSKY_DIRECT_BASE
+OPENSKY_URL = f"{OPENSKY_BASE}/api/states/all"
+OPENSKY_FLIGHTS_URL = f"{OPENSKY_BASE}/api/flights/aircraft"
+OPENSKY_TRACKS_URL = f"{OPENSKY_BASE}/api/tracks/all"
 OPENSKY_TOKEN_URL = (
     "https://auth.opensky-network.org/auth/realms/opensky-network/"
     "protocol/openid-connect/token"
@@ -452,11 +472,18 @@ async def _opensky_auth_header() -> dict[str, str]:
     """Return the appropriate Authorization header for the OpenSky API.
 
     Order of preference:
+      0. None when OPENSKY_PROXY_URL is set — the host-side proxy owns
+         the credentials and injects Bearer auth itself. Keeping our
+         own Authorization header here would duplicate (and leak) the
+         legacy in-sandbox token via the proxy hop.
       1. OAuth2 client_credentials (the only auth OpenSky supports as of
-         March 2026 for new installs).
+         March 2026 for new installs) when running direct from the
+         sandbox.
       2. Legacy HTTP Basic, kept for backwards compatibility with internal
          mirrors / older deployments. Only used if OAuth2 isn't configured.
     """
+    if OPENSKY_PROXY_URL:
+        return {}
     token = await _opensky_tokens.get()
     if token:
         return {"Authorization": f"Bearer {token}"}
@@ -2330,7 +2357,11 @@ app = FastAPI(
 
 @app.get("/api/health")
 async def health() -> dict[str, Any]:
-    if _opensky_tokens.configured:
+    if OPENSKY_PROXY_URL:
+        # Tier-1: keys live exclusively on the host inside the proxy.
+        # The sandbox process has no credential material to report.
+        opensky_auth = "host-proxy"
+    elif _opensky_tokens.configured:
         opensky_auth = "oauth2"
     elif OPENSKY_USER and OPENSKY_PASS:
         opensky_auth = "basic"
@@ -2341,6 +2372,7 @@ async def health() -> dict[str, Any]:
         "airports_loaded": len(AIRPORTS),
         "opensky_auth": opensky_auth,
         "opensky_authenticated": opensky_auth != "anonymous",
+        "opensky_proxy_url": OPENSKY_PROXY_URL or None,
         "openclaw_bin": OPENCLAW_BIN,
         "openclaw_available": Path(OPENCLAW_BIN).exists(),
         "openclaw_agent": OPENCLAW_AGENT,

@@ -1,44 +1,43 @@
 # SPDX-License-Identifier: Apache-2.0
 #
-# Flight Tracking Integration — sandbox network policy.
+# Flight Tracking Integration — sandbox network policy (Tier-1).
 #
-# The sandbox-side FastAPI server (server.py) needs outbound access to:
-#   - opensky-network.org:443        (live aircraft state vectors)
-#   - auth.opensky-network.org:443   (OAuth2 client_credentials token mint)
-#   - services6.arcgis.com:443       (FAA AIS Special Use + Class airspace)
-#   - tfr.faa.gov:443                (FAA Temporary Flight Restrictions WFS)
+# Architecture: the sandbox does NOT talk to opensky-network.org or
+# auth.opensky-network.org directly. Instead it talks to a host-side
+# Python daemon (`opensky-proxy.py`, port 9202) which holds the OAuth2
+# credentials in ~/.nemoclaw/credentials.json on the host. Mirrors the
+# planet-proxy tier-1 pattern. The OPENSKY_CLIENT_ID/SECRET never enter
+# the sandbox, so a sandbox compromise can't exfiltrate them.
 #
-# Inference traffic (api -> Nemotron) is already governed by OpenShell's
-# gateway-managed inference route configured via `openshell inference set`,
-# so we don't need to declare it here.
+# install.sh dynamically substitutes <HOST_IP> with the brev VM's
+# primary address before applying this policy. The template below is
+# a reference shape; the real on-the-wire policy uses the rendered IP.
 #
-# Static map tiles (openfreemap.org) are fetched directly by the user's
-# browser via the openshell port-forward — they never leave the host. The
-# sandbox itself does not need access to the tile server.
+# Other allowed upstreams:
+#   - services6.arcgis.com:443  (FAA AIS Special Use + Class airspace)
+#   - tfr.faa.gov:443           (FAA Temporary Flight Restrictions WFS)
 #
-# install.sh applies the policy block below via `openshell policy set`. The
-# binary path (`/usr/bin/python3`) matches the Python 3.11 interpreter that
-# ships in the NemoClaw base image.
+# Inference traffic (api -> Nemotron) is governed by OpenShell's
+# gateway-managed inference route (`openshell inference set`), so it
+# isn't declared here. Static map tiles are fetched directly by the
+# user's browser via the openshell port-forward; the sandbox itself
+# does not need access to the tile server.
 
 network_policies:
   flight_tracking_opensky:
     name: flight_tracking_opensky
     endpoints:
-      - host: opensky-network.org
-        port: 443
+      # Tier-1 host proxy. <HOST_IP> is rendered by install.sh.
+      - host: <HOST_IP>
+        port: 9202
         protocol: rest
         enforcement: enforce
-        tls: terminate
+        tls: passthrough
         rules:
-          - allow: { method: GET, path: "/api/states/all" }
           - allow: { method: GET, path: "/api/states/all*" }
-      - host: auth.opensky-network.org
-        port: 443
-        protocol: rest
-        enforcement: enforce
-        tls: terminate
-        rules:
-          - allow: { method: POST, path: "/auth/realms/opensky-network/protocol/openid-connect/token" }
+          - allow: { method: GET, path: "/api/flights/aircraft*" }
+          - allow: { method: GET, path: "/api/tracks/all*" }
+          - allow: { method: GET, path: "/health" }
       - host: services6.arcgis.com
         port: 443
         protocol: rest

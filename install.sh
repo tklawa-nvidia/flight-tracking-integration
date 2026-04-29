@@ -1,19 +1,31 @@
 #!/usr/bin/env bash
-# Flight Tracking Integration — sandbox installer.
+# Flight Tracking Integration — sandbox installer (Tier-1 host-proxy).
 #
-# Sandbox-side install. Per the demo brief, no host-side proxy is used:
-# OpenSky has no auth secret in anonymous mode, and the inference key is
-# read at server startup from the env file we drop into
-# /sandbox/.openclaw-data/flight-tracking/flight.env. If you want to harden
-# this later, swap inference traffic onto a host proxy and remove the key
-# from the env file — the server already reads INFERENCE_BASE_URL/MODEL/
-# INFERENCE_API_KEY straight from the environment.
+# This installer takes the same approach as the Planet integration:
+# OpenSky OAuth2 credentials live ONLY on the host, in
+# ~/.nemoclaw/credentials.json (chmod 600). A small Python daemon
+# (`opensky-proxy.py`) runs on the host, mints/refreshes Bearer tokens
+# itself, and forwards the sandbox's calls to opensky-network.org. The
+# sandbox process only knows the proxy URL — never the client_id or
+# secret. A sandbox compromise therefore cannot exfiltrate the key.
+#
+# Steps performed:
+#   1. Read OpenSky creds from credentials.json (prompt if missing).
+#   2. (Optionally) refresh the openshell provider record (gateway).
+#   3. Start/restart `opensky-proxy.py` on the host (port 9202).
+#   4. Detect the host's primary IP and write a network policy that
+#      lets the sandbox reach <HOST_IP>:9202 (and ARCGIS / TFR), but
+#      NOT opensky-network.org / auth.opensky-network.org directly.
+#   5. Stage server files into the sandbox.
+#   6. Render flight.env with OPENSKY_PROXY_URL only — no keys.
+#   7. Build venv, restart uvicorn, set up the openshell forward.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SANDBOX_NAME="${1:-${OPENSHELL_SANDBOX:-}}"
 PORT="${FLIGHT_APP_PORT:-18890}"
+OPENSKY_PROXY_PORT="${OPENSKY_PROXY_PORT:-9202}"
 
 CREDS_PATH="$HOME/.nemoclaw/credentials.json"
 ONBOARD_PATH="$HOME/.nemoclaw/onboard-session.json"
@@ -251,38 +263,126 @@ else
   info "OpenSky: anonymous (~400 credits/day)."
 fi
 
-# ── 3. Apply network policy ─────────────────────────────────────────────
-info "Applying flight_tracking_opensky network policy…"
+# ── 3. Start the host-side OpenSky proxy ────────────────────────────────
+#
+# The proxy runs on the host (outside the sandbox), reads creds from
+# credentials.json, mints/refreshes OAuth2 Bearer tokens, and forwards
+# sandbox requests to opensky-network.org. The sandbox itself never
+# sees the secret.
+#
+# We restart on every install so that:
+#   * a credentials.json edit takes effect immediately (proxy reads
+#     creds at request time too, but a restart guarantees a clean
+#     token cache for the demo)
+#   * a new code revision of opensky-proxy.py is picked up
+#   * we reset any stuck state from a previous run
+echo
+info "Starting host-side opensky-proxy on 0.0.0.0:$OPENSKY_PROXY_PORT…"
+
+# Best-effort kill of any prior copy of the daemon. We match the python
+# command line rather than relying on a pidfile so a stale pidfile from
+# a crashed previous run can't block us.
+EXISTING_PID=$(pgrep -f "python3.*opensky-proxy\.py" 2>/dev/null || true)
+if [ -n "$EXISTING_PID" ]; then
+  info "Stopping existing opensky-proxy (PID $EXISTING_PID)…"
+  kill "$EXISTING_PID" 2>/dev/null || true
+  sleep 1
+  # Force-kill anything that ignored SIGTERM.
+  pgrep -f "python3.*opensky-proxy\.py" 2>/dev/null \
+    | xargs -r kill -9 2>/dev/null || true
+fi
+
+# `setsid nohup` so the daemon survives the install.sh shell exit and
+# so it gets its own session (won't be orphaned to the systemd reaper).
+mkdir -p "$(dirname /tmp/opensky-proxy.log)" 2>/dev/null || true
+setsid nohup python3 "$SCRIPT_DIR/opensky-proxy.py" \
+    --port "$OPENSKY_PROXY_PORT" \
+    > /tmp/opensky-proxy.log 2>&1 < /dev/null &
+PROXY_PID=$!
+disown 2>/dev/null || true
+sleep 2
+
+if kill -0 "$PROXY_PID" 2>/dev/null; then
+  ok "opensky-proxy started (PID $PROXY_PID, port $OPENSKY_PROXY_PORT)"
+else
+  warn "opensky-proxy failed to start. Last 20 log lines:"
+  tail -n 20 /tmp/opensky-proxy.log 2>/dev/null || true
+  fail "Could not start opensky-proxy. Inspect /tmp/opensky-proxy.log"
+fi
+
+# Health-probe the daemon — a fresh fork can momentarily be running
+# without yet being bound to the port, so retry briefly.
+PROXY_READY=false
+for _ in 1 2 3 4 5; do
+  if curl -fsS -o /dev/null --max-time 2 \
+        "http://127.0.0.1:${OPENSKY_PROXY_PORT}/health"; then
+    PROXY_READY=true
+    break
+  fi
+  sleep 1
+done
+if [ "$PROXY_READY" = true ]; then
+  ok "opensky-proxy /health passed"
+else
+  warn "opensky-proxy /health didn't respond — proceeding but check /tmp/opensky-proxy.log"
+fi
+
+# ── 4. Detect the host IP the sandbox should dial ───────────────────────
+#
+# This must be the address the sandbox sees the host at, not 127.0.0.1
+# (the sandbox has its own loopback). The brev VM publishes its primary
+# interface address via `hostname -I`; that's what the sandbox's NAT
+# tables route to. Allow override via env var for unusual networking
+# setups.
+HOST_IP="${OPENSKY_PROXY_HOST:-}"
+if [ -z "$HOST_IP" ]; then
+  HOST_IP=$( (hostname -I 2>/dev/null || true) | awk '{print $1}')
+fi
+if [ -z "$HOST_IP" ]; then
+  HOST_IP=$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || true)
+fi
+[ -z "$HOST_IP" ] && fail "Could not detect host IP. Set OPENSKY_PROXY_HOST."
+info "Host IP for sandbox→proxy traffic: $HOST_IP"
+
+OPENSKY_PROXY_URL="http://${HOST_IP}:${OPENSKY_PROXY_PORT}"
+
+# ── 5. Apply network policy ─────────────────────────────────────────────
+info "Applying flight_tracking_opensky network policy (Tier-1)…"
 
 POLICY_FILE=$(mktemp /tmp/flight-tracking-policy-XXXX.yaml)
 openshell policy get "$SANDBOX_NAME" --full 2>/dev/null | sed '1,/^---$/d' > "$POLICY_FILE"
 
-# Idempotent upsert of the flight_tracking_opensky block. Earlier versions
-# of the demo only opened opensky-network.org; OAuth2 also needs
-# auth.opensky-network.org for the token mint, so we reconcile both hosts.
+# Idempotent upsert. Crucially, we DROP opensky-network.org and
+# auth.opensky-network.org from the policy — under tier-1 the sandbox
+# must reach OpenSky only via the host proxy. Anything else would
+# bypass the kept-on-host credential boundary.
+export HOST_IP
+export PROXY_PORT="$OPENSKY_PROXY_PORT"
 PATCH_RESULT=$(python3 - "$POLICY_FILE" <<'PY'
-import sys, yaml
+import os, sys, yaml
 path = sys.argv[1]
+host_ip    = os.environ['HOST_IP']
+proxy_port = int(os.environ['PROXY_PORT'])
+
 with open(path) as f:
     doc = yaml.safe_load(f) or {}
 nps = doc.get('network_policies') or {}
+
 desired = {
     'name': 'flight_tracking_opensky',
     'endpoints': [
         {
-            'host': 'opensky-network.org', 'port': 443, 'protocol': 'rest',
-            'tls': 'terminate', 'enforcement': 'enforce',
+            # Tier-1 host proxy — the only OpenSky path the sandbox
+            # is allowed to take. tls: passthrough because the proxy
+            # listens HTTP-only on the loopback bridge; TLS termination
+            # happens at the proxy↔OpenSky hop.
+            'host': host_ip, 'port': proxy_port, 'protocol': 'rest',
+            'tls': 'passthrough', 'enforcement': 'enforce',
             'rules': [
-                {'allow': {'method': 'GET', 'path': '/api/states/all'}},
                 {'allow': {'method': 'GET', 'path': '/api/states/all*'}},
-            ],
-        },
-        {
-            'host': 'auth.opensky-network.org', 'port': 443, 'protocol': 'rest',
-            'tls': 'terminate', 'enforcement': 'enforce',
-            'rules': [
-                {'allow': {'method': 'POST',
-                           'path': '/auth/realms/opensky-network/protocol/openid-connect/token'}},
+                {'allow': {'method': 'GET', 'path': '/api/flights/aircraft*'}},
+                {'allow': {'method': 'GET', 'path': '/api/tracks/all*'}},
+                {'allow': {'method': 'GET', 'path': '/health'}},
             ],
         },
         {
@@ -322,7 +422,7 @@ if [ "$PATCH_RESULT" = "unchanged" ]; then
   ok "Policy already up to date"
 else
   openshell policy set "$SANDBOX_NAME" --policy "$POLICY_FILE" --wait 2>&1 \
-    && ok "Policy applied (added/updated flight_tracking_opensky)" \
+    && ok "Policy applied (host-proxy only — direct OpenSky access removed)" \
     || fail "openshell policy set failed; review $POLICY_FILE"
 fi
 rm -f "$POLICY_FILE"
@@ -350,37 +450,29 @@ upload "$SCRIPT_DIR/skills/flight-tracking/scripts/fly"                "$SKILLS_
 ssh_sandbox "chmod +x $SANDBOX_BASE/start.sh $SKILLS_BASE/flight-tracking/scripts/fly" 2>/dev/null
 ok "Files staged"
 
-# ── 5. flight.env ───────────────────────────────────────────────────────
+# ── 6. flight.env (Tier-1: zero secrets in sandbox) ─────────────────────
 #
-# We render flight.env from credentials.json each install. Any OPENSKY_*
-# value the user replaced is therefore propagated; legacy plaintext that
-# was sitting in flight.env from a previous run is overwritten. The file
-# is chmod 600 (sandbox user only) and never copied or committed.
-#
-# Note: the OPENSKY_* keys still land in this file because the FastAPI
-# server reads them from its process env and OpenClaw's SecretRef
-# resolver isn't shell-accessible (`openclaw config get` redacts
-# secrets). The provider record on the gateway and credentials.json on
-# the host are the canonical store; flight.env is a cache that survives
-# only as long as the sandbox is alive. The follow-up that gets the
-# keys fully out of the sandbox is a host-side `opensky-proxy.py`
-# (planet-proxy pattern) — sandbox would then see only OPENSKY_PROXY_URL.
-info "Writing flight.env (rendered from $CREDS_PATH)…"
+# This file used to carry OPENSKY_CLIENT_ID/SECRET into the sandbox.
+# Under Tier-1 those values STAY ON THE HOST — the sandbox only learns
+# the proxy URL, and the proxy attaches the Bearer token at the
+# host↔OpenSky hop. The file is chmod 600 (sandbox user only).
+info "Writing flight.env (zero OpenSky secrets — Tier-1)…"
 
 ssh_sandbox "cat > $SANDBOX_BASE/flight.env" <<EOF
 # Auto-generated by install.sh — DO NOT EDIT BY HAND.
-# Source of truth: ~/.nemoclaw/credentials.json on the host.
-# Re-run ./install.sh after editing credentials.json to push the change.
-OPENSKY_CLIENT_ID=$OPENSKY_CLIENT_ID
-OPENSKY_CLIENT_SECRET=$OPENSKY_CLIENT_SECRET
-OPENSKY_USERNAME=$OPENSKY_USERNAME
-OPENSKY_PASSWORD=$OPENSKY_PASSWORD
+# Tier-1 architecture: OpenSky credentials live ONLY on the host at
+# ~/.nemoclaw/credentials.json. The host-side opensky-proxy.py
+# (PID listed via \`pgrep -f opensky-proxy\` on the host) injects
+# the Bearer token; this sandbox never sees the secret.
+# Rotate by editing credentials.json on the host then re-running
+# install.sh.
+OPENSKY_PROXY_URL=$OPENSKY_PROXY_URL
 FLIGHT_APP_PORT=$PORT
 OPENCLAW_AGENT=main
 OPENCLAW_TIMEOUT_S=180
 EOF
 ssh_sandbox "chmod 600 $SANDBOX_BASE/flight.env" 2>/dev/null
-ok "flight.env written"
+ok "flight.env written (only OPENSKY_PROXY_URL — no secrets)"
 
 # ── 6. Build venv + install deps inside the sandbox ─────────────────────
 info "Building Python venv inside the sandbox (one-time)…"
@@ -399,41 +491,58 @@ ok "Python deps installed"
 # ── 7. (Re)start the server inside the sandbox ──────────────────────────
 info "Starting FlightOps server inside the sandbox on port $PORT…"
 
-ssh_sandbox "
-set -e
-# Best-effort kill of any prior uvicorn for this app.
-if command -v pkill >/dev/null 2>&1; then
-  pkill -f 'uvicorn server:app' >/dev/null 2>&1 || true
-else
-  ps -eo pid,args 2>/dev/null | awk '/uvicorn server:app/ && !/awk/ {print \$1}' \
-    | xargs -r kill 2>/dev/null || true
-fi
-sleep 1
-# Detach with setsid so the server survives the SSH disconnect on minimal images.
-setsid nohup $SANDBOX_BASE/start.sh > $SANDBOX_BASE/server.log 2>&1 < /dev/null &
-disown 2>/dev/null || true
-"
+# Two separate one-line ssh calls. Multi-line heredoc invocations of
+# ssh_sandbox here were causing the SSH session to hang waiting on
+# fd cleanup of the disowned background uvicorn — single-line form
+# returns in ~3s instead. The minimal sandbox image strips pkill/
+# pgrep and restricts plain `ps` to our own session, so the kill
+# step walks /proc directly (always available, always sees our own
+# UID's processes regardless of session).
 
-# Wait until the port is actually accepting connections from inside the sandbox.
+# Step 7a — kill any prior uvicorn serving this app.
+ssh_sandbox 'for pd in /proc/[0-9]*; do pid=$(basename "$pd"); [ -r "$pd/cmdline" ] || continue; cmd=$(tr "\0" " " < "$pd/cmdline" 2>/dev/null); case "$cmd" in *uvicorn*server:app*) kill -9 "$pid" 2>/dev/null || true ;; esac; done; sleep 1; true' \
+  || true
+
+# Step 7b — truncate the log + launch start.sh detached. Inline one-
+# liner so SSH's fd cleanup doesn't block on the disowned background.
+ssh_sandbox "cd $SANDBOX_BASE && : > server.log && nohup ./start.sh > server.log 2>&1 < /dev/null & disown; true" \
+  || true
+
+# Wait until the port is accepting connections AND the listening server
+# actually picked up the new flight.env. We don't just check that *some*
+# uvicorn is listening — a stale uvicorn from a previous install can
+# happily serve the old code on the same port and make this check pass
+# with garbage. We probe /api/health and require opensky_auth=host-proxy
+# (or anonymous, if creds were intentionally skipped) to know the new
+# process is the one answering.
 SERVER_UP=false
 for _ in 1 2 3 4 5 6 7 8 9 10; do
   sleep 1
-  if ssh_sandbox "
-if command -v ss >/dev/null 2>&1; then
-  ss -ltn 2>/dev/null | awk '{print \$4}' | grep -qE ':(${PORT})\$'
-elif command -v netstat >/dev/null 2>&1; then
-  netstat -ltn 2>/dev/null | awk '{print \$4}' | grep -qE ':(${PORT})\$'
-else
-  python3 -c 'import socket,sys;s=socket.socket();exit(0 if s.connect_ex((\"127.0.0.1\",${PORT}))==0 else 1)'
-fi
-  " 2>/dev/null; then
+  HEALTH=$(ssh_sandbox "
+python3 - <<'PY' 2>/dev/null
+import json, urllib.request
+try:
+    with urllib.request.urlopen('http://127.0.0.1:${PORT}/api/health', timeout=2) as r:
+        print(r.read().decode())
+except Exception:
+    pass
+PY
+" 2>/dev/null || true)
+  if [ -n "$HEALTH" ] && echo "$HEALTH" | grep -q '"opensky_auth":"host-proxy"'; then
     SERVER_UP=true
     break
   fi
 done
 
 if [ "$SERVER_UP" = true ]; then
-  ok "Server is listening on :$PORT"
+  ok "Server is listening on :$PORT (opensky_auth=host-proxy)"
+elif [ -n "${HEALTH:-}" ]; then
+  warn "Server is listening but did NOT pick up host-proxy mode."
+  warn "  /api/health says: $HEALTH"
+  warn "  → a stale uvicorn from a previous install is probably still bound to :$PORT."
+  warn "  Last 30 log lines:"
+  ssh_sandbox "tail -n 30 $SANDBOX_BASE/server.log 2>/dev/null" || true
+  fail "FlightOps backend failed to roll over to Tier-1 mode."
 else
   warn "Server did not start. Last 30 log lines:"
   ssh_sandbox "tail -n 30 $SANDBOX_BASE/server.log 2>/dev/null" || true
@@ -483,11 +592,13 @@ cat <<EOF
   Skill:       /sandbox/.openclaw-data/skills/flight-tracking
   Helper:      \`fly\` CLI inside the sandbox (try: fly goto IAD)
 
-  Secrets:
+  Secrets (Tier-1 host-proxy):
     canonical:   $CREDS_PATH        (host, chmod 600)
+    proxy:       opensky-proxy.py @ http://${HOST_IP}:${OPENSKY_PROXY_PORT}  (host)
     gateway:     openshell provider 'flight-tracking-opensky'
-    sandbox:     $SANDBOX_BASE/flight.env (rendered each install)
+    sandbox:     $SANDBOX_BASE/flight.env  (no secrets — only proxy URL)
     rotate:      edit credentials.json → re-run ./install.sh
+    proxy log:   /tmp/opensky-proxy.log (on host)
 
   Try in chat:
     "Go to IAD and analyse traffic"
