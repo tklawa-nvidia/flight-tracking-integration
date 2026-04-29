@@ -210,14 +210,22 @@ const APPROX_CREDITS_PER_CALL = 2;
 
 const FLIGHT_STALE_MS = 60_000;        // drop flights we haven't seen in 60s
 const MAX_HISTORY = 60;
-// Don't extrapolate further than this since the last fix — an aircraft we
-// haven't heard from in 60s is more likely lost than still on its old
-// vector. Beyond this we just freeze the icon at the last known position.
-const DEAD_RECKON_MAX_S = 60;
+// Don't extrapolate further than this since the last fix. We poll OpenSky
+// every ~10s, so a flight we haven't heard from in 30s is either out of
+// our bbox or has dropped off ADS-B. Capping at 30s prevents the icon
+// from "running far ahead" on stale extrapolation only to be yanked back
+// when a delayed fix finally arrives — at high zoom that yank is the
+// most visible jitter.
+const DEAD_RECKON_MAX_S = 30;
 // When a new fix lands, the icon is currently at its dead-reckoned visual
 // position. The new fix tells us where the plane actually is. Snapping to
 // the new position would jitter, so we keep a decaying offset that smoothly
 // pulls the icon onto the new dead-reckoning line over this many seconds.
+// The same time-constant is used for *heading* glide — when the new fix
+// reports a different heading than the old anchor, the icon's drawn
+// orientation eases shortest-arc toward the new heading instead of
+// snapping. Without that, a real-world ~5° course adjustment looks like
+// a sudden swerve at high zoom.
 const CORRECTION_DECAY_S = 3;
 // Show breadcrumb paths for every visible flight at this zoom or above.
 const TRAIL_ZOOM_THRESHOLD = 6;
@@ -564,6 +572,37 @@ function renderPos(f, nowMs) {
     return dr;
   }
   return [dr[0] + f.correction[0] * decay, dr[1] + f.correction[1] * decay];
+}
+
+// Returns the heading the icon should be drawn at, in degrees CW from
+// north (i.e. the OpenSky convention). When a fresh fix arrives with a
+// different heading than the previous anchor, we glide shortest-arc from
+// the old heading to the new one over CORRECTION_DECAY_S — same
+// time-constant the position correction uses, so the icon's orientation
+// and track stay coherent during the glide. f.headingCorrection is the
+// signed shortest-arc delta in degrees that we still owe (old − new).
+function renderHeading(f, nowMs) {
+  const base = f.anchor?.heading ?? f.heading ?? 0;
+  if (!f.headingCorrection || f.correctionTs == null) return base;
+  const age = (nowMs - f.correctionTs) / 1000;
+  const decay = Math.exp(-age / CORRECTION_DECAY_S);
+  if (decay < 0.01) {
+    f.headingCorrection = 0;
+    return base;
+  }
+  // Wrap to (−180, 180] so the rendered angle stays in a sane range
+  // and we never accidentally take the long way round a discontinuity.
+  let h = base + f.headingCorrection * decay;
+  h = ((h % 360) + 360) % 360;
+  return h;
+}
+
+// Shortest signed delta from a → b in degrees, range (−180, 180].
+function shortestArcDeg(a, b) {
+  let d = (b - a) % 360;
+  if (d > 180) d -= 360;
+  if (d <= -180) d += 360;
+  return d;
 }
 
 // When a new state vector arrives the icon is currently at its dead-
@@ -2068,7 +2107,11 @@ function buildLayers() {
         getSize: planeSize,
         // Plane SVG points UP (0° = north). OpenSky heading is degrees CW
         // from north. deck.gl getAngle is CCW degrees, so we negate.
-        getAngle: (f) => -(f.anchor?.heading ?? f.heading ?? 0),
+        // renderHeading eases shortest-arc from the old anchor's heading
+        // to the new one over CORRECTION_DECAY_S, matching the position
+        // glide so the icon's orientation and track stay in sync during
+        // a course adjustment instead of snapping to the new heading.
+        getAngle: (f) => -renderHeading(f, performance.now()),
         getColor: planeColor,
         sizeUnits: 'pixels',
         sizeMinPixels: 10,
@@ -3007,6 +3050,7 @@ function ingestFlights(flights) {
     // instead of teleporting.
     const prev = state.flights.get(f.id);
     let correction = null;
+    let headingCorrection = 0;
     if (prev && prev.anchor) {
       const oldRender = renderPos(prev, now);
       const dLon = oldRender[0] - newAnchor.lon;
@@ -3016,10 +3060,19 @@ function ingestFlights(flights) {
       // just snap.
       if (dLon * dLon + dLat * dLat < 25) {
         correction = clampedCorrection(oldRender, newAnchor);
+        // Capture heading delta so the icon's orientation eases to the
+        // new heading instead of snapping. The "owed" delta is the
+        // shortest signed arc from new → old, so renderHeading adds
+        // (old − new) * decay back onto the new base heading.
+        const oldHeading = renderHeading(prev, now);
+        if (newAnchor.heading != null && Number.isFinite(oldHeading)) {
+          headingCorrection = shortestArcDeg(newAnchor.heading, oldHeading);
+        }
       }
     }
     f.anchor = newAnchor;
     f.correction = correction;
+    f.headingCorrection = headingCorrection;
     f.correctionTs = now;
 
     state.flights.set(f.id, f);
