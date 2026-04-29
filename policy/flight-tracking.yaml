@@ -57,6 +57,11 @@ network_policies:
           - allow: { method: GET, path: "/nas/api/airport-events*" }
           - allow: { method: GET, path: "/awc/api/data/metar*" }
           - allow: { method: GET, path: "/health" }
+      # FAA Aeronautical Information Services (AIS) ArcGIS REST endpoint.
+      # Every layer the app ships from this host is a `FeatureServer/0/query`
+      # under a different feature service name. Listing each one explicitly
+      # (rather than a wildcard middle segment) keeps the policy as the
+      # authoritative inventory of "what FAA datasets does this app pull".
       - host: services6.arcgis.com
         port: 443
         protocol: rest
@@ -65,6 +70,12 @@ network_policies:
         rules:
           - allow: { method: GET, path: "/ssFJjBXIUyZDrSYZ/ArcGIS/rest/services/Special_Use_Airspace/FeatureServer/0/query*" }
           - allow: { method: GET, path: "/ssFJjBXIUyZDrSYZ/ArcGIS/rest/services/Class_Airspace/FeatureServer/0/query*" }
+          - allow: { method: GET, path: "/ssFJjBXIUyZDrSYZ/ArcGIS/rest/services/Boundary_Airspace/FeatureServer/0/query*" }     # ARTCC + FIR boundaries
+          - allow: { method: GET, path: "/ssFJjBXIUyZDrSYZ/ArcGIS/rest/services/AM_Runway/FeatureServer/0/query*" }              # Airport runway polygons
+          - allow: { method: GET, path: "/ssFJjBXIUyZDrSYZ/ArcGIS/rest/services/AM_Taxiway/FeatureServer/0/query*" }             # Airport taxiway polygons
+          - allow: { method: GET, path: "/ssFJjBXIUyZDrSYZ/ArcGIS/rest/services/Digital_Obstacle_File/FeatureServer/0/query*" }  # FAA DOF point obstacles
+          - allow: { method: GET, path: "/ssFJjBXIUyZDrSYZ/ArcGIS/rest/services/ATS_Route/FeatureServer/0/query*" }              # Airways (V/J routes)
+          - allow: { method: GET, path: "/ssFJjBXIUyZDrSYZ/ArcGIS/rest/services/NAVAIDSystem/FeatureServer/0/query*" }           # VOR/DME/TACAN/NDB/ILS
       - host: tfr.faa.gov
         port: 443
         protocol: rest

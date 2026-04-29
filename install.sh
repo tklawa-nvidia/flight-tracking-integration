@@ -458,6 +458,9 @@ desired = {
             ],
         },
         {
+            # FAA AIS ArcGIS REST endpoint. One allow per FeatureServer the
+            # app actually uses — see FAA_DATASETS in app/server.py.
+            # Adding a new layer? Extend both this list and FAA_DATASETS.
             'host': 'services6.arcgis.com', 'port': 443, 'protocol': 'rest',
             'tls': 'terminate', 'enforcement': 'enforce',
             'rules': [
@@ -465,6 +468,18 @@ desired = {
                            'path': '/ssFJjBXIUyZDrSYZ/ArcGIS/rest/services/Special_Use_Airspace/FeatureServer/0/query*'}},
                 {'allow': {'method': 'GET',
                            'path': '/ssFJjBXIUyZDrSYZ/ArcGIS/rest/services/Class_Airspace/FeatureServer/0/query*'}},
+                {'allow': {'method': 'GET',
+                           'path': '/ssFJjBXIUyZDrSYZ/ArcGIS/rest/services/Boundary_Airspace/FeatureServer/0/query*'}},
+                {'allow': {'method': 'GET',
+                           'path': '/ssFJjBXIUyZDrSYZ/ArcGIS/rest/services/AM_Runway/FeatureServer/0/query*'}},
+                {'allow': {'method': 'GET',
+                           'path': '/ssFJjBXIUyZDrSYZ/ArcGIS/rest/services/AM_Taxiway/FeatureServer/0/query*'}},
+                {'allow': {'method': 'GET',
+                           'path': '/ssFJjBXIUyZDrSYZ/ArcGIS/rest/services/Digital_Obstacle_File/FeatureServer/0/query*'}},
+                {'allow': {'method': 'GET',
+                           'path': '/ssFJjBXIUyZDrSYZ/ArcGIS/rest/services/ATS_Route/FeatureServer/0/query*'}},
+                {'allow': {'method': 'GET',
+                           'path': '/ssFJjBXIUyZDrSYZ/ArcGIS/rest/services/NAVAIDSystem/FeatureServer/0/query*'}},
             ],
         },
         {
