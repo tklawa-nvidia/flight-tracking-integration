@@ -1127,6 +1127,164 @@ _FIND_DEFAULT_LIMIT = 10
 # call hits adsbdb.com (already rate-limited per egress IP); 20 keeps
 # us under the limit for cold caches without blowing the 1s budget.
 _FIND_MAX_ROUTE_CONFIRM = 20
+# Cap on parallel OpenSky /flights/aircraft lookups for the
+# authoritative-origin tier (see _opensky_recent_flight). Capped lower
+# than adsbdb because each call goes through the host proxy and
+# burns OpenSky credits; 10 still covers "top candidates the user
+# would care about" with the prelim sort by last_seen.
+_FIND_MAX_OPENSKY_ORIGIN = 10
+# How fresh the most-recent OpenSky flight record has to be for us to
+# trust it as "the leg this plane is on right now". OpenSky materialises
+# a flight record shortly after it detects a takeoff (usually within
+# a minute or two); if the record is older than ~6 hours, the plane has
+# been on the ground long enough that the prior leg's airports tell us
+# nothing useful about today's departure.
+_FIND_OPENSKY_FRESH_S = 6 * 3600
+
+
+def _airport_codes(a: dict[str, Any] | None) -> set[str]:
+    """All known codes (ICAO + IATA + lookup `code`) for a curated
+    airport row, uppercased and with empties dropped. Used to cross-check
+    upstream-provided airport codes (which may be ICAO from OpenSky or
+    IATA from adsbdb) against our resolved target airport."""
+    if not a:
+        return set()
+    out = {
+        (a.get("icao") or "").upper(),
+        (a.get("iata") or "").upper(),
+        (a.get("code") or "").upper(),
+    }
+    out.discard("")
+    return out
+
+
+async def _opensky_recent_flight(icao24: str) -> dict[str, Any] | None:
+    """Most recent flight record for `icao24` from OpenSky, or None.
+
+    Used by tool_find_flights as the *authoritative* origin source —
+    OpenSky's /flights/aircraft is derived from real ADS-B tracks
+    (when an aircraft transitions on-ground -> airborne it materialises
+    a record with estDepartureAirport set), so it can correctly tell us
+    "this plane just took off from KBWI, not KIAD" even when adsbdb's
+    callsign-keyed scheduled-route table comes back empty.
+
+    A 6-hour lookback is plenty: anything older than that won't
+    represent the leg the plane is currently flying, so we don't need
+    the full 24h window the drawer uses. Fail-soft to None on any
+    error so the caller falls back to adsbdb / geometric scoring.
+    """
+    try:
+        flights = await fetch_aircraft_flights(icao24, lookback_s=_FIND_OPENSKY_FRESH_S)
+    except HTTPException:
+        return None
+    return flights[0] if flights else None
+
+
+def _classify_route_match(
+    f:           dict[str, Any],
+    departing_a: dict[str, Any] | None,
+    arriving_a:  dict[str, Any] | None,
+) -> str:
+    """Layered confidence classification for a candidate flight.
+
+    Reads two enrichment fields the caller may have populated on `f`:
+      - `_opensky_origin`: most recent OpenSky flights/aircraft record
+                           (authoritative — derived from real ADS-B).
+      - `route`           : adsbdb route lookup (callsign-keyed,
+                            scheduled route, fragile).
+
+    Returns the canonical `_route_match` label:
+      * `confirmed-opensky`     — OpenSky says this plane took off from
+                                  the requested departing airport, OR
+                                  the most recent completed leg arrived
+                                  there and the plane is now airborne
+                                  (i.e. it just lifted off again).
+                                  Also covers "recently arrived at the
+                                  requested arriving airport".
+      * `wrong-airport-opensky` — OpenSky's most recent leg started at
+                                  a different real airport within the
+                                  freshness window. Strong signal that
+                                  the geometric heuristic was fooled by
+                                  a nearby field (e.g. BWI departure
+                                  climbing through IAD's bubble).
+      * `confirmed`             — adsbdb's scheduled route matches the
+                                  departing/arriving filter. Less
+                                  authoritative than OpenSky for
+                                  origin, but useful for *destination*
+                                  confirmation since OpenSky doesn't
+                                  know the destination of in-progress
+                                  flights.
+      * `wrong-route`           — adsbdb confirms a route, just not
+                                  the one the user asked about.
+      * `not-confirmed`         — neither source had usable data;
+                                  geometric scoring decides next.
+    """
+    op = f.get("_opensky_origin")
+    r  = f.get("route")
+    now = time.time()
+
+    op_dep_icao  = ""
+    op_arr_icao  = ""
+    op_first_seen = 0
+    op_last_seen  = 0
+    op_is_fresh = False
+    if op:
+        op_dep_icao   = (op.get("estDepartureAirport") or "").upper()
+        op_arr_icao   = (op.get("estArrivalAirport")  or "").upper()
+        op_first_seen = int(op.get("firstSeen") or 0)
+        op_last_seen  = int(op.get("lastSeen")  or 0)
+        latest_ts = max(op_first_seen, op_last_seen)
+        op_is_fresh = (latest_ts > 0) and ((now - latest_ts) < _FIND_OPENSKY_FRESH_S)
+
+    if departing_a is not None and op_is_fresh:
+        want = _airport_codes(departing_a)
+        # Case A: OpenSky has materialised the in-progress leg with
+        # estDepartureAirport set to the airport we asked about.
+        # Strongest possible confirmation — derived from real ADS-B.
+        if op_dep_icao and op_dep_icao in want:
+            return "confirmed-opensky"
+        # Case B: the most recent COMPLETED leg ended at the requested
+        # airport. We're seeing the plane in the live /states/all feed
+        # right now, so it must have just lifted off from there again
+        # before OpenSky materialised the new in-progress record.
+        # (estDepartureAirport here describes the *previous* leg's
+        # origin and is irrelevant to the current departure question.)
+        if op_arr_icao and op_arr_icao in want:
+            return "confirmed-opensky"
+        # Case C: OpenSky says the plane is currently airborne FROM a
+        # different real airport (no arrival yet — record is for the
+        # in-progress leg). Definitively wrong airport.
+        if op_dep_icao and not op_arr_icao:
+            return "wrong-airport-opensky"
+        # Case D: the latest completed leg landed at a different
+        # airport within the freshness window AND we're seeing the
+        # plane in the live feed now → it took off from THAT airport,
+        # not ours. Also definitively wrong.
+        if op_arr_icao:
+            return "wrong-airport-opensky"
+
+    if arriving_a is not None and op_is_fresh:
+        want = _airport_codes(arriving_a)
+        if op_arr_icao and op_arr_icao in want:
+            return "confirmed-opensky"
+
+    if r and (departing_a or arriving_a):
+        origin_iata = ((r.get("origin")      or {}).get("iata") or "").upper()
+        origin_icao = ((r.get("origin")      or {}).get("icao") or "").upper()
+        dest_iata   = ((r.get("destination") or {}).get("iata") or "").upper()
+        dest_icao   = ((r.get("destination") or {}).get("icao") or "").upper()
+        ok = True
+        if departing_a is not None:
+            want = _airport_codes(departing_a)
+            if not (want & {origin_iata, origin_icao}):
+                ok = False
+        if ok and arriving_a is not None:
+            want = _airport_codes(arriving_a)
+            if not (want & {dest_iata, dest_icao}):
+                ok = False
+        return "confirmed" if ok else "wrong-route"
+
+    return "not-confirmed"
 
 _FIND_PHASE_PREDICATES: dict[str, Callable[[dict[str, Any]], bool]] = {
     "ground":   lambda f: bool(f.get("on_ground")),
@@ -1432,25 +1590,59 @@ async def tool_find_flights(
         for f in candidates:
             f["_arrival_score"] = _score_arrival_likelihood(f, arriving_a, radius)
 
-    # Optional route confirmation against adsbdb. Only call up to
-    # _FIND_MAX_ROUTE_CONFIRM in parallel — adsbdb is per-egress-IP
-    # rate-limited and we already cache 5 minutes of results.
+    # Route confirmation has TWO independent upstream sources, fanned
+    # out in parallel:
+    #
+    #   1. OpenSky /flights/aircraft (icao24-keyed, authoritative). For
+    #      a currently-airborne aircraft, returns a record describing
+    #      the leg it's flying right now (or the most recent completed
+    #      leg if the new one hasn't materialised yet). This is the
+    #      same data the side drawer uses to caption "From: KBWI".
+    #      Strongest evidence for *origin*.
+    #
+    #   2. adsbdb /v0/callsign (callsign-keyed, scheduled route). Tells
+    #      us "UAL108 typically goes IAD->LAX". Less authoritative
+    #      than OpenSky for origin (callsigns get reused for
+    #      repositioning legs, charters, etc., and adsbdb has spotty
+    #      coverage), but it's the only signal we have for *intended
+    #      destination* of an in-progress flight, since OpenSky
+    #      doesn't know the destination until landing.
+    #
+    # Layered classification (see _classify_route_match) prefers the
+    # OpenSky signal and falls back to adsbdb, then geometric scoring.
+    # The big win vs the previous adsbdb-only design: when adsbdb says
+    # "not found" for a callsign and the geometric heuristic likes a
+    # nearby plane, we no longer return a flight that OpenSky knows
+    # took off from a different airport (the BWI-vs-IAD bug).
     do_route = (
         confirm_route if confirm_route is not None
         else (departing_a is not None or arriving_a is not None)
     )
+    # Initialise these here so the geometric prefilter below can read
+    # them even when the route-confirmation block didn't run (empty
+    # candidate list, or do_route disabled).
+    confirmed:    list[dict[str, Any]] = []
+    weak:         list[dict[str, Any]] = []
+    wrong_origin: list[dict[str, Any]] = []
     if do_route and candidates:
-        # Pick the top candidates by recency for confirmation; we sort
-        # the full set later, but we don't want to run /api/route on a
-        # list of 80 flights even though the user only cares about ~5.
         prelim_sort = sorted(
             candidates,
             key=lambda f: (f.get("last_seen") or 0),
             reverse=True,
         )[: _FIND_MAX_ROUTE_CONFIRM]
-        callsigns = [
+        prelim_callsigns = [
             (f.get("callsign") or "").strip().upper() for f in prelim_sort
         ]
+        # OpenSky lookup is heavier (host proxy + per-aircraft credits),
+        # so cap it tighter and only run it when a departing/arriving
+        # filter is in play — without one, the OpenSky origin signal
+        # has nothing to match against.
+        do_opensky = (departing_a is not None or arriving_a is not None)
+        prelim_icao24 = [
+            (f.get("id") or "").lower()
+            for f in prelim_sort[: _FIND_MAX_OPENSKY_ORIGIN]
+        ] if do_opensky else []
+
         async def _route(cs: str) -> tuple[str, dict[str, Any] | None]:
             if not cs:
                 return cs, None
@@ -1459,58 +1651,66 @@ async def tool_find_flights(
             except HTTPException:
                 return cs, None
             return cs, res if res.get("found") else None
-        tasks = [_route(cs) for cs in callsigns]
-        route_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        async def _origin(icao: str) -> tuple[str, dict[str, Any] | None]:
+            if not icao:
+                return icao, None
+            return icao, await _opensky_recent_flight(icao)
+
+        route_task  = asyncio.gather(*[_route(cs)  for cs in prelim_callsigns])
+        origin_task = asyncio.gather(*[_origin(ic) for ic in prelim_icao24])
+        route_results, origin_results = await asyncio.gather(route_task, origin_task)
+
         route_by_cs: dict[str, dict[str, Any]] = {}
         for r in route_results:
             if isinstance(r, tuple):
                 cs, payload = r
                 if payload:
                     route_by_cs[cs] = payload
+        origin_by_icao: dict[str, dict[str, Any]] = {}
+        for o in origin_results:
+            if isinstance(o, tuple):
+                icao, rec = o
+                if rec:
+                    origin_by_icao[icao] = rec
+
         for f in candidates:
             cs = (f.get("callsign") or "").strip().upper()
+            ic = (f.get("id") or "").lower()
             if cs in route_by_cs:
                 f["route"] = route_by_cs[cs]
-        # If departing/arriving were specified AND we confirmed routes,
-        # tighten the candidate list to those whose route matches.
-        # Geometric matches without route confirmation still count as
-        # weak hits — keep them on the list but flag them.
-        confirmed: list[dict[str, Any]] = []
-        weak:      list[dict[str, Any]] = []
+            if ic in origin_by_icao:
+                f["_opensky_origin"] = origin_by_icao[ic]
+
         for f in candidates:
-            r = f.get("route")
-            ok = True
-            if r and (departing_a or arriving_a):
-                origin_iata = ((r.get("origin") or {}).get("iata") or "").upper()
-                origin_icao = ((r.get("origin") or {}).get("icao") or "").upper()
-                dest_iata   = ((r.get("destination") or {}).get("iata") or "").upper()
-                dest_icao   = ((r.get("destination") or {}).get("icao") or "").upper()
-                if departing_a is not None:
-                    want = {(departing_a.get("code") or "").upper(),
-                            (departing_a.get("icao") or "").upper(),
-                            (departing_a.get("iata") or "").upper()}
-                    want.discard("")
-                    if not (want & {origin_iata, origin_icao}):
-                        ok = False
-                if ok and arriving_a is not None:
-                    want = {(arriving_a.get("code") or "").upper(),
-                            (arriving_a.get("icao") or "").upper(),
-                            (arriving_a.get("iata") or "").upper()}
-                    want.discard("")
-                    if not (want & {dest_iata, dest_icao}):
-                        ok = False
-                f["_route_match"] = "confirmed" if ok else "wrong-route"
-                if ok:
-                    confirmed.append(f)
+            label = _classify_route_match(f, departing_a, arriving_a)
+            f["_route_match"] = label
+            if label in ("confirmed", "confirmed-opensky"):
+                confirmed.append(f)
+            elif label == "wrong-airport-opensky":
+                wrong_origin.append(f)
             else:
-                f["_route_match"] = "not-confirmed"
                 weak.append(f)
-        # If we got at least one route-confirmed match, prefer those —
-        # those are real "scheduled IAD→TPA" hits. Else fall back to
-        # the geometric matches and let the agent disclaim accordingly.
-        if confirmed:
-            candidates = confirmed + weak  # confirmed first; weak as backup
-        # else: leave candidates as-is, all geometric
+
+        # When the user asked for a specific departing airport AND
+        # OpenSky authoritatively says some candidates took off from
+        # somewhere else, drop those candidates entirely — they were
+        # geometric look-alikes (typical case: KBWI departures
+        # climbing through KIAD's 150 km bubble heading west).
+        # Keep them only as a last-resort fallback if there's nothing
+        # else to return, in which case the agent disclaim string
+        # will let the user know the match is questionable.
+        if departing_a is not None and wrong_origin and (confirmed or weak):
+            # Drop wrong_origin entirely.
+            candidates = confirmed + weak
+        elif confirmed:
+            candidates = confirmed + weak
+        elif wrong_origin and not weak:
+            # Last-resort: nothing else, surface the wrong-airport
+            # rows so the agent can at least say "best I could find,
+            # but origin doesn't match".
+            candidates = wrong_origin
+        # else: leave candidates as-is, all geometric / not-confirmed.
 
     # Sort candidates by `order`. Default depends on the query shape.
     order_key = (order or "").strip().lower() or (
@@ -1550,12 +1750,14 @@ async def tool_find_flights(
     # whole bubble regardless of plausibility".
     def _confidence_rank(f: dict[str, Any]) -> int:
         m = f.get("_route_match")
-        if m == "confirmed":           return 0
-        if m == "geometric-departure": return 1
-        if m == "geometric-arrival":   return 1
-        if m == "not-confirmed":       return 2
-        if m == "wrong-route":         return 3
-        return 4
+        if m == "confirmed-opensky":     return 0  # ADS-B authoritative
+        if m == "confirmed":             return 1  # adsbdb scheduled-route
+        if m == "geometric-departure":   return 2
+        if m == "geometric-arrival":     return 2
+        if m == "not-confirmed":         return 3
+        if m == "wrong-route":           return 4
+        if m == "wrong-airport-opensky": return 5  # filtered above; defensive
+        return 6
 
     def _direction_score(f: dict[str, Any]) -> float:
         # Larger = more departure-y / arrival-y. Negate when we sort
@@ -1646,6 +1848,19 @@ async def tool_find_flights(
                 "departure_score":         f.get("_departure_score"),
                 "arrival_score":           f.get("_arrival_score"),
                 "route":                   f.get("route"),
+                # OpenSky's per-airframe history record (the same
+                # source the side drawer uses to caption "From: KBWI").
+                # Surfaced so the agent can ground its narration in
+                # authoritative ADS-B-derived origin data instead of
+                # making claims from geometric scores alone.
+                "opensky_origin": (
+                    {
+                        "estDepartureAirport": (f.get("_opensky_origin") or {}).get("estDepartureAirport"),
+                        "estArrivalAirport":   (f.get("_opensky_origin") or {}).get("estArrivalAirport"),
+                        "first_seen":          (f.get("_opensky_origin") or {}).get("firstSeen"),
+                        "last_seen":           (f.get("_opensky_origin") or {}).get("lastSeen"),
+                    } if f.get("_opensky_origin") else None
+                ),
             }
             for f in candidates
         ],
