@@ -26,6 +26,12 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SANDBOX_NAME="${1:-${OPENSHELL_SANDBOX:-}}"
 PORT="${FLIGHT_APP_PORT:-18890}"
 OPENSKY_PROXY_PORT="${OPENSKY_PROXY_PORT:-9202}"
+# Gateway name registered with `nemoclaw onboard`. "nemoclaw" is the
+# convention; override via OPENSHELL_GATEWAY=<name> if you renamed it.
+GATEWAY_NAME="${OPENSHELL_GATEWAY:-nemoclaw}"
+# Skip the systemd-user tunnel install (e.g. on macOS hosts that don't
+# have systemd-user — the script will fall back to `openshell forward`).
+SKIP_SYSTEMD_TUNNEL="${SKIP_SYSTEMD_TUNNEL:-0}"
 
 CREDS_PATH="$HOME/.nemoclaw/credentials.json"
 ONBOARD_PATH="$HOME/.nemoclaw/onboard-session.json"
@@ -47,7 +53,7 @@ ssh_sandbox() {
       -o StrictHostKeyChecking=no \
       -o UserKnownHostsFile=/dev/null \
       -o LogLevel=ERROR \
-      -o ProxyCommand="openshell ssh-proxy --gateway-name nemoclaw --name $SANDBOX_NAME" \
+      -o ProxyCommand="openshell ssh-proxy --gateway-name $GATEWAY_NAME --name $SANDBOX_NAME" \
       "sandbox@openshell-$SANDBOX_NAME" "$@"
 }
 
@@ -547,6 +553,58 @@ else
   warn "Server did not start. Last 30 log lines:"
   ssh_sandbox "tail -n 30 $SANDBOX_BASE/server.log 2>/dev/null" || true
   fail "FlightOps backend failed to come up. Inspect $SANDBOX_BASE/server.log"
+fi
+
+# ── 7c. Install / refresh the systemd-user tunnel unit ──────────────────
+# Renders scripts/systemd/flight-tunnel.service.template into
+# ~/.config/systemd/user/flight-tunnel.service with this install's
+# sandbox name, gateway name, app port, and $HOME baked in. This is
+# the recommended tunnel path — wraps `ssh -L` with TCP keepalives
+# and Restart=always so demo-time gateway flaps auto-recover.
+#
+# Skipped automatically on hosts without systemd-user (e.g. macOS) or
+# when SKIP_SYSTEMD_TUNNEL=1 is set; install.sh's port-forward step
+# falls back to `openshell forward` in that case.
+TUNNEL_TEMPLATE="$SCRIPT_DIR/scripts/systemd/flight-tunnel.service.template"
+TUNNEL_UNIT_DIR="$HOME/.config/systemd/user"
+TUNNEL_UNIT="$TUNNEL_UNIT_DIR/flight-tunnel.service"
+
+systemd_user_available() {
+  command -v systemctl >/dev/null 2>&1 || return 1
+  # systemctl --user --version succeeds when the user manager is up.
+  systemctl --user --version >/dev/null 2>&1
+}
+
+if [ "$SKIP_SYSTEMD_TUNNEL" = "1" ]; then
+  info "Skipping systemd-user tunnel install (SKIP_SYSTEMD_TUNNEL=1)."
+elif ! systemd_user_available; then
+  info "systemd-user not available — will use \`openshell forward\` fallback."
+elif [ ! -f "$TUNNEL_TEMPLATE" ]; then
+  warn "Tunnel template missing at $TUNNEL_TEMPLATE — skipping."
+else
+  info "Installing systemd-user tunnel unit (flight-tunnel.service)…"
+  mkdir -p "$TUNNEL_UNIT_DIR"
+  # Render the template. sed -e per-placeholder so we don't choke on
+  # paths containing slashes (HOME).
+  TMP_UNIT=$(mktemp)
+  sed -e "s|__SANDBOX_NAME__|$SANDBOX_NAME|g" \
+      -e "s|__GATEWAY_NAME__|$GATEWAY_NAME|g" \
+      -e "s|__APP_PORT__|$PORT|g" \
+      -e "s|__HOME__|$HOME|g" \
+      "$TUNNEL_TEMPLATE" > "$TMP_UNIT"
+  # Only rewrite the unit (and reload systemd) if it actually changed —
+  # avoids spurious restarts when the operator re-runs install.sh
+  # against the same sandbox.
+  if [ ! -f "$TUNNEL_UNIT" ] || ! cmp -s "$TMP_UNIT" "$TUNNEL_UNIT"; then
+    mv "$TMP_UNIT" "$TUNNEL_UNIT"
+    systemctl --user daemon-reload
+    ok "Wrote $TUNNEL_UNIT"
+  else
+    rm -f "$TMP_UNIT"
+    ok "Tunnel unit already up to date"
+  fi
+  systemctl --user enable flight-tunnel.service >/dev/null 2>&1 || true
+  ok "Tunnel unit enabled (sandbox=$SANDBOX_NAME, gateway=$GATEWAY_NAME, port=$PORT)"
 fi
 
 # ── 8. Host-side port forward ───────────────────────────────────────────

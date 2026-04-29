@@ -1,0 +1,39 @@
+[Unit]
+# Rendered by install.sh into ~/.config/systemd/user/flight-tunnel.service
+# with the placeholders (__SANDBOX_NAME__, __GATEWAY_NAME__, __APP_PORT__,
+# __HOME__) substituted for this install.
+#
+# To inspect / cycle manually:
+#   systemctl --user status  flight-tunnel.service
+#   systemctl --user restart flight-tunnel.service
+#   journalctl --user -u flight-tunnel.service -f
+
+Description=FlightOps SSH port-forward to OpenShell sandbox (__SANDBOX_NAME__)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=PATH=__HOME__/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# Raw `ssh -L` wrapped with TCP keepalives so a transient gateway flap
+# fails fast (~90 s) instead of leaving a half-open socket that accepts
+# bytes and never proxies them. ExitOnForwardFailure=yes makes systemd
+# notice the failure and Restart=always brings the tunnel back within 5 s.
+ExecStart=/usr/bin/ssh \
+  -F /dev/null \
+  -o StrictHostKeyChecking=no \
+  -o UserKnownHostsFile=/dev/null \
+  -o LogLevel=ERROR \
+  -o ServerAliveInterval=30 \
+  -o ServerAliveCountMax=3 \
+  -o ExitOnForwardFailure=yes \
+  -o ConnectTimeout=15 \
+  -N \
+  -L __APP_PORT__:127.0.0.1:__APP_PORT__ \
+  -o "ProxyCommand=openshell ssh-proxy --gateway-name __GATEWAY_NAME__ --name __SANDBOX_NAME__" \
+  sandbox@openshell-__SANDBOX_NAME__
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
