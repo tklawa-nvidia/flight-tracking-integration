@@ -2746,12 +2746,14 @@ function airportsQueryForZoom(zoom) {
 //
 // Aircraft count is purely client-side: filter the existing snapshot by
 // the new bbox. Airports are a cheap static lookup, so we re-fetch them.
-let _hudInflight = false;
-let _hudPending  = false;
-async function updateInViewHud() {
-  if (!state.map) return;
-  // Aircraft: count from the locally cached snapshot. No network needed,
-  // works even mid-pause.
+//
+// IMPORTANT: pump() also calls updateAircraftInViewCount() rather than
+// writing state.flights.size — otherwise we'd race ourselves. The flight
+// store accumulates aircraft across pumps (a CONUS-wide view leaves ~5k
+// in state.flights even after the user zooms to a single airport), so
+// state.flights.size != "in the current viewport" except by coincidence.
+function updateAircraftInViewCount() {
+  if (!state.map || !elHudFlights) return;
   const b = state.map.getBounds();
   const w = b.getWest(),  e = b.getEast();
   const s = b.getSouth(), n = b.getNorth();
@@ -2764,7 +2766,14 @@ async function updateInViewHud() {
       if (lat >= s && lat <= n && lon >= w && lon <= e) aircraft++;
     }
   }
-  if (elHudFlights) elHudFlights.textContent = aircraft.toLocaleString();
+  elHudFlights.textContent = aircraft.toLocaleString();
+}
+
+let _hudInflight = false;
+let _hudPending  = false;
+async function updateInViewHud() {
+  if (!state.map) return;
+  updateAircraftInViewCount();
 
   // Airports: fast static lookup. Coalesce overlapping calls so a fast
   // pinch-zoom doesn't fire 4 fetches in a row.
@@ -2862,7 +2871,10 @@ async function pump({ snapshot = false } = {}) {
     state.airportsInView = airportsRes.airports || [];
     state.airportsTruncated = Boolean(airportsRes.truncated);
 
-    elHudFlights.textContent = state.flights.size.toLocaleString();
+    // Aircraft pill must be bbox-filtered, not state.flights.size — the
+    // flight store accumulates planes across pumps, so its size lags far
+    // behind a zoom-in. Same helper updateInViewHud uses on moveend.
+    updateAircraftInViewCount();
     const apCount = state.airportsInView.length.toLocaleString();
     elHudAirports.textContent = state.airportsTruncated ? `${apCount}+` : apCount;
     state.lastFetchedAt = Date.now();
