@@ -12,20 +12,221 @@ summary lands in your DM.
 - Live aircraft via [OpenSky Network](https://opensky-network.org/),
   refreshed every ~10 seconds, with rotated plane icons and animated
   trails for the selected flight.
-- A curated dataset of ~125 globally significant airports (OpenFlights
-  subset) with click-through detail panels.
-- A FlightOps copilot pane wired to your Nemotron inference. It calls the
-  same map-control API as the OpenClaw skill — chat or skill, both end up
-  on the same surface.
+- A bundled OurAirports dataset (~11,000 airports) with click-through
+  detail panels and a curated "globally significant" subset for the
+  default zoom-out view.
+- Public-feed overlays for FAA AIS airspace, TFRs, NAS Status,
+  Aviation Weather Center METARs, and FAA ARTCC boundaries.
+- A FlightOps copilot pane wired to your Nemotron inference. It calls
+  the same map-control API as the OpenClaw skill — chat or skill, both
+  end up on the same surface.
 - One-shot CLI helper `fly goto IAD`, `fly analyze JFK 100`, etc.
-- A **Tier-1 host-side proxy** for OpenSky (the same pattern Planet
-  uses): the sandbox can't reach `opensky-network.org` directly. A
-  small Python daemon (`opensky-proxy.py`) runs on the host, holds the
-  OAuth2 credentials, and forwards the sandbox's calls upstream with a
-  Bearer token attached. The sandbox knows only the proxy URL — the
-  `OPENSKY_CLIENT_ID` / `OPENSKY_CLIENT_SECRET` never enter the
-  sandbox, so a sandbox compromise can't exfiltrate them. Tile
-  downloads happen in your browser, not the sandbox.
+- **Two host-side proxy daemons** so the sandbox never sees secrets or
+  hits hosts that block its egress IP:
+  - `opensky-proxy.py` — holds the OpenSky OAuth2 client and injects
+    a Bearer token on every forwarded call.
+  - `faa-proxy.py` — IP-rewraps `nasstatus.faa.gov` and
+    `aviationweather.gov` (which 403 the cloud ASN the sandbox egresses
+    through).
+- **No MCP**: the agent uses OpenClaw's SKILL.md model. The skill
+  descriptor in `skills/flight-tracking/SKILL.md` declares the tool
+  surface in plain English; the agent shells out to a bash CLI (`fly`)
+  or `curl http://127.0.0.1:18890/api/...` to drive it. See
+  [Key concepts](#key-concepts-a-nemoclaw-tour) below.
+
+## Key concepts (a NemoClaw tour)
+
+If you're picking up NemoClaw via this demo, here is the mental model.
+Each concept maps to a concrete artefact in this repo, so you can read
+it as an annotated walkthrough.
+
+### 1. The sandbox
+
+Everything except secrets and the host proxies runs inside an
+**openshell sandbox** — a Linux namespace launched by the gateway with
+its own filesystem, its own egress firewall, and a restricted set of
+binaries it is allowed to execute. The FastAPI app, the OpenClaw
+agent, the bundled airport dataset, and the static frontend all live
+in `/sandbox/.openclaw-data/flight-tracking/` inside the sandbox. The
+host VM never executes any user code from this repo at runtime — only
+the two proxy daemons run on the host.
+
+You can shell into the sandbox with:
+
+```bash
+ssh openshell-<sandbox-name>     # uses ~/.ssh/config entry written by openshell
+```
+
+…and you'll find the sandbox can `curl 127.0.0.1:18890` (its own
+FastAPI) but **cannot** `curl opensky-network.org` — the egress
+firewall returns "blocked by policy".
+
+### 2. Network policy is the authoritative guardrail
+
+`policy/flight-tracking.yaml` declares an **allowlist** of (host, port,
+HTTP method, path-prefix) tuples the sandbox is allowed to reach.
+Anything not on the list is blocked at the gateway, no matter what
+code inside the sandbox tries. This is the layer that turns "we
+shouldn't talk to OpenSky directly" into "we *can't* talk to OpenSky
+directly".
+
+```yaml
+endpoints:
+  - host: <HOST_IP>      # rendered to your Brev VM's IP
+    port: 9202           # opensky-proxy.py
+    rules:
+      - allow: { method: GET, path: "/api/states/all*" }
+      - allow: { method: GET, path: "/api/flights/aircraft*" }
+      ...
+  - host: services6.arcgis.com   # FAA AIS, no auth, browser-cacheable
+    rules:
+      - allow: { method: GET, path: "/.../FeatureServer/0/query*" }
+```
+
+`install.sh` substitutes `<HOST_IP>` with your VM's reachable address
+and pushes the rendered policy to the gateway. Re-run the installer
+to update it. **This file is the single audit point for "what can the
+sandbox talk to".**
+
+### 3. Host-proxy pattern (how API keys stay out of the sandbox)
+
+The credential we care most about (OpenSky OAuth2 client) lives on the
+host VM only:
+
+```
+~/.nemoclaw/credentials.json        chmod 600, never copied into sandbox
+  ├── inference.endpointUrl
+  ├── inference.compatible_api_key
+  ├── opensky.client_id             ← ONLY here
+  └── opensky.client_secret         ← ONLY here
+```
+
+A small Python daemon (`opensky-proxy.py`) reads those at request
+time, mints a Bearer token, caches it until expiry, and forwards the
+sandbox's HTTP calls to `opensky-network.org`. The sandbox's
+`flight.env` contains `OPENSKY_PROXY_URL=http://<host>:9202` and
+**nothing else** — no client ID, no secret. A complete compromise of
+the sandbox cannot leak the OpenSky key because it isn't there.
+
+```
+sandbox FastAPI                            host                       upstream
+─────────────                              ────                       ────────
+GET …:9202/api/states/all  ────────►  opensky-proxy.py
+                                        + Authorization: Bearer …  ──►  opensky-network.org
+                              ◄────  forwarded JSON                ◄──
+```
+
+The same pattern is reused by `faa-proxy.py` on port 9203, but for a
+different reason: those FAA/NWS hosts are public, but they 403 the
+cloud ASN the openshell gateway egresses through. The proxy
+"IP-rewraps" the call from the host VM, which has a residential-class
+IP they accept.
+
+### 4. Skills (the agent's tool surface)
+
+OpenClaw discovers tools by reading **SKILL.md** files placed in
+`skills/<name>/SKILL.md`. The YAML frontmatter is the *only* thing
+the agent's selector model sees when deciding whether to invoke this
+skill — so the description has to be written for the model, not for
+humans. Look at `skills/flight-tracking/SKILL.md`:
+
+```yaml
+---
+name: flight-tracking
+description: "Live aircraft tracking, airport lookup, and interactive
+  map control for the FlightOps map UI at http://127.0.0.1:18890. Use
+  this skill whenever the user asks about live air traffic … HARD
+  RULES: (1) ALL data and ALL map control live behind
+  http://127.0.0.1:18890 … (2) ANY request that changes what's drawn
+  on the map REQUIRES issuing the matching POST /api/map/... call
+  FIRST … (5) EVERY /api/map/* response includes a `delivered`
+  integer … (6) For 'find a flight matching X and track it' use the
+  find→track pattern …"
+---
+```
+
+Three things to notice:
+
+1. The **description doubles as the prompt**. Tool selection happens
+   purely off this string, and so do behavioural rules ("never invent
+   a network outage", "always issue the POST before claiming the map
+   updated"). Iteration on this string is the highest-leverage way to
+   improve agent behaviour without retraining anything.
+2. The body of the SKILL.md is a **detailed API reference + worked
+   examples**. Once the agent has selected the skill, it reads the
+   body for parameter shapes and calling conventions.
+3. The skill's tools are just shell commands. There is no JSON-RPC
+   layer, no MCP server, no separate tool runtime. The agent runs
+   `curl http://127.0.0.1:18890/api/flights/find?...` directly, or
+   the convenience wrapper `fly` (in `skills/flight-tracking/scripts/`).
+
+### 5. Map control via WebSocket bus
+
+The interesting integration trick is that **the chat panel and the
+OpenClaw skill share one map-control surface**. Both end up calling:
+
+```
+POST /api/map/{goto|view|arcs|layer|filter|color|highlight|track|airspace3d}
+```
+
+…which writes the command to a sticky in-memory broadcast channel
+(`MapBus`) and then pushes it over `/ws/map` to every connected
+browser tab. The same code path drives the map whether the request
+came from:
+
+- a user typing in the left rail (browser → FastAPI → MapBus)
+- the OpenClaw agent (skill → `curl` inside sandbox → FastAPI → MapBus)
+- a `fly goto IAD` from any sandbox shell
+- a Telegram message routed through your other NemoClaw skill
+
+```
+                         ┌──────────────┐
+  browser chat ──────────►              │
+  fly CLI ───────────────►   /api/map   ├─────► MapBus ─wss/ws/map─► all open tabs
+  openclaw skill ────────►              │
+  Telegram bridge ───────►              │
+                         └──────────────┘
+```
+
+The bus replays the last command for ~3 minutes, so a tab opened
+right after a `goto` still catches up.
+
+### 6. The dual chat path
+
+There are two NemoClaw chat paths in this demo on purpose, and they
+behave differently:
+
+- **In-page chat (left rail)**: the FastAPI calls Nemotron directly
+  using `INFERENCE_API_KEY` from `flight.env`. Streams tokens to the
+  browser. Simple, fast, no agent loop — good for quick Q&A.
+- **OpenClaw chat (Telegram, dashboard, agent CLI)**: runs
+  `openclaw agent --json` *inside* the sandbox, which inherits the
+  gateway-managed inference route, picks up `flight-tracking`'s
+  SKILL.md, and can call its tools in a loop. This is where you get
+  "find the flight, track it, summarise it" multi-step behaviour.
+
+Both end up driving the same MapBus, so a Telegram-driven `goto LHR`
+is visually identical to one typed in the page.
+
+### 7. Provider records and key rotation
+
+Sensitive credentials are also registered as an **openshell provider**
+on the gateway, so when a future skill needs the same key it can pull
+it from the gateway (over the gateway's own credential channel) rather
+than reading the host file. To rotate the OpenSky key:
+
+```bash
+# edit the JSON file
+$EDITOR ~/.nemoclaw/credentials.json
+
+# re-run the installer — it refreshes the provider record AND
+# tells the host proxy to drop its cached token.
+./install.sh <sandbox>
+```
+
+The sandbox is never restarted, the SSH tunnel stays up, and the next
+upstream call mints a token from the new secret. This is the
+"rotate without an outage" property you want for production.
 
 ## Repo layout
 
@@ -45,42 +246,29 @@ flight-tracking-integration/
 ├── scripts/systemd/
 │   └── flight-tunnel.service.template  # rendered → ~/.config/systemd/user/
 ├── policy/flight-tracking.yaml
-├── opensky-proxy.py           # HOST-side OAuth2-injecting proxy (Tier-1)
+├── opensky-proxy.py           # HOST-side OAuth2-injecting proxy (port 9202)
+├── faa-proxy.py               # HOST-side IP-rewrap proxy (port 9203)
 ├── start.sh                   # sandbox-side launcher
 ├── install.sh                 # host-side installer
 └── README.md
 ```
 
-## Architecture: how OpenSky credentials stay out of the sandbox
+## Wire diagram
 
 ```
-  ┌──────────────────────────┐                ┌────────────────────────────┐
-  │  HOST (your VM)          │                │  SANDBOX (openshell)       │
-  │                          │                │                            │
-  │  ~/.nemoclaw/            │                │  /sandbox/.openclaw-data/  │
-  │   credentials.json       │                │   flight-tracking/         │
-  │   (chmod 600, host only) │                │     flight.env             │
-  │      │                   │                │       OPENSKY_PROXY_URL=…  │
-  │      ▼                   │                │       (no secrets)         │
-  │   opensky-proxy.py       │  HTTP    ┌─────┤                            │
-  │   :9202                  │◀─────────┤     │  uvicorn server.py         │
-  │   • mints OAuth2 token   │ Bearer   │     │   (binary: /usr/bin/       │
-  │   • caches + refreshes   │ injected │     │    python3 only — policy   │
-  │   • forwards to OpenSky  │          │     │    blocks everything else) │
-  │      │                   │          │     │                            │
-  │      ▼ Bearer            │          │     │   policy:                  │
-  │   opensky-network.org    │          │     │   • <HOST>:9202 ALLOWED    │
-  │                          │          │     │   • opensky-network.org    │
-  │                          │          │     │     BLOCKED                │
-  └──────────────────────────┘          │     └────────────────────────────┘
-                                        │
-            policy enforcement boundary ┘
+Browser ──HTTP/WS──▶ openshell forward ──▶ sandbox:18890 (FastAPI)
+                                             │
+                                             ├── /api/flights ───▶ host:9202 (opensky-proxy.py) ──▶ opensky-network.org
+                                             ├── /api/nas/*    ───▶ host:9203 (faa-proxy.py)    ──▶ nasstatus.faa.gov
+                                             ├── /api/weather  ───▶ host:9203 (faa-proxy.py)    ──▶ aviationweather.gov
+                                             ├── /api/airspace ───▶ services6.arcgis.com (FAA AIS)
+                                             ├── /api/chat     ───▶ Nemotron via openshell inference
+                                             └── /ws/map        ◀── /api/map/* (skill / fly CLI / chat)
 ```
 
-To rotate the OpenSky key: edit `~/.nemoclaw/credentials.json` on the
-host, re-run `./install.sh <sandbox>`. The sandbox is never touched
-during rotation — the proxy reads creds at request time so the new
-token is minted within seconds.
+The sandbox itself can only reach the boxes on the right via the
+arrows shown — everything else is blocked at the gateway by the
+network policy. See [Key concepts §2](#2-network-policy-is-the-authoritative-guardrail).
 
 ## Prerequisites
 
@@ -105,7 +293,8 @@ token is minted within seconds.
   `~/.nemoclaw/credentials.json` lifts it to ~4,000/day via OAuth2
   client_credentials. (OpenSky removed Basic auth in March 2026.) When
   set, the **host-side proxy** in `opensky-proxy.py` holds the keys; the
-  sandbox itself never sees them — see the architecture diagram above.
+  sandbox itself never sees them — see
+  [Key concepts §3](#3-host-proxy-pattern-how-api-keys-stay-out-of-the-sandbox).
 
 ## Install
 
@@ -194,51 +383,45 @@ Whatever Telegram bridge you already have wired to NemoClaw (the
 automatically because the SKILL.md has the right description for the
 agent's selector.
 
-## Architecture (one-liner)
-
-```
-Browser ──HTTP/WS──▶ openshell forward ──▶ sandbox:18890 (FastAPI)
-                                             │
-                                             ├── /api/flights ─▶ opensky-network.org (network policy: allow)
-                                             ├── /api/chat    ─▶ Nemotron via openshell inference
-                                             └── /ws/map       ◀── /api/map/* (skill / curl / chat)
-```
-
-Skill calls and chat tool-calls both land on the same `/api/map/*`
-endpoints, which broadcast the resulting deck.gl command (`goto`,
-`arcs`, `layer`, `highlight`) to every connected browser over the
-WebSocket bus. That's why "go to IAD" from Telegram and "go to IAD"
-typed into the left rail produce identical map behaviour.
-
 ## Security posture
 
-- **OpenSky credentials never enter the sandbox.** `OPENSKY_CLIENT_ID` /
-  `OPENSKY_CLIENT_SECRET` live only in `~/.nemoclaw/credentials.json`
-  (chmod 600) and an `openshell provider` record on the gateway. The
-  host-side `opensky-proxy.py` reads them at request time, mints a
-  Bearer token, and forwards to opensky-network.org. The sandbox knows
-  only the proxy URL, and the network policy forbids it from reaching
-  `opensky-network.org` directly.
+A condensed checklist; the full reasoning is in
+[Key concepts](#key-concepts-a-nemoclaw-tour) above.
+
+- **OpenSky credentials never enter the sandbox.** They live in
+  `~/.nemoclaw/credentials.json` (chmod 600) on the host and in an
+  `openshell provider` record on the gateway. `opensky-proxy.py`
+  injects the Bearer token at the host. `flight.env` inside the
+  sandbox contains `OPENSKY_PROXY_URL` and *nothing else* — `cat
+  flight.env` from inside a compromised sandbox leaks nothing useful.
+- **Public-feed proxy is for IP reputation, not secrets.**
+  `faa-proxy.py` (host:9203) wraps `nasstatus.faa.gov` and
+  `aviationweather.gov` because those endpoints 403 the cloud ASN the
+  openshell gateway egresses through, *not* because they need auth.
+  Same network-policy mechanics either way.
 - **Network policy is the authoritative guardrail.** See
-  `policy/flight-tracking.yaml` — outbound HTTPS is gated to a small
-  allowlist (the host proxy, FAA AIS, AWC, adsbdb/hexdb, openfreemap
-  tiles for the page itself). Trying to curl anything else from inside
-  the sandbox returns "blocked by policy".
-- **No public listener.** The sandbox-side server is reachable from
-  the host *only* through the SSH-tunnel-via-`openshell` forward
-  (either the systemd-user unit or `openshell forward start`). Nothing
-  is bound to a public interface.
-- **Inference auth.** The Nemotron `compatible_api_key` is rendered
-  into `flight.env` so the sandbox-side FastAPI can call inference for
-  the in-page chat panel. The OpenClaw chat path doesn't need it —
-  that runs `openclaw agent --json` inside the sandbox, which inherits
-  the gateway-managed inference route. To harden further, drop
-  `INFERENCE_API_KEY` from `flight.env` and proxy inference through
-  127.0.0.1 just like OpenSky.
-- **Rotation.** Edit `~/.nemoclaw/credentials.json` and re-run
-  `./install.sh`. The sandbox is never touched during rotation; the
-  proxy reads creds at request time so the new token is minted in
-  seconds.
+  `policy/flight-tracking.yaml`. Outbound HTTPS from the sandbox is
+  gated to a tight allowlist (the two host proxies + FAA AIS /
+  TFRs). `curl https://opensky-network.org/...` from inside the
+  sandbox returns "blocked by policy". This is enforced at the gateway,
+  not at the application — sandbox code can't bypass it.
+- **No public listener.** The sandbox-side FastAPI on port 18890 is
+  reachable from the host *only* through the SSH-tunnel-via-`openshell`
+  forward (managed by either the systemd-user unit on Linux or
+  `openshell forward start` everywhere else). Nothing is bound to a
+  public interface.
+- **No MCP, no remote tool runtime.** OpenClaw skills run as plain
+  shell commands inside the same sandbox. There is no separate JSON-RPC
+  server to harden, no extra socket exposed.
+- **Inference auth.** `compatible_api_key` is rendered into
+  `flight.env` so the in-page chat can call Nemotron directly. The
+  OpenClaw agent path uses the gateway-managed inference route and
+  needs no key in the sandbox. To harden further, drop
+  `INFERENCE_API_KEY` from `flight.env` and proxy inference through a
+  third host daemon — same pattern as the OpenSky one.
+- **Rotation = edit JSON + re-run installer.** The sandbox is not
+  restarted; the proxy mints a fresh token from the new secret on the
+  next request.
 
 ## Troubleshooting
 
