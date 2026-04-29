@@ -550,20 +550,64 @@ else
 fi
 
 # ── 8. Host-side port forward ───────────────────────────────────────────
+# Two paths supported, preferred-first:
+#
+#   (a) systemd-user unit `flight-tunnel.service` (recommended). Wraps a
+#       raw `ssh -L 18890:...` with ServerAliveInterval=30 +
+#       ExitOnForwardFailure=yes + Restart=always, so a transient
+#       openshell gateway flap auto-recovers within ~5s. This is the
+#       path that survives demos.
+#
+#   (b) `openshell forward start ... -d` as a fallback for hosts that
+#       don't have systemd-user (or where the unit isn't installed).
+#       Less robust — when the underlying gateway connection breaks
+#       the forward stays half-alive (accepts but never proxies),
+#       which is what bit us during demo prep.
+#
+# Either way we VERIFY by hitting /api/health through the forward —
+# `openshell forward list` returning a row isn't enough proof.
 info "Forwarding localhost:$PORT to the sandbox…"
 
-# Stop any prior forward on this port, then re-start in the background.
-openshell forward stop "$PORT" >/dev/null 2>&1 || true
-openshell forward start "$PORT" "$SANDBOX_NAME" -d >/dev/null 2>&1 || true
-sleep 1
-# `openshell forward list` columns are: SANDBOX BIND PORT PID STATUS — match
-# either the PORT column or a "BIND:PORT" pattern, whichever the version emits.
-if openshell forward list 2>/dev/null | awk 'NR>1 {print $3}' | grep -qx "$PORT"; then
-  ok "Port forward active: http://localhost:$PORT"
-elif curl -fsS -o /dev/null --max-time 3 "http://127.0.0.1:$PORT/api/health"; then
-  ok "Port forward active (verified via /api/health): http://localhost:$PORT"
-else
-  warn "Port forward not visible — start it manually: openshell forward start $PORT $SANDBOX_NAME -d"
+verify_forward() {
+  curl -fsS -o /dev/null --max-time 5 "http://127.0.0.1:$PORT/api/health"
+}
+
+forward_ok=false
+
+# (a) systemd-user unit if installed.
+if command -v systemctl >/dev/null 2>&1 \
+   && systemctl --user list-unit-files flight-tunnel.service \
+        2>/dev/null | grep -q '^flight-tunnel.service'; then
+  # Cycle to pick up any policy / sandbox changes from this install.
+  systemctl --user restart flight-tunnel.service >/dev/null 2>&1 || true
+  for _ in 1 2 3 4 5; do
+    sleep 1
+    if verify_forward; then forward_ok=true; break; fi
+  done
+  if $forward_ok; then
+    ok "Port forward active via systemd-user (flight-tunnel.service): http://localhost:$PORT"
+  else
+    warn "flight-tunnel.service didn't come up; falling back to \`openshell forward\`."
+  fi
+fi
+
+# (b) openshell forward fallback.
+if ! $forward_ok; then
+  openshell forward stop "$PORT" >/dev/null 2>&1 || true
+  openshell forward start "$PORT" "$SANDBOX_NAME" -d >/dev/null 2>&1 || true
+  for _ in 1 2 3 4 5; do
+    sleep 1
+    if verify_forward; then forward_ok=true; break; fi
+  done
+  if $forward_ok; then
+    ok "Port forward active via openshell: http://localhost:$PORT"
+  fi
+fi
+
+if ! $forward_ok; then
+  warn "Port forward not reachable on http://localhost:$PORT — recover with:"
+  warn "  systemctl --user restart flight-tunnel.service   # if the unit is installed"
+  warn "  openshell forward stop $PORT && openshell forward start $PORT $SANDBOX_NAME -d"
 fi
 
 # ── 9. Refresh agent sessions so the skill is picked up ────────────────
@@ -573,11 +617,17 @@ ssh_sandbox "[ -f $SESSIONS_PATH ] && echo '{}' > $SESSIONS_PATH || true" 2>/dev
 # ── 10. Health check ────────────────────────────────────────────────────
 info "Probing health endpoint…"
 sleep 2
-HEALTH=$(curl -fsSL "http://127.0.0.1:$PORT/api/health" 2>/dev/null || true)
+# --max-time guard: a half-open SSH forward (the openshell-forward
+# failure mode this install previously hit) accepts the TCP connect
+# but never proxies bytes back, which would hang `curl -fsSL` for
+# minutes. Bound it tight so the installer always returns.
+HEALTH=$(curl -fsSL --max-time 5 "http://127.0.0.1:$PORT/api/health" 2>/dev/null || true)
 if [ -n "$HEALTH" ]; then
   ok "Backend reachable: $HEALTH"
 else
-  warn "Health check did not return — server may still be warming up."
+  warn "Health check did not return — server may still be warming up,"
+  warn "or the host→sandbox port forward is half-open. Recover with:"
+  warn "  systemctl --user restart flight-tunnel.service"
 fi
 
 cat <<EOF
