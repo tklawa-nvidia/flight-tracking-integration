@@ -480,6 +480,13 @@ function initMap() {
     refreshBboxMetar();
     refreshLayers();
     renderNasOverlay();
+    // The "Aircraft in view" / "Airports in view" HUD counts must
+    // refresh on every pan/zoom regardless of whether the live pump
+    // ran this turn. They describe what's currently visible, not the
+    // freshness of the data — so they need to update even when the
+    // feed is paused or set to manual cadence (cases where
+    // schedulePump short-circuits and never calls pump).
+    updateInViewHud();
   });
   // Update NAS pill positions continuously through the pan/zoom gesture
   // so they don't lag the underlying canvas. Cheap: we only re-project a
@@ -2729,6 +2736,65 @@ function airportsQueryForZoom(zoom) {
   if (zoom < 7)  return 'types=large,medium&limit=4000';
   if (zoom < 9)  return 'types=large,medium&limit=6000';
   return 'limit=12000';
+}
+
+// ── In-view HUD counters ─────────────────────────────────────────────────
+// Recomputes the "Aircraft in view" / "Airports in view" pills any time the
+// camera moves. These counts describe what's currently visible (so they're
+// bbox-derived, not pump-derived) and have to stay accurate even when the
+// live pump is paused or in manual cadence — otherwise zooming feels broken.
+//
+// Aircraft count is purely client-side: filter the existing snapshot by
+// the new bbox. Airports are a cheap static lookup, so we re-fetch them.
+let _hudInflight = false;
+let _hudPending  = false;
+async function updateInViewHud() {
+  if (!state.map) return;
+  // Aircraft: count from the locally cached snapshot. No network needed,
+  // works even mid-pause.
+  const b = state.map.getBounds();
+  const w = b.getWest(),  e = b.getEast();
+  const s = b.getSouth(), n = b.getNorth();
+  let aircraft = 0;
+  if (state.flights && typeof state.flights.values === 'function') {
+    for (const f of state.flights.values()) {
+      const lat = f && f.lat;
+      const lon = f && f.lon;
+      if (lat == null || lon == null) continue;
+      if (lat >= s && lat <= n && lon >= w && lon <= e) aircraft++;
+    }
+  }
+  if (elHudFlights) elHudFlights.textContent = aircraft.toLocaleString();
+
+  // Airports: fast static lookup. Coalesce overlapping calls so a fast
+  // pinch-zoom doesn't fire 4 fetches in a row.
+  if (_hudInflight) { _hudPending = true; return; }
+  _hudInflight = true;
+  try {
+    const apQuery = airportsQueryForZoom(state.map.getZoom());
+    const bboxStr = currentBbox();
+    const res = await fetchOrThrow(`/api/airports?bbox=${bboxStr}&${apQuery}`);
+    state.airportsInView   = res.airports || [];
+    state.airportsTruncated = Boolean(res.truncated);
+    if (elHudAirports) {
+      const c = state.airportsInView.length.toLocaleString();
+      elHudAirports.textContent = state.airportsTruncated ? `${c}+` : c;
+    }
+    refreshLayers();
+  } catch (err) {
+    // Don't toast — this is a background refresh that races with the
+    // pump and the user's zoom gestures. Silent failure is fine; the
+    // counts just stay at whatever the last successful fetch returned.
+    console.debug('updateInViewHud: airports fetch failed', err);
+  } finally {
+    _hudInflight = false;
+    if (_hudPending) {
+      _hudPending = false;
+      // Schedule the trailing refresh after the current frame so a long
+      // pinch-zoom collapses to a single fetch when it stops.
+      setTimeout(updateInViewHud, 50);
+    }
+  }
 }
 
 // ── Data pump ────────────────────────────────────────────────────────────
