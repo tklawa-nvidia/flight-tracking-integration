@@ -44,6 +44,16 @@ const state = {
   selectedAirport: null,
   arcs: [],
   arcsAirportCode: null,
+  // When the agent issues `/api/map/track`, the server broadcasts both a
+  // {type:'highlight'} and a {type:'view'} over the bus. The view always
+  // arrives because it's pure camera math, but the highlight needs the
+  // target plane to be in `state.flights` (which is bbox-scoped to the
+  // current viewport). If the agent picks a plane that's just outside
+  // the current bbox, the highlight no-ops — the camera moves but the
+  // detail card never opens and trails never light up. We stash the
+  // intent here and re-try it from `ingestFlights` once the post-flyTo
+  // poll loads the plane in. {target: lowercase id-or-callsign, expiresAt}.
+  pendingHighlight: null,
   layerVisibility: {
     flights: true,
     airports: true,
@@ -3097,6 +3107,11 @@ function ingestFlights(flights) {
       state.flightHistory.delete(id);
     }
   }
+  // The agent's track flow can land a {highlight} bus message before
+  // the next /api/flights poll pulls the target plane into the
+  // client-side index — see `state.pendingHighlight` above. Now that
+  // a fresh batch has been ingested, retry the lookup.
+  resolvePendingHighlight();
 }
 
 // ── Status pill ──────────────────────────────────────────────────────────
@@ -4146,29 +4161,66 @@ function handleBusMessage(msg) {
     }
     case 'highlight': {
       const target = (msg.flight || '').toLowerCase();
-      // Try ICAO24 hex match first, then callsign.
-      let matched = state.flights.get(target);
-      if (!matched) {
-        for (const f of state.flights.values()) {
-          if ((f.callsign || '').trim().toLowerCase() === target) {
-            matched = f;
-            break;
-          }
-        }
-      }
-      if (matched) {
-        state.selectedFlightId = matched.id;
-        state.layerVisibility.trails = true;
-        document.getElementById('layer-trails').checked = true;
-        flyTo(matched.lon, matched.lat, 9);
-        selectFlight(matched);
-      } else {
-        toast(`No live contact for ${msg.flight}`);
-      }
+      if (tryHighlightTarget(target)) break;
+      // The plane isn't in the client-side index yet — almost always
+      // because the agent's track flow has just sent us a {view} pulling
+      // the camera to a previously off-screen plane, and the next
+      // /api/flights poll for the new bbox hasn't landed. Stash it and
+      // resolve in `ingestFlights` when the plane shows up.
+      state.pendingHighlight = {
+        target,
+        expiresAt: performance.now() + 20_000,
+      };
       break;
     }
     default:
       console.debug('unhandled bus msg', msg);
+  }
+}
+
+// Shared lookup-and-highlight side-effects: set selection, force trails
+// on, fly the camera, open the detail drawer. Used by the {highlight}
+// bus handler on its first try AND by `resolvePendingHighlight()` once
+// a delayed /api/flights poll loads the target. Returns true if the
+// plane was found, false if it still isn't in `state.flights`.
+function tryHighlightTarget(target) {
+  if (!target) return false;
+  let matched = state.flights.get(target);
+  if (!matched) {
+    for (const f of state.flights.values()) {
+      if ((f.callsign || '').trim().toLowerCase() === target) {
+        matched = f;
+        break;
+      }
+    }
+  }
+  if (!matched) return false;
+  state.selectedFlightId = matched.id;
+  state.layerVisibility.trails = true;
+  const trailsBox = document.getElementById('layer-trails');
+  if (trailsBox) trailsBox.checked = true;
+  flyTo(matched.lon, matched.lat, 9);
+  selectFlight(matched);
+  return true;
+}
+
+// Drain any pending highlight intent (set by the {highlight} bus
+// handler when the target wasn't yet in state.flights). Called from
+// `ingestFlights` after each poll lands. If the intent has expired
+// without a match, surface the original "no live contact" toast so
+// the user (and agent, watching `delivered`) gets the same signal as
+// before — just delayed by up to 20s instead of fired prematurely on
+// the very first poll.
+function resolvePendingHighlight() {
+  const ph = state.pendingHighlight;
+  if (!ph) return;
+  if (tryHighlightTarget(ph.target)) {
+    state.pendingHighlight = null;
+    return;
+  }
+  if (performance.now() > ph.expiresAt) {
+    toast(`No live contact for ${ph.target}`);
+    state.pendingHighlight = null;
   }
 }
 
