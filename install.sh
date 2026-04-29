@@ -333,6 +333,56 @@ else
   warn "opensky-proxy /health didn't respond — proceeding but check /tmp/opensky-proxy.log"
 fi
 
+# ── 3b. Start the host-side FAA proxy ───────────────────────────────────
+#
+# Same pattern as opensky-proxy, but for public no-auth feeds that
+# nonetheless reject requests from the openshell gateway's egress IP
+# (FAA NAS Status, Aviation Weather Center). No credentials involved
+# — this proxy just IP-rewraps the request via the host VM's address,
+# which FAA's WAF accepts.
+FAA_PROXY_PORT="${FAA_PROXY_PORT:-9203}"
+echo
+info "Starting host-side faa-proxy on 0.0.0.0:$FAA_PROXY_PORT…"
+
+EXISTING_FAA_PID=$(pgrep -f "python3.*faa-proxy\.py" 2>/dev/null || true)
+if [ -n "$EXISTING_FAA_PID" ]; then
+  info "Stopping existing faa-proxy (PID $EXISTING_FAA_PID)…"
+  kill "$EXISTING_FAA_PID" 2>/dev/null || true
+  sleep 1
+  pgrep -f "python3.*faa-proxy\.py" 2>/dev/null \
+    | xargs -r kill -9 2>/dev/null || true
+fi
+
+setsid nohup python3 "$SCRIPT_DIR/faa-proxy.py" \
+    --port "$FAA_PROXY_PORT" \
+    > /tmp/faa-proxy.log 2>&1 < /dev/null &
+FAA_PROXY_PID=$!
+disown 2>/dev/null || true
+sleep 2
+
+if kill -0 "$FAA_PROXY_PID" 2>/dev/null; then
+  ok "faa-proxy started (PID $FAA_PROXY_PID, port $FAA_PROXY_PORT)"
+else
+  warn "faa-proxy failed to start. Last 20 log lines:"
+  tail -n 20 /tmp/faa-proxy.log 2>/dev/null || true
+  fail "Could not start faa-proxy. Inspect /tmp/faa-proxy.log"
+fi
+
+FAA_READY=false
+for _ in 1 2 3 4 5; do
+  if curl -fsS -o /dev/null --max-time 2 \
+        "http://127.0.0.1:${FAA_PROXY_PORT}/health"; then
+    FAA_READY=true
+    break
+  fi
+  sleep 1
+done
+if [ "$FAA_READY" = true ]; then
+  ok "faa-proxy /health passed"
+else
+  warn "faa-proxy /health didn't respond — proceeding but check /tmp/faa-proxy.log"
+fi
+
 # ── 4. Detect the host IP the sandbox should dial ───────────────────────
 #
 # This must be the address the sandbox sees the host at, not 127.0.0.1
@@ -351,6 +401,7 @@ fi
 info "Host IP for sandbox→proxy traffic: $HOST_IP"
 
 OPENSKY_PROXY_URL="http://${HOST_IP}:${OPENSKY_PROXY_PORT}"
+FAA_PROXY_URL="http://${HOST_IP}:${FAA_PROXY_PORT}"
 
 # ── 5. Apply network policy ─────────────────────────────────────────────
 info "Applying flight_tracking_opensky network policy (Tier-1)…"
@@ -364,11 +415,13 @@ openshell policy get "$SANDBOX_NAME" --full 2>/dev/null | sed '1,/^---$/d' > "$P
 # bypass the kept-on-host credential boundary.
 export HOST_IP
 export PROXY_PORT="$OPENSKY_PROXY_PORT"
+export FAA_PROXY_PORT
 PATCH_RESULT=$(python3 - "$POLICY_FILE" <<'PY'
 import os, sys, yaml
 path = sys.argv[1]
-host_ip    = os.environ['HOST_IP']
-proxy_port = int(os.environ['PROXY_PORT'])
+host_ip        = os.environ['HOST_IP']
+proxy_port     = int(os.environ['PROXY_PORT'])
+faa_proxy_port = int(os.environ['FAA_PROXY_PORT'])
 
 with open(path) as f:
     doc = yaml.safe_load(f) or {}
@@ -378,16 +431,29 @@ desired = {
     'name': 'flight_tracking_opensky',
     'endpoints': [
         {
-            # Tier-1 host proxy — the only OpenSky path the sandbox
-            # is allowed to take. tls: passthrough because the proxy
-            # listens HTTP-only on the loopback bridge; TLS termination
-            # happens at the proxy↔OpenSky hop.
+            # Tier-1 host proxy for OpenSky — the only OpenSky path the
+            # sandbox is allowed to take. tls: passthrough because the
+            # proxy listens HTTP-only on the loopback bridge; TLS
+            # termination happens at the proxy↔OpenSky hop.
             'host': host_ip, 'port': proxy_port, 'protocol': 'rest',
             'tls': 'passthrough', 'enforcement': 'enforce',
             'rules': [
                 {'allow': {'method': 'GET', 'path': '/api/states/all*'}},
                 {'allow': {'method': 'GET', 'path': '/api/flights/aircraft*'}},
                 {'allow': {'method': 'GET', 'path': '/api/tracks/all*'}},
+                {'allow': {'method': 'GET', 'path': '/health'}},
+            ],
+        },
+        {
+            # Tier-1 host proxy for FAA NAS Status + AWC METAR. Both
+            # upstreams are public (no auth) but block the openshell
+            # gateway's egress IP at the application layer (HTTP 403).
+            # We IP-rewrap them through the host VM, which FAA accepts.
+            'host': host_ip, 'port': faa_proxy_port, 'protocol': 'rest',
+            'tls': 'passthrough', 'enforcement': 'enforce',
+            'rules': [
+                {'allow': {'method': 'GET', 'path': '/nas/api/airport-events*'}},
+                {'allow': {'method': 'GET', 'path': '/awc/api/data/metar*'}},
                 {'allow': {'method': 'GET', 'path': '/health'}},
             ],
         },
@@ -473,12 +539,13 @@ ssh_sandbox "cat > $SANDBOX_BASE/flight.env" <<EOF
 # Rotate by editing credentials.json on the host then re-running
 # install.sh.
 OPENSKY_PROXY_URL=$OPENSKY_PROXY_URL
+FAA_PROXY_URL=$FAA_PROXY_URL
 FLIGHT_APP_PORT=$PORT
 OPENCLAW_AGENT=main
 OPENCLAW_TIMEOUT_S=180
 EOF
 ssh_sandbox "chmod 600 $SANDBOX_BASE/flight.env" 2>/dev/null
-ok "flight.env written (only OPENSKY_PROXY_URL — no secrets)"
+ok "flight.env written (proxy URLs only — no secrets)"
 
 # ── 6. Build venv + install deps inside the sandbox ─────────────────────
 info "Building Python venv inside the sandbox (one-time)…"
@@ -701,12 +768,12 @@ cat <<EOF
   Helper:      \`fly\` CLI inside the sandbox (try: fly goto IAD)
 
   Secrets (Tier-1 host-proxy):
-    canonical:   $CREDS_PATH        (host, chmod 600)
-    proxy:       opensky-proxy.py @ http://${HOST_IP}:${OPENSKY_PROXY_PORT}  (host)
-    gateway:     openshell provider 'flight-tracking-opensky'
-    sandbox:     $SANDBOX_BASE/flight.env  (no secrets — only proxy URL)
-    rotate:      edit credentials.json → re-run ./install.sh
-    proxy log:   /tmp/opensky-proxy.log (on host)
+    canonical:    $CREDS_PATH        (host, chmod 600)
+    opensky:      opensky-proxy.py @ http://${HOST_IP}:${OPENSKY_PROXY_PORT}  (host, /tmp/opensky-proxy.log)
+    faa+awc:      faa-proxy.py     @ http://${HOST_IP}:${FAA_PROXY_PORT}     (host, /tmp/faa-proxy.log)
+    gateway:      openshell provider 'flight-tracking-opensky'
+    sandbox:      $SANDBOX_BASE/flight.env  (no secrets — only proxy URLs)
+    rotate:       edit credentials.json → re-run ./install.sh
 
   Try in chat:
     "Go to IAD and analyse traffic"

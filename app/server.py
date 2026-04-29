@@ -93,11 +93,20 @@ OPENSKY_CACHE_TTL = 8.0  # seconds — slightly under anonymous 10s rate limit
 # auth, so failures are usually rate-limit or maintenance windows; we treat
 # every error as "just don't render that overlay" and never block the chart.
 
-# Aviation Weather Center — METARs / TAFs / station data. The bbox order
-# expected by AWC is `lonW,latS,lonE,latN`. `format=json` returns one
-# object per station with `lat`, `lon`, `fltCat` (VFR/MVFR/IFR/LIFR),
-# `temp`, `dewp`, `wdir`, `wspd`, `visib`, `altim`, `rawOb`, `wxString`.
-AWC_METAR_URL = "https://aviationweather.gov/api/data/metar"
+# Aviation Weather Center (AWC) and FAA NAS Status both block requests
+# coming from the cloud ASN that the openshell sandbox egresses through
+# (returns 403 Forbidden), even though they're public, no-auth endpoints
+# from a browser or VM. To work around that we route them through a
+# small host-side forwarder, `faa-proxy.py`, the same way OpenSky goes
+# through `opensky-proxy.py`. When FAA_PROXY_URL is set the constants
+# below resolve to the proxy; otherwise they hit the real upstream
+# (used for dev outside the sandbox).
+FAA_PROXY_URL = os.getenv("FAA_PROXY_URL", "").strip().rstrip("/")
+AWC_METAR_URL = (
+    f"{FAA_PROXY_URL}/awc/api/data/metar"
+    if FAA_PROXY_URL
+    else "https://aviationweather.gov/api/data/metar"
+)
 METAR_CACHE_TTL = 5 * 60  # AWC publishes hourly; 5 min keeps the chart fresh
 
 # FAA NAS Status — Air Traffic Control System Command Center publishes
@@ -105,7 +114,11 @@ METAR_CACHE_TTL = 5 * 60  # AWC publishes hourly; 5 min keeps the chart fresh
 # Airport Closure, AFP, deicing, etc.) as a single JSON payload. The
 # response is one object per affected airport with sub-objects for each
 # event type (groundStop, groundDelay, airportClosure, freeForm, …).
-NAS_STATUS_URL = "https://nasstatus.faa.gov/api/airport-events"
+NAS_STATUS_URL = (
+    f"{FAA_PROXY_URL}/nas/api/airport-events"
+    if FAA_PROXY_URL
+    else "https://nasstatus.faa.gov/api/airport-events"
+)
 NAS_CACHE_TTL = 90  # NAS Status updates whenever a new advisory is posted
 
 # Aircraft + flight-route registry. adsbdb.com aggregates the FAA
@@ -2830,6 +2843,9 @@ async def health() -> dict[str, Any]:
         "opensky_auth": opensky_auth,
         "opensky_authenticated": opensky_auth != "anonymous",
         "opensky_proxy_url": OPENSKY_PROXY_URL or None,
+        "faa_proxy_url": FAA_PROXY_URL or None,
+        "nas_via": "host-proxy" if FAA_PROXY_URL else "direct",
+        "metar_via": "host-proxy" if FAA_PROXY_URL else "direct",
         "openclaw_bin": OPENCLAW_BIN,
         "openclaw_available": Path(OPENCLAW_BIN).exists(),
         "openclaw_agent": OPENCLAW_AGENT,
