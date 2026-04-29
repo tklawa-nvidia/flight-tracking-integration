@@ -1143,6 +1143,155 @@ _FIND_PHASE_ALIASES = {
 }
 
 
+def _score_departure_likelihood(
+    f: dict[str, Any], airport: dict[str, Any], radius_km: float,
+) -> float:
+    """Heuristic 0..~12 score that this flight is a fresh departure
+    from `airport`.
+
+    Rewards low altitude, strong climb rate, proximity to the
+    airport, and a heading that points radially outward from the
+    airport's lat/lon. A high-altitude level plane at the edge of
+    the search bubble (i.e. cruise transit overhead) scores ~0; a
+    plane that's at 2000 ft, climbing 1500 fpm, 15 km out, and
+    pointing away scores ~10. Used as the primary sort key when
+    adsbdb route confirmation comes back empty — without this we
+    fell back to `last_seen` and routinely picked transit traffic.
+    """
+    score = 0.0
+    alt = f.get("alt_m") or 99999.0
+    vrate = f.get("vrate_mps") or 0.0
+    dist = f.get("_distance_km")
+    on_ground = bool(f.get("on_ground"))
+
+    if on_ground:
+        # Already on the ground at the departure airport — nearly
+        # certainly the plane the user means if they said "the latest
+        # flight that just left", but we mark it positively without
+        # the bonus from climb rate (which is 0 on the ground).
+        if dist is not None and dist < 5:
+            score += 4
+        return score
+
+    # Altitude: takeoffs live in the bottom of the column. 0..3000m
+    # is the climbout zone where the picture is unambiguous.
+    if alt < 1500:
+        score += 5
+    elif alt < 3000:
+        score += 3.5
+    elif alt < 5000:
+        score += 1.5
+    elif alt > 9000:
+        score -= 3  # cruise — almost certainly transit, not departure
+
+    # Vertical rate: climb is the smoking gun for a departure.
+    if vrate > 7:
+        score += 5
+    elif vrate > 2.5:
+        score += 3.5
+    elif vrate > 0.5:
+        score += 1.5
+    elif vrate < -1.5:
+        score -= 3  # descending = arrival, not departure
+
+    # Distance from airport: the closer the plane is to the airport,
+    # the more likely it just lifted off. Edge-of-bubble = transit.
+    if dist is not None:
+        if dist < radius_km * 0.10:
+            score += 3   # < 15 km of a 150 km bubble — right on top
+        elif dist < radius_km * 0.30:
+            score += 2
+        elif dist < radius_km * 0.60:
+            score += 0.5
+        elif dist > radius_km * 0.85:
+            score -= 1.5  # at the bubble's edge — likely transit
+
+    # Heading direction: a real departure points radially outward
+    # from the airport. Score the alignment between the plane's
+    # heading and the bearing from the airport to the plane.
+    h = f.get("heading")
+    plat, plon = f.get("lat"), f.get("lon")
+    if h is not None and plat is not None and plon is not None:
+        outbound_bearing = bearing_deg(
+            airport["lat"], airport["lon"], float(plat), float(plon),
+        )
+        misalign = heading_misalignment_deg(float(h), outbound_bearing)
+        if misalign < 30:
+            score += 1.5
+        elif misalign < 60:
+            score += 0.5
+        elif misalign > 120:
+            score -= 1  # heading back toward the airport — arrival
+
+    return score
+
+
+def _score_arrival_likelihood(
+    f: dict[str, Any], airport: dict[str, Any], radius_km: float,
+) -> float:
+    """Mirror of `_score_departure_likelihood` for arriving traffic.
+
+    Rewards descending vertical rate, low-but-not-touchdown altitude,
+    proximity, and a heading pointed radially toward the airport.
+    """
+    score = 0.0
+    alt = f.get("alt_m") or 99999.0
+    vrate = f.get("vrate_mps") or 0.0
+    dist = f.get("_distance_km")
+    on_ground = bool(f.get("on_ground"))
+
+    if on_ground:
+        if dist is not None and dist < 5:
+            score += 4
+        return score
+
+    if alt < 600:
+        score += 5      # short-final / threshold
+    elif alt < 2500:
+        score += 3.5    # base/final
+    elif alt < 4500:
+        score += 1.5    # downwind / approach
+    elif alt > 9000:
+        score -= 3      # cruise overhead
+
+    if vrate < -7:
+        score += 5
+    elif vrate < -2.5:
+        score += 3.5
+    elif vrate < -0.5:
+        score += 1.5
+    elif vrate > 1.5:
+        score -= 3      # climbing = departure, not arrival
+
+    if dist is not None:
+        if dist < radius_km * 0.10:
+            score += 3
+        elif dist < radius_km * 0.30:
+            score += 2
+        elif dist < radius_km * 0.60:
+            score += 0.5
+        elif dist > radius_km * 0.85:
+            score -= 1.5
+
+    h = f.get("heading")
+    plat, plon = f.get("lat"), f.get("lon")
+    if h is not None and plat is not None and plon is not None:
+        # Inbound bearing is FROM the plane TO the airport — i.e. the
+        # heading the plane should be pointing if it's lined up.
+        inbound_bearing = bearing_deg(
+            float(plat), float(plon), airport["lat"], airport["lon"],
+        )
+        misalign = heading_misalignment_deg(float(h), inbound_bearing)
+        if misalign < 30:
+            score += 1.5
+        elif misalign < 60:
+            score += 0.5
+        elif misalign > 120:
+            score -= 1
+
+    return score
+
+
 async def tool_find_flights(
     *,
     departing:        str | None = None,
@@ -1263,6 +1412,26 @@ async def tool_find_flights(
                 f["lat"], f["lon"], center["lat"], center["lon"],
             )
 
+    # Geometric likelihood scores. Used as the primary sort key when
+    # the requested direction (departing/arriving) couldn't be
+    # confirmed via adsbdb — adsbdb has spotty coverage for shorter-
+    # haul callsigns, so falling back to "latest last_seen" was
+    # picking up high-altitude transit traffic instead of the real
+    # takeoff. A real departure has:
+    #   - low altitude (just lifted off)
+    #   - positive vertical rate (still climbing)
+    #   - close to the departing airport's lat/lon
+    #   - heading away from the airport (radial vs tangential)
+    # A real arrival is the same picture mirrored. Scores are
+    # additive in [-10, +10]ish; we don't normalise — they just feed
+    # the sort.
+    if departing_a is not None:
+        for f in candidates:
+            f["_departure_score"] = _score_departure_likelihood(f, departing_a, radius)
+    if arriving_a is not None:
+        for f in candidates:
+            f["_arrival_score"] = _score_arrival_likelihood(f, arriving_a, radius)
+
     # Optional route confirmation against adsbdb. Only call up to
     # _FIND_MAX_ROUTE_CONFIRM in parallel — adsbdb is per-egress-IP
     # rate-limited and we already cache 5 minutes of results.
@@ -1347,16 +1516,82 @@ async def tool_find_flights(
     order_key = (order or "").strip().lower() or (
         "latest" if (departing_a or arriving_a) else "closest"
     )
+
+    # Geometric prefilter when departure/arrival was requested but
+    # adsbdb didn't confirm anything. Without this guard, "latest"
+    # picks the most-recently-seen plane in the bubble — which is
+    # often a 25,000 ft transit jet, not the actual takeoff. We
+    # require a minimum departure/arrival score to count as a real
+    # match. The threshold (3.0) was tuned to admit "low + climbing"
+    # while rejecting "level cruise overhead".
+    DEPARTURE_SCORE_FLOOR = 3.0
+    if (
+        do_route
+        and not confirmed
+        and (departing_a is not None or arriving_a is not None)
+    ):
+        if departing_a is not None:
+            strong = [c for c in candidates
+                      if (c.get("_departure_score") or 0) >= DEPARTURE_SCORE_FLOOR]
+        else:
+            strong = [c for c in candidates
+                      if (c.get("_arrival_score") or 0) >= DEPARTURE_SCORE_FLOOR]
+        if strong:
+            # Mark the surviving rows so the agent can see WHY they
+            # were chosen even though adsbdb didn't confirm.
+            for c in strong:
+                c["_route_match"] = "geometric-departure" if departing_a else "geometric-arrival"
+            candidates = strong
+
+    # Primary sort key prefers route-confirmed matches, then geometric
+    # likelihood (when departing/arriving), then the user-requested
+    # order_key as the secondary key. This way `order=latest` still
+    # means "latest among the plausible matches", not "latest in the
+    # whole bubble regardless of plausibility".
+    def _confidence_rank(f: dict[str, Any]) -> int:
+        m = f.get("_route_match")
+        if m == "confirmed":           return 0
+        if m == "geometric-departure": return 1
+        if m == "geometric-arrival":   return 1
+        if m == "not-confirmed":       return 2
+        if m == "wrong-route":         return 3
+        return 4
+
+    def _direction_score(f: dict[str, Any]) -> float:
+        # Larger = more departure-y / arrival-y. Negate when we sort
+        # ascending so high scores come first.
+        if departing_a is not None:
+            return f.get("_departure_score") or 0.0
+        if arriving_a is not None:
+            return f.get("_arrival_score") or 0.0
+        return 0.0
+
     if order_key == "latest":
-        candidates.sort(key=lambda f: (f.get("last_seen") or 0), reverse=True)
+        candidates.sort(key=lambda f: (
+            _confidence_rank(f),
+            -(_direction_score(f)),
+            -(f.get("last_seen") or 0),
+        ))
     elif order_key in ("closest", "closest_to_origin", "nearest"):
-        candidates.sort(key=lambda f: (f.get("_distance_km") if f.get("_distance_km") is not None else 1e9))
+        candidates.sort(key=lambda f: (
+            _confidence_rank(f),
+            (f.get("_distance_km") if f.get("_distance_km") is not None else 1e9),
+        ))
     elif order_key in ("lowest_alt", "low_alt", "lowest"):
-        candidates.sort(key=lambda f: (f.get("alt_m") if f.get("alt_m") is not None else 1e9))
+        candidates.sort(key=lambda f: (
+            _confidence_rank(f),
+            (f.get("alt_m") if f.get("alt_m") is not None else 1e9),
+        ))
     elif order_key in ("fastest_climb", "climb"):
-        candidates.sort(key=lambda f: (f.get("vrate_mps") or 0), reverse=True)
+        candidates.sort(key=lambda f: (
+            _confidence_rank(f),
+            -(f.get("vrate_mps") or 0),
+        ))
     elif order_key in ("aligned", "best_aligned"):
-        candidates.sort(key=lambda f: f.get("_heading_misalign_deg", 999))
+        candidates.sort(key=lambda f: (
+            _confidence_rank(f),
+            f.get("_heading_misalign_deg", 999),
+        ))
     else:
         return {
             "ok": False,
@@ -1403,6 +1638,13 @@ async def tool_find_flights(
                 "distance_from_center_km": f.get("_distance_km"),
                 "heading_misalign_deg":    f.get("_heading_misalign_deg"),
                 "route_match":             f.get("_route_match"),
+                # Geometric likelihood scores. ~10 = textbook
+                # departure/arrival; ~0 = inconclusive; <0 = looks
+                # like the opposite (departure score for an arriving
+                # plane). Surfaced so the agent can disclaim
+                # appropriately when no route confirmation came back.
+                "departure_score":         f.get("_departure_score"),
+                "arrival_score":           f.get("_arrival_score"),
                 "route":                   f.get("route"),
             }
             for f in candidates

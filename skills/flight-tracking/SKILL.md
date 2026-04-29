@@ -356,11 +356,36 @@ Filter cheat sheet (all optional, AND'd together):
 
 DO NOT loop `/api/route/<cs>` over every live callsign. The fan-out
 above (with `confirm_route=true`) does it server-side, capped at 20
-in parallel, with caching. If the server can't reach adsbdb on a
-given turn, the geometric heuristic still returns candidates — they
-just carry `route_match:"not-confirmed"` and you should tell the
-user "best geometric guess; route confirmation unavailable" rather
-than fabricating a confirmed match.
+in parallel, with caching.
+
+### Route confirmation can fail — read `route_match` before claiming
+
+adsbdb has spotty coverage for some carriers/callsigns. When that
+happens the server falls back to a **geometric likelihood** score
+and surfaces it on every candidate so you can see why it ranked
+things the way it did:
+
+| `route_match`         | what it means                                          |
+|-----------------------|--------------------------------------------------------|
+| `confirmed`           | adsbdb says origin/destination matches the request     |
+| `geometric-departure` | low alt + climbing + close + heading outbound          |
+| `geometric-arrival`   | low alt + descending + close + heading inbound         |
+| `wrong-route`         | adsbdb has a route, but it's the wrong airport         |
+| `not-confirmed`       | adsbdb returned nothing AND geometry was inconclusive  |
+
+Plus per-candidate `departure_score` / `arrival_score` (≈10 = textbook,
+≈0 = inconclusive, <0 = looks like the opposite). The list is sorted
+confirmed → geometric → not-confirmed; pick the first row.
+
+Required disclaimers when committing the camera:
+
+* `confirmed` → say "tracking AAL123 (IAD → TPA per adsbdb)".
+* `geometric-departure` / `geometric-arrival` → say something like
+  "best geometric match — adsbdb couldn't confirm the route, but the
+  flight is at 2,000 ft climbing out of IAD". Do NOT claim a
+  destination unless adsbdb actually returned one.
+* If only `not-confirmed` rows came back, tell the user "no live
+  flight matches a recent IAD departure right now" and DO NOT track.
 
 ## How to look up a specific flight
 
