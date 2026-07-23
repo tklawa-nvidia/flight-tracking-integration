@@ -124,6 +124,26 @@ You can switch feeds two ways: **live, from the console UI** (no reinstall), or 
 
 > **Why the default is `community`, not `opensky`:** OpenSky blackholes datacenter/cloud IP ranges (AWS/GCP/Azure). From a Brev/cloud VM, `opensky-network.org` is unreachable (the SYN is dropped inside OpenSky's network — confirmed via TCP traceroute), so planes never load. The community feeds have no such block and need no credentials, so they work out of the box on cloud VMs. Use `opensky` only on a non-cloud host whose egress OpenSky still accepts.
 
+> **"But I have OpenSky credentials — why am I still blocked?"** Because the block is at the **TCP layer, applied to your source IP *before* any TLS handshake or HTTP request.** The connection never opens, so OpenSky never sees your `Authorization` header — authentication can't lift an IP block it never gets the chance to evaluate. Both `opensky-network.org` and `auth.opensky-network.org` (the token endpoint) are unreachable from cloud ranges. Credentials only raise your *rate limit* once you can reach the API; they don't change *whether* you can reach it. (Confirmed from this GCP box: `curl https://opensky-network.org/...` and the OAuth2 token mint both hang and time out.)
+>
+> **If you genuinely need OpenSky data from a cloud VM**, route just OpenSky's outbound calls through a **non-datacenter hop** with `OPENSKY_EGRESS_PROXY` (the community feeds keep going out directly — no reason to tunnel them):
+>
+> ```bash
+> # A) SOCKS proxy over SSH to any non-cloud box you can log into
+> #    (your laptop, a home server). Needs PySocks on the host:
+> ssh -fN -D 1080 you@home-box                 # opens a local SOCKS5 proxy
+> pip install PySocks
+> OPENSKY_EGRESS_PROXY=socks5h://127.0.0.1:1080 \
+>   FLIGHT_ADSB_SOURCE=opensky ./install.sh <sandbox-name>
+>
+> # B) An HTTP forward proxy (Squid / tinyproxy / Cloudflare WARP in proxy
+> #    mode) — no extra Python deps needed:
+> OPENSKY_EGRESS_PROXY=http://127.0.0.1:8080 \
+>   FLIGHT_ADSB_SOURCE=opensky ./install.sh <sandbox-name>
+> ```
+>
+> The credentials still live only on the host (`~/.nemoclaw/credentials.json`); the sandbox is unchanged. Verify with `curl -s http://127.0.0.1:9202/ | python3 -m json.tool` — `egress_proxy` shows the active hop. A **Tailscale exit node** on a residential machine is the alternative (it reroutes the whole host's egress, so no `OPENSKY_EGRESS_PROXY` is needed). For most hackathon use, the `community` default is simpler and works with zero setup.
+
 Set it at install time, e.g.:
 
 ```bash
@@ -192,6 +212,9 @@ Wire Telegram through NemoClaw as usual. The same `flight-tracking` skill drives
 | `localhost:18890` refused (laptop) | Run `brev port-forward … --port 18890:18890` and keep it open |
 | Empty response on 18890 (VM) | `systemctl --user restart flight-tunnel.service`; restart app: `ssh openshell-<sandbox> 'cd /sandbox/.openclaw-data/flight-tracking && nohup ./start.sh >> server.log 2>&1 &'` |
 | No aircraft / rate limited | Ensure `opensky-proxy.py` is running on the host; check `/api/health` for `opensky_auth: "host-proxy"` |
+| No planes on `opensky` feed from a cloud VM | Expected — OpenSky blocks cloud IPs at the TCP layer, *before* auth, so credentials don't help. Either stay on `community` (default, works everywhere) or set `OPENSKY_EGRESS_PROXY` to a non-datacenter hop (see "Live-aircraft data source"). |
+| Chat sits on "Agent working…" a long time | Normal for multi-tool turns — openclaw's CLI has no token-stream mode, so the final reply lands in one shot. The bubble now shows a **live elapsed counter** and a **step trail** ("Centering the map… → Analysing traffic around IAD…") so you can see it's progressing. Toggle **Show tool calls** in the chat header for the raw curl trace. |
+| Agent's tool calls all `403 policy_denied` / turn takes ~60s then fails | The sandbox exports `http_proxy=…:3128` but the agent's exec env doesn't list `127.0.0.1` in `no_proxy`, so `curl` routes **loopback** through the egress proxy, which denies it. The `flight-tracking` skill recipes + `fly` CLI now pass `--noproxy 127.0.0.1` on every call so loopback bypasses the proxy. If you hand-run a curl against the app, add `--noproxy 127.0.0.1` too. (Re-run `./install.sh` to pick up the patched skill.) |
 | NAS / METAR layer fails | Start `faa-proxy.py` on host :9203; re-run `./install.sh` |
 | Agent says map updated but UI unchanged | Open `http://localhost:18890` first; check `delivered` in tool response |
 | Chat panel hangs / says "openclaw binary not found" | `./install.sh --status` to see what's missing; usually means the sandbox image lost `/usr/local/bin/openclaw` — re-run `nemoclaw onboard` |

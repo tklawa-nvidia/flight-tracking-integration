@@ -164,6 +164,10 @@ usage_exit() {
     FLIGHT_APP_PORT        FastAPI port (default 18890)
     SKIP_SYSTEMD_TUNNEL    Set to 1 to skip systemd-user tunnel install
     FLIGHT_ADSB_SOURCE     Live-aircraft source: community (default) | opensky
+    OPENSKY_EGRESS_PROXY   Route OpenSky's outbound calls through a non-datacenter
+                           hop so a cloud VM can reach OpenSky despite its IP block
+                           (e.g. http://127.0.0.1:8080 or socks5h://127.0.0.1:1080).
+                           Only used with FLIGHT_ADSB_SOURCE=opensky.
     ENABLE_BREV_FORWARD    Set to 1 to install the public 0.0.0.0 Brev forward
     BREV_FORWARD_PORT      Public port for the Brev forward (default 18891)
 
@@ -757,7 +761,11 @@ fi
 # `setsid nohup` so the daemon survives the install.sh shell exit and
 # so it gets its own session (won't be orphaned to the systemd reaper).
 mkdir -p "$(dirname /tmp/opensky-proxy.log)" 2>/dev/null || true
+# OPENSKY_EGRESS_PROXY (optional): route OpenSky's outbound calls through a
+# non-datacenter hop so a cloud VM can reach OpenSky despite the IP block.
+# Only meaningful with FLIGHT_ADSB_SOURCE=opensky; harmless otherwise.
 setsid nohup env "FLIGHT_ADSB_SOURCE=$FLIGHT_ADSB_SOURCE" \
+    "OPENSKY_EGRESS_PROXY=${OPENSKY_EGRESS_PROXY:-}" \
     python3 "$SCRIPT_DIR/opensky-proxy.py" \
     --port "$OPENSKY_PROXY_PORT" \
     > /tmp/opensky-proxy.log 2>&1 < /dev/null &

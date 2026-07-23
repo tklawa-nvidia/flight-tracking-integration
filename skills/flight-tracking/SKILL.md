@@ -1,6 +1,6 @@
 ---
 name: flight-tracking
-description: "FlightOps live-aircraft + airport + interactive-map control at http://127.0.0.1:18890. Use for live traffic near an airport, inbound patterns, squawks, METAR, NAS/ground-stops, ARTCC, OR driving the map (fly, arcs, track/highlight, recolour, toggle layer, filter, 3D, METAR colour, switch feed). EXEC-READY RECIPES — run verbatim, substitute the token; field names differ per endpoint, do NOT guess. (A) 'go to <X> and analyse [traffic]' → ONE call: `curl -fsS --max-time 60 -X POST -H 'Content-Type: application/json' -d '{\"target\":\"<X>\",\"zoom\":9,\"radius_km\":80}' 'http://127.0.0.1:18890/api/map/goto-analyze'` — flies the map AND returns the traffic summary in a single shot (field is `target`, NOT `airport`). Read `.analysis` from the JSON for the summary. (B) 'show arcs into <X>' → ONE call: `curl -fsS --max-time 60 -X POST -H 'Content-Type: application/json' -d '{\"airport\":\"<X>\",\"radius_km\":80}' 'http://127.0.0.1:18890/api/map/arcs'`. NOTE: arcs' field IS `airport` (different from goto). (C) 'recolour planes by <altitude|vrate|squawk|phase>' → ONE call: `curl -fsS --max-time 60 -X POST -H 'Content-Type: application/json' -d '{\"mode\":\"<altitude|vrate|squawk|phase>\"}' 'http://127.0.0.1:18890/api/map/color'`. (D) 'find <plane matching X> and track it' → TWO calls: `curl -fsS --max-time 60 'http://127.0.0.1:18890/api/flights/find?departing=<X>&limit=5'` then pick the first id and `curl -fsS --max-time 60 -X POST -H 'Content-Type: application/json' -d '{\"flight\":\"<id>\",\"zoom\":10}' 'http://127.0.0.1:18890/api/map/track'`. (E) 'toggle layer <L> on/off' → `curl -fsS --max-time 60 -X POST -H 'Content-Type: application/json' -d '{\"layer\":\"<L>\",\"visible\":true}' 'http://127.0.0.1:18890/api/map/layer'` (layer ∈ flights|airports|arcs|trails|paths|weather|sua|classes|tfrs|runways|taxiways|obstacles|ats|metar|nas|artcc|navaids). (F) 'is <airport> delayed / GDP / ground stop?' → `curl -fsS --max-time 60 'http://127.0.0.1:18890/api/nas/airport/<X>'`. (G) 'weather at <X> / METAR' → `curl -fsS --max-time 60 'http://127.0.0.1:18890/api/weather/metar?bbox=-77,38,-76,39'`. (H) 'what is <airport>' → `curl -fsS --max-time 60 'http://127.0.0.1:18890/api/airport/<X>'`. (I) 'switch/change the live feed/provider/data source to <community|adsb.fi|airplanes.live|adsb.lol|opensky>' → ONE call: `curl -fsS --max-time 60 -X POST -H 'Content-Type: application/json' -d '{\"source\":\"<X>\"}' 'http://127.0.0.1:18890/api/map/source'`. NOTE: field is `source`. This changes the feed for BOTH the operator's map AND your own analysis. List feeds + what each supports with `curl -fsS 'http://127.0.0.1:18890/api/sources'`. FEED: default is `community` (live positions/tracking/trails + origin→dest via `/api/route/<callsign>`) with NO pre-built history → `/api/flight/<icao24>` and `/track` return nothing and `route_match` is never `confirmed-opensky` (don't claim an OpenSky-confirmed origin; use `/api/route/<callsign>` + geometry). `opensky` has history but is BLOCKED from cloud/VM IPs (returns no planes here). ANTI-PATTERNS — never: exec a bare URL without `curl`; omit `--max-time 60`; GET a /api/map/* endpoint (POST-only, GET=405); guess JSON field names (each recipe shows the exact body); read /sandbox/.openclaw/skills/ files; call any OTHER skill; curl upstream OpenSky/FAA/AWC hosts (firewalled — the local proxies handle them). RULES: (1) any map change = do the matching POST BEFORE describing it. (2) colour modes are exactly phase|altitude|vrate|squawk (aliases elevation/flight level/rate of climb/emergency); no invented palettes. (3) every /api/map/* returns `delivered`; if ≥1 confirm in ONE sentence and stop (no hedging); if 0 say 'no map UI connected — open http://127.0.0.1:18890'. (4) 405/422 = wrong method/body: re-read the recipe, retry ONCE, else 'service unavailable' and stop. (5) use the FEWEST tool calls."
+description: "FlightOps live-aircraft + airport + interactive-map control at http://127.0.0.1:18890. Use for live traffic near an airport, inbound patterns, squawks, METAR, NAS/ground-stops, ARTCC, OR driving the map (fly, arcs, track/highlight, recolour, toggle layer, filter, 3D, METAR colour, switch feed). EXEC-READY RECIPES — run verbatim, substitute the token; field names differ per endpoint, do NOT guess. (A) 'go to <X> and analyse [traffic]' → ONE call: `curl --noproxy 127.0.0.1 -fsS --max-time 60 -X POST -H 'Content-Type: application/json' -d '{\"target\":\"<X>\",\"zoom\":9,\"radius_km\":80}' 'http://127.0.0.1:18890/api/map/goto-analyze'` — flies the map AND returns the traffic summary in a single shot (field is `target`, NOT `airport`). Read `.analysis` from the JSON for the summary. (B) 'show arcs into <X>' → ONE call: `curl --noproxy 127.0.0.1 -fsS --max-time 60 -X POST -H 'Content-Type: application/json' -d '{\"airport\":\"<X>\",\"radius_km\":80}' 'http://127.0.0.1:18890/api/map/arcs'`. NOTE: arcs' field IS `airport` (different from goto). (C) 'recolour planes by <altitude|vrate|squawk|phase>' → ONE call: `curl --noproxy 127.0.0.1 -fsS --max-time 60 -X POST -H 'Content-Type: application/json' -d '{\"mode\":\"<altitude|vrate|squawk|phase>\"}' 'http://127.0.0.1:18890/api/map/color'`. (D) 'find <plane matching X> and track it' → TWO calls: `curl --noproxy 127.0.0.1 -fsS --max-time 60 'http://127.0.0.1:18890/api/flights/find?departing=<X>&limit=5'` then pick the first id and `curl --noproxy 127.0.0.1 -fsS --max-time 60 -X POST -H 'Content-Type: application/json' -d '{\"flight\":\"<id>\",\"zoom\":10}' 'http://127.0.0.1:18890/api/map/track'`. (E) 'toggle layer <L> on/off' → `curl --noproxy 127.0.0.1 -fsS --max-time 60 -X POST -H 'Content-Type: application/json' -d '{\"layer\":\"<L>\",\"visible\":true}' 'http://127.0.0.1:18890/api/map/layer'` (layer ∈ flights|airports|arcs|trails|paths|weather|sua|classes|tfrs|runways|taxiways|obstacles|ats|metar|nas|artcc|navaids). (F) 'is <airport> delayed / GDP / ground stop?' → `curl --noproxy 127.0.0.1 -fsS --max-time 60 'http://127.0.0.1:18890/api/nas/airport/<X>'`. (G) 'weather at <X> / METAR' → `curl --noproxy 127.0.0.1 -fsS --max-time 60 'http://127.0.0.1:18890/api/weather/metar?bbox=-77,38,-76,39'`. (H) 'what is <airport>' → `curl --noproxy 127.0.0.1 -fsS --max-time 60 'http://127.0.0.1:18890/api/airport/<X>'`. (I) 'switch/change the live feed/provider/data source to <community|adsb.fi|airplanes.live|adsb.lol|opensky>' → ONE call: `curl --noproxy 127.0.0.1 -fsS --max-time 60 -X POST -H 'Content-Type: application/json' -d '{\"source\":\"<X>\"}' 'http://127.0.0.1:18890/api/map/source'`. NOTE: field is `source`. This changes the feed for BOTH the operator's map AND your own analysis. List feeds + what each supports with `curl --noproxy 127.0.0.1 -fsS 'http://127.0.0.1:18890/api/sources'`. FEED: default is `community` (live positions/tracking/trails + origin→dest via `/api/route/<callsign>`) with NO pre-built history → `/api/flight/<icao24>` and `/track` return nothing and `route_match` is never `confirmed-opensky` (don't claim an OpenSky-confirmed origin; use `/api/route/<callsign>` + geometry). `opensky` has history but is BLOCKED from cloud/VM IPs (returns no planes here). ANTI-PATTERNS — never: exec a bare URL without `curl`; omit `--max-time 60`; GET a /api/map/* endpoint (POST-only, GET=405); guess JSON field names (each recipe shows the exact body); read /sandbox/.openclaw/skills/ files; call any OTHER skill; curl upstream OpenSky/FAA/AWC hosts (firewalled — the local proxies handle them). RULES: (1) any map change = do the matching POST BEFORE describing it. (2) colour modes are exactly phase|altitude|vrate|squawk (aliases elevation/flight level/rate of climb/emergency); no invented palettes. (3) every /api/map/* returns `delivered`; if ≥1 confirm in ONE sentence and stop (no hedging); if 0 say 'no map UI connected — open http://127.0.0.1:18890'. (4) 405/422 = wrong method/body: re-read the recipe, retry ONCE, else 'service unavailable' and stop. (5) use the FEWEST tool calls."
 ---
 
 # flight-tracking
@@ -220,7 +220,7 @@ selectable — from the map's **Layers → Data feed** dropdown, or by you via
 `POST /api/map/source`. Inspect the options + capabilities any time:
 
 ```bash
-curl -s http://127.0.0.1:18890/api/sources | python3 -m json.tool
+curl --noproxy 127.0.0.1 -s http://127.0.0.1:18890/api/sources | python3 -m json.tool
 # → { "current": "community", "sources":[…], "capabilities": {
 #       "community": {live_positions, live_tracking, live_trail,
 #                     prebuilt_history:false, origin_destination:"via callsign",
@@ -269,21 +269,21 @@ block and switch them back to `community`.
 
 ```bash
 # user: "show me only the planes squawking emergency near IAD"
-curl -sX POST http://127.0.0.1:18890/api/map/goto \
+curl --noproxy 127.0.0.1 -sX POST http://127.0.0.1:18890/api/map/goto \
      -d '{"target":"IAD","zoom":7,"pitch":40}' -H 'Content-Type: application/json'
-curl -sX POST http://127.0.0.1:18890/api/map/color \
+curl --noproxy 127.0.0.1 -sX POST http://127.0.0.1:18890/api/map/color \
      -d '{"mode":"squawk"}' -H 'Content-Type: application/json'
-curl -sX POST http://127.0.0.1:18890/api/map/filter \
+curl --noproxy 127.0.0.1 -sX POST http://127.0.0.1:18890/api/map/filter \
      -d '{"mode":"squawk","only":"emergency"}' -H 'Content-Type: application/json'
 # now the chart shows only 7500/7600/7700 traffic, coloured by code,
 # with the camera tilted at 40° so the operator can scan altitudes.
 
 # user: "go back to normal" / "reset filters"
-curl -sX POST http://127.0.0.1:18890/api/map/filter \
+curl --noproxy 127.0.0.1 -sX POST http://127.0.0.1:18890/api/map/filter \
      -d '{"mode":"squawk","reset":true}' -H 'Content-Type: application/json'
-curl -sX POST http://127.0.0.1:18890/api/map/filter \
+curl --noproxy 127.0.0.1 -sX POST http://127.0.0.1:18890/api/map/filter \
      -d '{"mode":"phase","reset":true}'  -H 'Content-Type: application/json'
-curl -sX POST http://127.0.0.1:18890/api/map/color \
+curl --noproxy 127.0.0.1 -sX POST http://127.0.0.1:18890/api/map/color \
      -d '{"mode":"phase"}' -H 'Content-Type: application/json'
 ```
 
@@ -307,7 +307,7 @@ rather than pretending to have done it.
 
 ```bash
 # user: "go to IAD and analyse the traffic"  → ALWAYS ONE call (map + analysis)
-curl -sX POST http://127.0.0.1:18890/api/map/goto-analyze \
+curl --noproxy 127.0.0.1 -sX POST http://127.0.0.1:18890/api/map/goto-analyze \
      -H 'Content-Type: application/json' \
      -d '{"target":"IAD","zoom":9,"radius_km":80}'
 # → {"ok":true,"delivered":N,"goto":{...},"analysis":{...}}
@@ -327,7 +327,7 @@ broadcasts a goto with the right pose.
 
 ```bash
 # user: "show me the inbound arcs into JFK"
-curl -sX POST http://127.0.0.1:18890/api/map/arcs \
+curl --noproxy 127.0.0.1 -sX POST http://127.0.0.1:18890/api/map/arcs \
      -H 'Content-Type: application/json' \
      -d '{"airport":"JFK","radius_km":80}'
 ```
@@ -348,7 +348,7 @@ the map never moved").
 
 ```bash
 # user: "find UAL108 and track it on the map"
-curl -sX POST http://127.0.0.1:18890/api/map/track \
+curl --noproxy 127.0.0.1 -sX POST http://127.0.0.1:18890/api/map/track \
      -H 'Content-Type: application/json' \
      -d '{"flight":"UAL108","zoom":10,"pitch":45}'
 # → {"ok":true,"delivered":1,"flight":{"id":"A2CA5D","callsign":"UAL108",
@@ -371,7 +371,7 @@ and time out the chat turn — never do that).
 #    auto-applies climb-phase + heading-toward-arriving filters,
 #    and (because both departing and arriving were given) confirms
 #    the route against adsbdb in parallel for the top candidates.
-curl -s "http://127.0.0.1:18890/api/flights/find?departing=IAD&arriving=TPA&limit=5"
+curl --noproxy 127.0.0.1 -s "http://127.0.0.1:18890/api/flights/find?departing=IAD&arriving=TPA&limit=5"
 # → {"ok":true,"count":1,"filters":{...},
 #    "flights":[{"id":"a2ca5d","callsign":"UAL108","lat":...,"lon":...,
 #                "alt_m":5097,"vrate_mps":12.3,"heading":188,
@@ -384,7 +384,7 @@ curl -s "http://127.0.0.1:18890/api/flights/find?departing=IAD&arriving=TPA&limi
 #    lowest_alt, fastest_climb, aligned.)
 
 # 3. TRACK — pass the resolved id (or callsign) to /api/map/track.
-curl -sX POST http://127.0.0.1:18890/api/map/track \
+curl --noproxy 127.0.0.1 -sX POST http://127.0.0.1:18890/api/map/track \
      -H 'Content-Type: application/json' \
      -d '{"flight":"a2ca5d","zoom":10,"pitch":45}'
 ```
@@ -507,19 +507,19 @@ the right tool:
 
 # 1. Resolve the callsign to an icao24 by scanning the live state vectors.
 #    Callsigns are space-padded by OpenSky and case-insensitive.
-ICAO24=$(curl -s "http://127.0.0.1:18890/api/flights" \
+ICAO24=$(curl --noproxy 127.0.0.1 -s "http://127.0.0.1:18890/api/flights" \
   | python3 -c "import sys, json; r=json.load(sys.stdin)['flights']; \
                 print(next((f['id'] for f in r if (f.get('callsign') or '').strip().upper()=='UAL123'), ''))")
 
 # 2. Pull the recent flight summary (origin + destination + timing).
-curl -s "http://127.0.0.1:18890/api/flight/$ICAO24"
+curl --noproxy 127.0.0.1 -s "http://127.0.0.1:18890/api/flight/$ICAO24"
 
 # 3. (Optional) pull the waypoint track for "where it has been".
-curl -s "http://127.0.0.1:18890/api/flight/$ICAO24/track?time=0"
+curl --noproxy 127.0.0.1 -s "http://127.0.0.1:18890/api/flight/$ICAO24/track?time=0"
 
 # 4. (Optional) put it on the map — but if the user asked you to
 #    "track" or "follow" the plane, use /api/map/track above instead.
-curl -sX POST http://127.0.0.1:18890/api/map/highlight \
+curl --noproxy 127.0.0.1 -sX POST http://127.0.0.1:18890/api/map/highlight \
      -H 'Content-Type: application/json' \
      -d "{\"flight\":\"$ICAO24\"}"
 ```
@@ -584,7 +584,7 @@ from `state.colorMode`; `POST /api/map/color` is the only handle.
 
 ```bash
 # user: "color the planes by altitude"
-curl -sX POST http://127.0.0.1:18890/api/map/color \
+curl --noproxy 127.0.0.1 -sX POST http://127.0.0.1:18890/api/map/color \
      -H 'Content-Type: application/json' \
      -d '{"mode":"altitude"}'
 # THEN reply: "Switched to the altitude preset. Lower-altitude
@@ -592,17 +592,17 @@ curl -sX POST http://127.0.0.1:18890/api/map/color \
 # deep saturated green at FL400+." (Match the actual palette.)
 
 # user: "show me who's climbing or descending"
-curl -sX POST http://127.0.0.1:18890/api/map/color \
+curl --noproxy 127.0.0.1 -sX POST http://127.0.0.1:18890/api/map/color \
      -d '{"mode":"vrate"}' -H 'Content-Type: application/json'
 
 # user: "any emergencies right now?"
-curl -sX POST http://127.0.0.1:18890/api/map/color \
+curl --noproxy 127.0.0.1 -sX POST http://127.0.0.1:18890/api/map/color \
      -d '{"mode":"squawk"}' -H 'Content-Type: application/json'
 # Then read /api/flights and surface any flight whose squawk is
 # 7500 (hijack), 7600 (radio fail), or 7700 (general emergency).
 
 # user: "go back to normal"
-curl -sX POST http://127.0.0.1:18890/api/map/color \
+curl --noproxy 127.0.0.1 -sX POST http://127.0.0.1:18890/api/map/color \
      -d '{"mode":"phase"}' -H 'Content-Type: application/json'
 ```
 
@@ -647,13 +647,13 @@ across any subset:
 
 ```bash
 # what's at or near KIAD? (default datasets: sua,tfrs,runways)
-curl -s "http://127.0.0.1:18890/api/airspace/lookup?lat=38.94&lon=-77.46&radius_km=80"
+curl --noproxy 127.0.0.1 -s "http://127.0.0.1:18890/api/airspace/lookup?lat=38.94&lon=-77.46&radius_km=80"
 
 # include obstacles + taxiways + ATS routes too
-curl -s "http://127.0.0.1:18890/api/airspace/lookup?lat=38.94&lon=-77.46&radius_km=20&datasets=sua,tfrs,runways,taxiways,obstacles,ats"
+curl --noproxy 127.0.0.1 -s "http://127.0.0.1:18890/api/airspace/lookup?lat=38.94&lon=-77.46&radius_km=20&datasets=sua,tfrs,runways,taxiways,obstacles,ats"
 
 # does the user want to see SUAs while you analyse them?
-curl -sX POST http://127.0.0.1:18890/api/map/layer \
+curl --noproxy 127.0.0.1 -sX POST http://127.0.0.1:18890/api/map/layer \
      -H 'Content-Type: application/json' \
      -d '{"layer":"sua","visible":true}'
 ```
@@ -705,12 +705,12 @@ Four small data feeds make the chart actually useful for live operations:
 
 ```bash
 # Where is it currently IFR/LIFR in the Northeast?
-curl -s "http://127.0.0.1:18890/api/weather/metar?bbox=-80,38,-66,46" \
+curl --noproxy 127.0.0.1 -s "http://127.0.0.1:18890/api/weather/metar?bbox=-80,38,-66,46" \
   | python3 -c "import sys,json; r=json.load(sys.stdin)['stations']; \
                 print([s['station'] for s in r if s['flt_cat'] in ('IFR','LIFR')])"
 
 # Show the layer on the map for the user
-curl -sX POST http://127.0.0.1:18890/api/map/layer -d '{"layer":"metar","visible":true}' -H 'Content-Type: application/json'
+curl --noproxy 127.0.0.1 -sX POST http://127.0.0.1:18890/api/map/layer -d '{"layer":"metar","visible":true}' -H 'Content-Type: application/json'
 ```
 
 `flt_cat` is one of `VFR / MVFR / IFR / LIFR`. Each station record
@@ -728,10 +728,10 @@ flow-control orders, and is unable to detect an active GDP.
 
 ```bash
 # Anything happening right now?
-curl -s http://127.0.0.1:18890/api/nas/status | jq '.by_severity, .events | length'
+curl --noproxy 127.0.0.1 -s http://127.0.0.1:18890/api/nas/status | jq '.by_severity, .events | length'
 
 # Per-airport: "is JFK delayed?"
-curl -s http://127.0.0.1:18890/api/nas/airport/JFK
+curl --noproxy 127.0.0.1 -s http://127.0.0.1:18890/api/nas/airport/JFK
 ```
 
 `severity` ranks `info < advisory < delay < ground_stop < closure`. A
@@ -746,10 +746,10 @@ not a sign the upstream is broken.
 
 ```bash
 # user: "who flies a8ae7e?"
-curl -s http://127.0.0.1:18890/api/registry/a8ae7e
+curl --noproxy 127.0.0.1 -s http://127.0.0.1:18890/api/registry/a8ae7e
 
 # user: "where is UAL123 going?"
-curl -s http://127.0.0.1:18890/api/route/UAL123
+curl --noproxy 127.0.0.1 -s http://127.0.0.1:18890/api/route/UAL123
 ```
 
 `/api/registry` returns registration (e.g. N12345), manufacturer,

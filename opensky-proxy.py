@@ -512,7 +512,7 @@ def _fetch_opensky_states(query: str) -> tuple[dict | None, str]:
             headers["Authorization"] = f"Bearer {token}"
         req = urllib.request.Request(url, method="GET", headers=headers)
         try:
-            with urllib.request.urlopen(req, timeout=6) as resp:
+            with _OPENSKY_OPENER.open(req, timeout=6) as resp:
                 return (json.loads(resp.read().decode("utf-8")), "")
         except urllib.error.HTTPError as e:
             if e.code == 401 and attempt == 1 and token:
@@ -615,7 +615,7 @@ def _passthrough(
 
         req = urllib.request.Request(target, method="GET", headers=headers)
         try:
-            with urllib.request.urlopen(req, timeout=8) as resp:
+            with _OPENSKY_OPENER.open(req, timeout=8) as resp:
                 body = resp.read()
                 handler.send_response(resp.status)
                 ct = resp.headers.get("Content-Type", "application/json")
@@ -666,6 +666,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "routes": list(ROUTES.keys()),
                 "creds_loaded": bool(cid and secret),
                 "creds_path": CREDS_PATH,
+                "egress_proxy": EGRESS_PROXY or None,
             })
             return
 
@@ -780,6 +781,18 @@ def main() -> None:
             sys.stderr.write(
                 f"[opensky-proxy] WARNING: no OPENSKY_CLIENT_ID/SECRET in "
                 f"{CREDS_PATH}; running anonymously (~400 credits/day)\n"
+            )
+        if EGRESS_PROXY:
+            sys.stderr.write(
+                f"[opensky-proxy] OpenSky egress via proxy: {EGRESS_PROXY}\n"
+            )
+        else:
+            sys.stderr.write(
+                "[opensky-proxy] NOTE: no OPENSKY_EGRESS_PROXY set. If this "
+                "host is a cloud/datacenter VM, OpenSky blocks its IP at the "
+                "TCP layer (pre-auth) and every request will time out and fall "
+                "back to community. Set OPENSKY_EGRESS_PROXY to a non-datacenter "
+                "hop, or use FLIGHT_ADSB_SOURCE=community.\n"
             )
         sys.stderr.write(
             f"[opensky-proxy] listening on 0.0.0.0:{port} "

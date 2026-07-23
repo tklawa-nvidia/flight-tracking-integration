@@ -16,7 +16,7 @@ BASE="${FLIGHT_APP_URL:-http://127.0.0.1:18890}"
 
 post_json() {
   local path="$1"; shift
-  curl -fsSL -X POST "${BASE}${path}" \
+  curl --noproxy 127.0.0.1 -fsSL -X POST "${BASE}${path}" \
     -H 'Content-Type: application/json' \
     -d "$1"
 }
@@ -32,7 +32,7 @@ case "$cmd" in
   analyze)
     airport="${1:?usage: fly analyze <airport> [radius_km]}"
     radius="${2:-80}"
-    curl -fsSL "${BASE}/api/analyze?airport=${airport}&radius_km=${radius}"
+    curl --noproxy 127.0.0.1 -fsSL "${BASE}/api/analyze?airport=${airport}&radius_km=${radius}"
     ;;
   arcs)
     airport="${1:?usage: fly arcs <airport> [radius_km]}"
@@ -51,10 +51,10 @@ case "$cmd" in
     ;;
   airport)
     code="${1:?usage: fly airport <iata-or-icao>}"
-    curl -fsSL "${BASE}/api/airport/${code}"
+    curl --noproxy 127.0.0.1 -fsSL "${BASE}/api/airport/${code}"
     ;;
   health)
-    curl -fsSL "${BASE}/api/health"
+    curl --noproxy 127.0.0.1 -fsSL "${BASE}/api/health"
     ;;
   *)
     cat <<EOF
