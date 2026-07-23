@@ -25,6 +25,26 @@ fi
 . "$VENV/bin/activate"
 
 cd "$APP_DIR"
+
+# Free the port from any previous instance BEFORE binding. A reinstall's
+# remote kill can miss an app that a prior session launched (different exec
+# channel / PID view), and uvicorn would then exit with "address already in
+# use" while the STALE build keeps serving — making a fresh install look
+# like it "didn't take". Best-effort, multiple methods, never fatal.
+if command -v fuser >/dev/null 2>&1; then
+  fuser -k "${PORT}/tcp" 2>/dev/null || true
+fi
+for pd in /proc/[0-9]*; do
+  [ -r "$pd/cmdline" ] || continue
+  _c=$(tr '\0' ' ' < "$pd/cmdline" 2>/dev/null)
+  case "$_c" in
+    *uvicorn*server:app*)
+      _p=$(basename "$pd")
+      [ "$_p" = "$$" ] || kill -9 "$_p" 2>/dev/null || true ;;
+  esac
+done
+sleep 1
+
 # Access logs are ON: every /api/* request the OpenClaw agent issues lands in
 # $LOG, so when a skill call returns 4xx/5xx you can grep the log to see the
 # exact method+path+status without having to instrument the agent.

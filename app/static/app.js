@@ -61,6 +61,10 @@ const state = {
     try { return localStorage.getItem('flightSource') || 'community'; }
     catch { return 'community'; }
   })(),
+  // Live-feed metadata reported by the host proxy on each pump: the source
+  // actually served, and whether an OpenSky→community fallback kicked in.
+  feedServed: null,
+  feedFallback: false,
   layerVisibility: {
     flights: true,
     airports: true,
@@ -2928,6 +2932,13 @@ async function pump({ snapshot = false } = {}) {
     ]);
 
     ingestFlights(flightsRes.flights || []);
+    // Relay the source the host proxy actually served. If OpenSky was
+    // requested but is blackholed, the proxy falls back to community and
+    // sets flightsRes.fallback — reflect that in the feed note.
+    const wasFallback = state.feedFallback;
+    state.feedServed = flightsRes.source || null;
+    state.feedFallback = Boolean(flightsRes.fallback);
+    if (state.feedFallback !== wasFallback) renderFlightSourceNote();
     state.airportsInView = airportsRes.airports || [];
     state.airportsTruncated = Boolean(airportsRes.truncated);
 
@@ -3288,7 +3299,15 @@ function renderFlightSourceNote() {
   const rows = caps.lines
     .map(([k, txt]) => `<span class="fs-cap"><span class="${k}">${k === 'ok' ? '✓' : '✗'}</span> ${txt}</span>`)
     .join('<br/>');
-  el.innerHTML = `${rows}<span class="fs-warn">${caps.warn}</span>`;
+  // When OpenSky is selected but blackholed from this cloud IP, the host
+  // proxy transparently serves the community feed and tags the response.
+  // Surface that so the map reads "OpenSky unavailable — community" rather
+  // than looking broken.
+  const fallbackBanner = state.feedFallback
+    ? `<span class="fs-fallback">⚠ OpenSky unavailable from this host — showing community feed`
+      + `${state.feedServed ? ` (${state.feedServed})` : ''}.</span>`
+    : '';
+  el.innerHTML = `${fallbackBanner}${rows}<span class="fs-warn">${caps.warn}</span>`;
 }
 
 async function initFlightSource() {
@@ -4606,13 +4625,23 @@ syncChatToggleUI();
 // Update the live "Agent working…" status line with a present-tense
 // label for the step currently running. Shown regardless of the trace
 // toggle so the turn always feels alive during the model's think time.
-function setWorkingStatus(contentEl, label) {
+function setWorkingStatus(contentEl, label, elapsedS) {
   if (!contentEl) return;
   const safe = String(label || 'Agent working').replace(/[&<>]/g, (c) => (
     { '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]
   ));
+  // A live elapsed counter is what turns a frozen-looking "Agent
+  // working…" into something that visibly ticks. Since openclaw's CLI
+  // has no token-stream mode (only batch --json) there are long silent
+  // stretches while the model thinks BEFORE its first tool call and
+  // while it composes the final reply — those are exactly when the UI
+  // used to look hung. The counter proves the turn is still alive even
+  // when no new progress step has fired yet.
+  const clock = (typeof elapsedS === 'number' && elapsedS >= 1)
+    ? ` <span class="working-elapsed">${elapsedS}s</span>`
+    : '';
   contentEl.innerHTML =
-    `${safe} <span class="thinking-dots"><span></span><span></span><span></span></span>`;
+    `${safe}${clock} <span class="thinking-dots"><span></span><span></span><span></span></span>`;
 }
 
 function summariseTraceItem(item) {
@@ -4702,12 +4731,20 @@ function appendTraceCard(wrap, e) {
 // can't retro-render past events; that's an acceptable trade-off.
 function shouldShowEvent(e) {
   if (!e) return false;
+  // `progress` steps are the synthesised, always-clean "Centering the
+  // map… / Analysing traffic around IAD…" one-liners derived from the
+  // agent's own loopback tool hits. They are the single best cue that
+  // the turn is alive and *making progress* (not just "working"), so we
+  // ALWAYS render them as a live step trail — regardless of the Tool
+  // calls toggle. The bulky raw tool_call/tool_result/planning cards
+  // (raw curl JSON) stay behind the toggle to keep the default demo clean.
+  if (e.kind === 'progress') return true;
   // Planning narration is part of the agent's "decide what to call"
   // step, so it lives under the same Tool calls toggle. Surfacing
   // them together gives the user a coherent "plan → call → result"
   // story for each step.
   if (e.kind === 'tool_call' || e.kind === 'tool_result'
-      || e.kind === 'planning' || e.kind === 'progress') {
+      || e.kind === 'planning') {
     return chatTrace.showTools;
   }
   return false;
@@ -4741,8 +4778,23 @@ elChatForm.addEventListener('submit', async (e) => {
   const traceWrap = document.createElement('div');
   traceWrap.className = 'msg-trace';
   bubble.insertBefore(traceWrap, content);
-  content.innerHTML =
-    'Agent working <span class="thinking-dots"><span></span><span></span><span></span></span>';
+
+  // Live status: the current present-tense label + a ticking elapsed
+  // counter. `workingLabel` is updated in place as `progress` events
+  // arrive; the 1 s heartbeat re-renders it with the running clock so
+  // the bubble never looks frozen during the model's silent think-time
+  // (openclaw has no token stream — see setWorkingStatus).
+  const turnStart = performance.now();
+  let workingLabel = 'Agent working';
+  const renderWorking = () =>
+    setWorkingStatus(content, workingLabel,
+      Math.floor((performance.now() - turnStart) / 1000));
+  renderWorking();
+  const heartbeat = setInterval(renderWorking, 1000);
+  let heartbeatStopped = false;
+  const stopHeartbeat = () => {
+    if (!heartbeatStopped) { clearInterval(heartbeat); heartbeatStopped = true; }
+  };
 
   // Track the latest tool_call card by its call_id so when the
   // matching tool_result arrives we can dock it visually beneath
@@ -4796,7 +4848,8 @@ elChatForm.addEventListener('submit', async (e) => {
           // tool calls) drive the live status line ALWAYS — even with
           // the trace toggle off — so the turn never looks frozen.
           if (msg.kind === 'progress') {
-            setWorkingStatus(content, msg.label);
+            workingLabel = msg.label || workingLabel;
+            renderWorking();
           }
           if (shouldShowEvent(msg)) {
             const card = appendTraceCard(traceWrap, msg);
@@ -4807,13 +4860,16 @@ elChatForm.addEventListener('submit', async (e) => {
           }
         } else if (msg.type === 'done') {
           finalDone = msg;
+          stopHeartbeat();
           break streamLoop;
         } else if (msg.type === 'error') {
           finalErr = msg.error || 'Agent error';
+          stopHeartbeat();
           break streamLoop;
         }
       }
     }
+    stopHeartbeat();
 
     if (finalErr) {
       content.textContent = `Agent error: ${finalErr.slice(0, 320)}`;
@@ -4834,6 +4890,7 @@ elChatForm.addEventListener('submit', async (e) => {
     bubble.remove();
     appendMessage('bot', `Network error talking to OpenClaw: ${err.message}`);
   } finally {
+    stopHeartbeat();
     elChatInput.disabled = false;
     elChatInput.focus();
   }

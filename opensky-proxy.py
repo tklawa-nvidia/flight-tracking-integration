@@ -82,6 +82,24 @@ ROUTES = {
 
 # ── Data-source configuration ───────────────────────────────────────────────
 
+# Optional outbound proxy for OpenSky ONLY. OpenSky blackholes cloud/
+# datacenter IP ranges (AWS/GCP/Azure) at the TCP layer — the SYN is
+# dropped *before* TLS, so the connection never opens and OpenSky never
+# sees your OAuth2 credentials. No amount of authentication fixes that:
+# the block is on the source IP, applied pre-auth. The only way to reach
+# OpenSky from a cloud VM is to egress through a NON-datacenter hop.
+#
+# Set OPENSKY_EGRESS_PROXY to route just the OpenSky token-mint + API
+# calls (NOT the community feeds, which work fine directly) through such
+# a hop while keeping the credentials on the host. Examples:
+#     http://127.0.0.1:8080        (Squid/tinyproxy/Cloudflare-WARP-proxy)
+#     http://user:pass@host:port   (authenticated forward proxy)
+#     socks5h://127.0.0.1:1080     (e.g. `ssh -D 1080 you@home-box`; needs PySocks)
+# For socks5h:// the DNS is resolved at the proxy exit (recommended so
+# opensky-network.org resolves from the non-cloud side). Leave unset to
+# hit OpenSky directly (the default, correct for non-cloud hosts).
+EGRESS_PROXY = os.getenv("OPENSKY_EGRESS_PROXY", "").strip()
+
 RAW_SOURCE = (os.getenv("FLIGHT_ADSB_SOURCE", "community") or "community").strip().lower()
 MAX_RADIUS_NM = float(os.getenv("FLIGHT_ADSB_MAX_NM", "250") or "250")
 DEFAULT_LAT = float(os.getenv("FLIGHT_ADSB_DEFAULT_LAT", "39.5") or "39.5")
@@ -145,6 +163,13 @@ CAPABILITIES = {
 }
 
 USER_AGENT = "FlightOps-NemoClaw-demo/1.0 (+https://github.com/brevdev/nemoclaw-demos)"
+
+# Negative cache: once OpenSky is found unreachable (blackholed cloud IP),
+# skip the slow probe on subsequent polls and serve community directly for
+# this many seconds. Keeps opensky-mode refreshes snappy after the first
+# fallback instead of eating a ~14s timeout every cycle.
+_OPENSKY_DOWN_SECS = 120.0
+_opensky_down_until = 0.0
 
 # Unit conversions to OpenSky's SI state vector.
 _FT_TO_M = 0.3048
@@ -233,7 +258,7 @@ class TokenCache:
             headers={"Content-Type": "application/x-www-form-urlencoded"},
         )
         try:
-            with urllib.request.urlopen(req, timeout=8) as resp:
+            with _OPENSKY_OPENER.open(req, timeout=8) as resp:
                 payload = json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
             sys.stderr.write(
@@ -405,11 +430,27 @@ def _effective_source(qs: dict[str, list[str]]) -> tuple[str, list[str]]:
 
 
 def _serve_states_community(
-    handler: "Handler", qs: dict[str, list[str]], providers: list[str]
+    handler: "Handler",
+    qs: dict[str, list[str]],
+    providers: list[str],
+    requested: str = "community",
+    fallback: bool = False,
 ) -> None:
-    """Answer /api/states/all from the community aggregators."""
+    """Answer /api/states/all from the community aggregators.
+
+    `requested` is the source the caller asked for (e.g. "opensky" when we
+    are here because OpenSky was unreachable and we fell back). `fallback`
+    marks that this community answer is standing in for a failed OpenSky
+    request, so the app/UI can say "OpenSky unavailable — community feed".
+    """
     lat, lon, nm = _bbox_to_circle(qs)
     now = time.time()
+
+    meta_headers = {
+        "X-Flightops-Source": "community",
+        "X-Flightops-Requested": requested,
+        "X-Flightops-Fallback": "1" if fallback else "0",
+    }
 
     last_err: Exception | None = None
     for name in providers:
@@ -429,18 +470,109 @@ def _serve_states_community(
                     states.append(row)
         sys.stderr.write(
             f"[opensky-proxy] states via {name}: {len(states)} aircraft "
-            f"({lat:.2f},{lon:.2f} r={nm}nm)\n"
+            f"({lat:.2f},{lon:.2f} r={nm}nm)"
+            f"{' [opensky-fallback]' if fallback else ''}\n"
         )
-        _send_json(handler, 200, {"time": int(now), "states": states})
+        _send_json(
+            handler, 200,
+            {
+                "time": int(now), "states": states,
+                "source": "community", "requested": requested,
+                "fallback": bool(fallback), "provider": name,
+            },
+            extra_headers={**meta_headers, "X-Flightops-Provider": name},
+        )
         return
 
     _send_json(
         handler, 502,
-        {"error": f"all ADS-B providers failed; last error: {last_err}", "states": []},
+        {
+            "error": f"all ADS-B providers failed; last error: {last_err}",
+            "states": [], "source": "community", "requested": requested,
+            "fallback": bool(fallback),
+        },
+        extra_headers=meta_headers,
     )
 
 
+def _fetch_opensky_states(query: str) -> tuple[dict | None, str]:
+    """Fetch /api/states/all from OpenSky. Returns (payload, err_message).
+
+    On success payload is the parsed JSON dict; on any failure it is None and
+    err_message explains why (used to trigger the community fallback). A short
+    timeout is used deliberately so a blackholed cloud IP falls back fast
+    rather than leaving the map blank for many seconds.
+    """
+    target = ROUTES["/api/states/all"]
+    url = f"{target}?{query}" if query else target
+    for attempt in (1, 2):
+        token = _tokens.get()
+        headers = {"Accept": "application/json"}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        req = urllib.request.Request(url, method="GET", headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                return (json.loads(resp.read().decode("utf-8")), "")
+        except urllib.error.HTTPError as e:
+            if e.code == 401 and attempt == 1 and token:
+                _tokens.invalidate()
+                continue
+            return (None, f"opensky HTTP {e.code} {e.reason}")
+        except (urllib.error.URLError, OSError, json.JSONDecodeError,
+                ValueError) as e:
+            return (None, f"opensky unreachable: {e}")
+    return (None, "opensky retries exhausted")
+
+
 # ── HTTP helpers ────────────────────────────────────────────────────────────
+
+
+def _build_opener() -> urllib.request.OpenerDirector:
+    """Build the urllib opener used for OpenSky calls.
+
+    Without OPENSKY_EGRESS_PROXY this is a plain opener (direct egress).
+    With it, all OpenSky traffic is routed through the configured proxy so
+    a cloud VM can reach OpenSky via a non-datacenter hop. http(s):// proxies
+    need no extra dependencies; socks5(h):// requires PySocks (`pip install
+    PySocks`) and degrades gracefully to direct (→ community fallback) if it
+    isn't installed, with a one-line warning.
+    """
+    if not EGRESS_PROXY:
+        return urllib.request.build_opener()
+    if EGRESS_PROXY.lower().startswith("socks"):
+        try:
+            import socks  # type: ignore  # from PySocks
+            from sockshandler import SocksiPyHandler  # type: ignore
+        except ImportError:
+            sys.stderr.write(
+                "[opensky-proxy] OPENSKY_EGRESS_PROXY is a SOCKS URL but "
+                "PySocks is not installed (`pip install PySocks`); falling "
+                "back to DIRECT egress — OpenSky will likely be unreachable "
+                "and community fallback will serve instead.\n"
+            )
+            return urllib.request.build_opener()
+        parsed = urllib.parse.urlparse(EGRESS_PROXY)
+        # socks5h:// → resolve DNS at the proxy exit (rdns=True); socks5:// → local.
+        rdns = parsed.scheme.lower() in ("socks5h", "socks4a")
+        stype = socks.SOCKS4 if parsed.scheme.lower().startswith("socks4") else socks.SOCKS5
+        return urllib.request.build_opener(
+            SocksiPyHandler(
+                stype, parsed.hostname, parsed.port or 1080, rdns,
+                parsed.username, parsed.password,
+            )
+        )
+    # http:// or https:// forward proxy (CONNECT tunnelling for https targets).
+    return urllib.request.build_opener(
+        urllib.request.ProxyHandler({"http": EGRESS_PROXY, "https": EGRESS_PROXY})
+    )
+
+
+# Built once at import; OpenSky call sites use this instead of the module-level
+# urllib.request.urlopen so the egress proxy (if any) is applied. Community
+# aggregator calls deliberately keep using plain urlopen — they work directly
+# and there's no reason to tunnel them.
+_OPENSKY_OPENER = _build_opener()
 
 
 def _resolve_target(path: str) -> str | None:
@@ -454,11 +586,18 @@ def _resolve_target(path: str) -> str | None:
     return target
 
 
-def _send_json(handler: http.server.BaseHTTPRequestHandler, code: int, obj: dict) -> None:
+def _send_json(
+    handler: http.server.BaseHTTPRequestHandler,
+    code: int,
+    obj: dict,
+    extra_headers: dict[str, str] | None = None,
+) -> None:
     body = json.dumps(obj).encode()
     handler.send_response(code)
     handler.send_header("Content-Type", "application/json")
     handler.send_header("Content-Length", str(len(body)))
+    for k, v in (extra_headers or {}).items():
+        handler.send_header(k, v)
     handler.end_headers()
     handler.wfile.write(body)
 
@@ -536,7 +675,38 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         if parsed.path == "/api/states/all":
             if eff_mode == "opensky":
-                self._passthrough_or_404("/api/states/all", parsed.query)
+                global _opensky_down_until
+                now = time.time()
+                # Skip the slow OpenSky probe if we recently found it down.
+                if now < _opensky_down_until:
+                    _serve_states_community(
+                        self, qs, list(_ALL_PROVIDERS),
+                        requested="opensky", fallback=True,
+                    )
+                    return
+                data, err = _fetch_opensky_states(parsed.query)
+                if data is not None:
+                    _opensky_down_until = 0.0
+                    data.setdefault("source", "opensky")
+                    data.setdefault("requested", "opensky")
+                    data.setdefault("fallback", False)
+                    _send_json(self, 200, data, extra_headers={
+                        "X-Flightops-Source": "opensky",
+                        "X-Flightops-Requested": "opensky",
+                        "X-Flightops-Fallback": "0",
+                    })
+                    return
+                # OpenSky failed/blackholed — remember it (negative cache) and
+                # fall back to community so the map keeps showing planes.
+                _opensky_down_until = now + _OPENSKY_DOWN_SECS
+                sys.stderr.write(
+                    f"[opensky-proxy] opensky states failed ({err}); serving "
+                    f"community for {int(_OPENSKY_DOWN_SECS)}s\n"
+                )
+                _serve_states_community(
+                    self, qs, list(_ALL_PROVIDERS),
+                    requested="opensky", fallback=True,
+                )
             else:
                 _serve_states_community(self, qs, eff_providers)
             return

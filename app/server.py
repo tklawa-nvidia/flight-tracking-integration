@@ -575,6 +575,15 @@ def _decode_state(row: list[Any]) -> dict[str, Any] | None:
 # analyse community data while the operator's map shows OpenSky.
 _active_source: str | None = None
 
+# Most recent feed metadata reported by the host proxy (source actually
+# served, the source requested, and whether an OpenSky→community fallback
+# happened). Relayed to the UI so it can distinguish "community by choice"
+# from "OpenSky unavailable — using community".
+_last_feed_meta: dict[str, Any] = {
+    "source": "community", "requested": "community",
+    "fallback": False, "provider": None,
+}
+
 
 async def fetch_flights(
     bbox: tuple[float, float, float, float] | None = None,
@@ -589,6 +598,7 @@ async def fetch_flights(
     server-wide `_active_source`. Cache is keyed per provider so switching
     sources doesn't serve a stale cross-source snapshot.
     """
+    global _last_feed_meta
     if _http is None:
         raise RuntimeError("HTTP client not initialised")
 
@@ -599,7 +609,7 @@ async def fetch_flights(
     key = f"{provider}|{bkey}" if provider else bkey
     cached = await _cache.get(key)
     if cached is not None:
-        return {"flights": cached, "fetched_from": "cache"}
+        return {"flights": cached, "fetched_from": "cache", **_last_feed_meta}
 
     params: dict[str, Any] = {}
     if bbox is not None:
@@ -631,8 +641,26 @@ async def fetch_flights(
         if decoded is not None:
             flights.append(decoded)
 
+    # Surface the source the host proxy actually served. When OpenSky is
+    # unreachable (blackholed from cloud IPs) the proxy transparently falls
+    # back to the community feeds and tags the response; we relay that so the
+    # UI can say "OpenSky unavailable — community" instead of going blank.
+    served = payload.get("source") or (provider or "community")
+    requested_src = payload.get("requested") or (provider or _active_source or "community")
+    _last_feed_meta = {
+        "source": served,
+        "requested": requested_src,
+        "fallback": bool(payload.get("fallback", False)),
+        "provider": payload.get("provider"),
+    }
+
     await _cache.set(key, flights)
-    return {"flights": flights, "fetched_from": "live", "fetched_at": payload.get("time")}
+    return {
+        "flights": flights,
+        "fetched_from": "live",
+        "fetched_at": payload.get("time"),
+        **_last_feed_meta,
+    }
 
 
 # ── Per-aircraft flight lookups ─────────────────────────────────────────────
@@ -2899,6 +2927,9 @@ async def health() -> dict[str, Any]:
         "openclaw_agent": OPENCLAW_AGENT,
         "openclaw_agent_home": OPENCLAW_AGENT_HOME,
         "openclaw_sessions_dir_exists": Path(OPENCLAW_SESSIONS_DIR).is_dir(),
+        "live_source_selected": _active_source or "community",
+        "live_source_served": _last_feed_meta.get("source"),
+        "live_source_fallback": bool(_last_feed_meta.get("fallback")),
     }
 
 
@@ -2954,6 +2985,8 @@ async def api_sources():
     return {
         "default": "community",
         "current": _active_source or "community",
+        "served": _last_feed_meta.get("source"),
+        "fallback": bool(_last_feed_meta.get("fallback")),
         "sources": [
             {"id": "community",      "label": "Community · auto",  "group": "community",
              "note": "adsb.fi → airplanes.live → adsb.lol, first to answer wins"},

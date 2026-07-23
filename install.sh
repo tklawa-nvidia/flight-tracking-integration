@@ -66,6 +66,14 @@ FAA_PROXY_PORT="${FAA_PROXY_PORT:-9203}"
 #     default so planes show out of the box.
 #   "opensky" — legacy OAuth2 path to opensky-network.org (needs creds and
 #     an egress IP OpenSky accepts; use only on non-cloud hosts).
+# Record whether the source was pinned explicitly (env/flag) BEFORE we apply
+# the default — lets the interactive wizard offer a choice only when the user
+# didn't already decide (and stay non-interactive for CI / piped installs).
+if [ -n "${FLIGHT_ADSB_SOURCE:-}" ]; then
+  FLIGHT_ADSB_SOURCE_EXPLICIT=1
+else
+  FLIGHT_ADSB_SOURCE_EXPLICIT=0
+fi
 FLIGHT_ADSB_SOURCE="${FLIGHT_ADSB_SOURCE:-community}"
 # Gateway name registered with `nemoclaw onboard`. "nemoclaw" is the
 # convention; override via OPENSHELL_GATEWAY=<name> if you renamed it.
@@ -586,6 +594,28 @@ prompt_for_creds() {
   fi
 }
 
+# ── Live-feed onboarding wizard ─────────────────────────────────────────────
+# When the operator hasn't pinned a source (no FLIGHT_ADSB_SOURCE env/flag)
+# and we're on an interactive TTY, offer a friendly choice. Whatever they
+# pick, the host proxy ALWAYS auto-falls-back to the community feeds if
+# OpenSky is unreachable — so a hackathon attendee can never end up with a
+# blank map. Non-interactive / piped installs keep the safe community default.
+if [ "$FLIGHT_ADSB_SOURCE_EXPLICIT" != "1" ] && [ -t 0 ]; then
+  echo
+  info "Choose the live-aircraft data feed:"
+  printf "      1) Community feeds  — no account, works from cloud/VM  (recommended)\n"
+  printf "      2) OpenSky          — enter credentials (full history; often blocked\n"
+  printf "                            from cloud IPs → auto-falls back to community)\n"
+  printf "    Selection [1]: "
+  read -r _feed_choice
+  case "${_feed_choice:-1}" in
+    2) FLIGHT_ADSB_SOURCE="opensky"
+       ok "Selected OpenSky (with automatic community fallback if unreachable)." ;;
+    *) FLIGHT_ADSB_SOURCE="community"
+       ok "Selected community feeds — no credentials needed." ;;
+  esac
+fi
+
 if [ "$FLIGHT_ADSB_SOURCE" = "community" ]; then
   echo
   ok "Live-aircraft data source: community ADS-B feeds (adsb.fi / airplanes.live / adsb.lol)"
@@ -1024,8 +1054,10 @@ info "Starting FlightOps server inside the sandbox on port $PORT…"
 # step walks /proc directly (always available, always sees our own
 # UID's processes regardless of session).
 
-# 9a — kill any prior uvicorn serving this app.
-ssh_sandbox 'for pd in /proc/[0-9]*; do pid=$(basename "$pd"); [ -r "$pd/cmdline" ] || continue; cmd=$(tr "\0" " " < "$pd/cmdline" 2>/dev/null); case "$cmd" in *uvicorn*server:app*) kill -9 "$pid" 2>/dev/null || true ;; esac; done; sleep 1; true' \
+# 9a — kill any prior uvicorn serving this app. Belt-and-braces: kill by
+# port (fuser, shared network view) AND by /proc scan, so a stale build
+# from a prior session can't keep the port and silently serve old code.
+ssh_sandbox 'p="'"$PORT"'"; (command -v fuser >/dev/null 2>&1 && fuser -k "${p}/tcp" 2>/dev/null) || true; for pd in /proc/[0-9]*; do pid=$(basename "$pd"); [ -r "$pd/cmdline" ] || continue; cmd=$(tr "\0" " " < "$pd/cmdline" 2>/dev/null); case "$cmd" in *uvicorn*server:app*) kill -9 "$pid" 2>/dev/null || true ;; esac; done; sleep 1; true' \
   || true
 
 # 9b — truncate the log + launch start.sh detached. Inline one-
