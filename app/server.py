@@ -38,6 +38,7 @@ import base64
 import json
 import math
 import os
+import re
 import shutil
 import time
 from collections import deque
@@ -2267,6 +2268,74 @@ def _extract_reply(payload: dict[str, Any]) -> tuple[str, str | None]:
     return reply, sid
 
 
+# Node/OpenClaw prints benign warnings to stderr (undici experimental
+# flags, trace-warnings hints, etc.) that have nothing to do with why a
+# turn failed. If we surface the *tail* of stderr verbatim on a non-zero
+# exit, the user sees "EnvHttpProxyAgent is experimental…" — pure noise
+# that hides the real cause (which is usually an inference-provider error
+# echoed in the agent's JSON stdout, not on stderr at all).
+_STDERR_NOISE_RE = re.compile(
+    r"""^\s*(?:
+        \(node:\d+\)\s |                      # (node:123) …  runtime warnings
+        \(Use\s`node\s--trace-warnings |      # the "how to trace" follow-up line
+        .*ExperimentalWarning |
+        .*\[UNDICI-[A-Z]+\]                    # undici EnvHttpProxyAgent etc.
+    )""",
+    re.VERBOSE,
+)
+
+
+def _clean_stderr(raw: str) -> str:
+    """Drop benign node/undici warning lines so what's left is signal."""
+    lines = [ln for ln in raw.splitlines()
+             if ln.strip() and not _STDERR_NOISE_RE.search(ln)]
+    return "\n".join(lines).strip()
+
+
+# Inference-backend failures the agent can hit that are NOT the app's fault
+# and NOT actionable by the user editing anything — surface a short, honest
+# hint instead of a raw 500 / stack fragment. Keyed by a substring probe.
+_INFRA_ERROR_HINTS: list[tuple[str, str]] = [
+    ("Worker local total request limit reached",
+     "The inference backend (NVIDIA nemotron worker) hit its request limit "
+     "and is temporarily rate-limited — this is the model service, not "
+     "FlightOps. Wait a few seconds and try again."),
+    ("ResourceExhausted",
+     "The inference backend is temporarily out of capacity (ResourceExhausted). "
+     "Retry in a moment; if it persists, the model provider is rate-limiting."),
+    ("chain_exhausted",
+     "The model and all configured fallbacks failed for this turn (usually a "
+     "transient inference timeout/rate-limit). Try again."),
+]
+
+
+def _diagnose_agent_failure(returncode: int, stdout: str, stderr: str) -> str:
+    """Build a legible failure message from a non-zero `openclaw agent` exit.
+
+    Priority: (1) a known inference-infra error found anywhere in the output
+    → a friendly hint; (2) any error text the agent echoed on stdout (often
+    JSON with a `status`/`error`); (3) the de-noised stderr; (4) a generic
+    fallback. Keeps the user from seeing only undici warnings when the real
+    cause is an upstream 500.
+    """
+    haystack = f"{stdout}\n{stderr}"
+    for probe, hint in _INFRA_ERROR_HINTS:
+        if probe in haystack:
+            return hint
+    clean_err = _clean_stderr(stderr)
+    stdout_err = ""
+    s = stdout.strip()
+    if s:
+        try:
+            doc = json.loads(s[s.find("{"):]) if "{" in s else {}
+            stdout_err = (doc.get("error") or doc.get("summary")
+                          or ((doc.get("result") or {}).get("error")) or "")
+        except Exception:
+            stdout_err = ""
+    detail = stdout_err or clean_err or "no error detail on stderr/stdout"
+    return f"agent exited {returncode}: {detail[:500]}"
+
+
 # Cap on how much of a tool-result body we surface to the chat UI.
 # Some tools (e.g. /api/flights without a bbox, /api/airports CONUS)
 # return >500 KB of JSON which would balloon the chat payload and
@@ -2522,10 +2591,11 @@ async def call_openclaw_agent(
         raise HTTPException(status_code=504, detail="openclaw agent timed out") from None
 
     if proc.returncode != 0:
-        err = (stderr or b"").decode("utf-8", errors="replace")[-1500:]
+        err = (stderr or b"").decode("utf-8", errors="replace")
+        out = (stdout or b"").decode("utf-8", errors="replace")
         raise HTTPException(
             status_code=502,
-            detail=f"openclaw agent exited {proc.returncode}: {err.strip()}",
+            detail=_diagnose_agent_failure(proc.returncode, out, err),
         )
 
     raw = (stdout or b"").decode("utf-8", errors="replace").strip()
@@ -4324,10 +4394,11 @@ async def api_chat_stream(body: ChatRequest):
                     await queue.put({"type": "event", **ev})
 
             if proc.returncode != 0:
-                err = bytes(stderr_buf).decode("utf-8", errors="replace")[-1500:]
+                err = bytes(stderr_buf).decode("utf-8", errors="replace")
+                out = bytes(stdout_buf).decode("utf-8", errors="replace")
                 await queue.put({
                     "type":  "error",
-                    "error": f"agent exited {proc.returncode}: {err.strip()[:500]}",
+                    "error": _diagnose_agent_failure(proc.returncode, out, err),
                 })
                 return
 
