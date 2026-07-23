@@ -98,6 +98,13 @@
 
         <div class="tab-panel" id="tab-layers" role="tabpanel" hidden>
           <label class="toggle"><input type="checkbox" id="layer-flights" checked /><span>Live aircraft</span></label>
+          <div class="flight-source" id="flight-source-wrap">
+            <div class="fs-row">
+              <label class="fs-label" for="flight-source">Data feed</label>
+              <select class="fs-select" id="flight-source" aria-describedby="flight-source-note"></select>
+            </div>
+            <div class="fs-note" id="flight-source-note" role="status" aria-live="polite"></div>
+          </div>
           <label class="toggle"><input type="checkbox" id="layer-airports" checked /><span>Airports</span></label>
           <label class="toggle"><input type="checkbox" id="layer-paths" /><span>Flight paths <em>(zoom in)</em></span></label>
           <label class="toggle"><input type="checkbox" id="layer-arcs" /><span>Inbound arcs</span></label>

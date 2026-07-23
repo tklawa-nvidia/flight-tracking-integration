@@ -1,49 +1,120 @@
 #!/usr/bin/env bash
 # Flight Tracking Integration — sandbox installer (Tier-1 host-proxy).
 #
-# This installer takes the same approach as the Planet integration:
-# OpenSky OAuth2 credentials live ONLY on the host, in
-# ~/.nemoclaw/credentials.json (chmod 600). A small Python daemon
-# (`opensky-proxy.py`) runs on the host, mints/refreshes Bearer tokens
-# itself, and forwards the sandbox's calls to opensky-network.org. The
-# sandbox process only knows the proxy URL — never the client_id or
-# secret. A sandbox compromise therefore cannot exfiltrate the key.
+# What this does:
+#   1. Detect the OpenClaw sandbox layout. Two are supported:
+#         New (openshell ≥ 0.0.44 / openclaw ≥ 2026.5.x):
+#           config:  /sandbox/.openclaw/openclaw.json
+#           skills:  /sandbox/.openclaw/skills/
+#           agents:  /sandbox/.openclaw/agents/<agent>/
+#         Legacy (older builds):
+#           skills:  /sandbox/.openclaw-data/skills/
+#           agents:  /sandbox/.openclaw-data/agents/<agent>/
+#      The FastAPI server + venv always live under
+#      /sandbox/.openclaw-data/flight-tracking/ (host-managed data
+#      area, present on both layouts) so a reinstall never rebuilds
+#      the venv.
+#   2. Read OpenSky creds from ~/.nemoclaw/credentials.json (Tier-1
+#      source of truth) and refresh the openshell provider record.
+#   3. Start the two host-side proxies (opensky-proxy.py:9202 and
+#      faa-proxy.py:9203). They mint Bearer tokens / IP-rewrap on
+#      the host so the sandbox never sees OpenSky secrets and never
+#      egresses from the gateway ASN.
+#   4. Apply the Tier-1 network policy: sandbox can reach the host
+#      proxies + FAA ArcGIS / TFR direct, but NOT opensky-network.org
+#      or auth.opensky-network.org.
+#   5. Stage server.py + static assets + venv inside the sandbox.
+#   6. Write flight.env with proxy URLs + the detected OPENCLAW_AGENT_HOME
+#      so server.py reads the right sessions/JSONL files.
+#   7. On the new layout: enable the flight-tracking skill in
+#      openclaw.json and ensure tools.profile=coding so the chat
+#      agent gets the `exec` tool in its system prompt (without
+#      this it spins out searching for tools that aren't surfaced).
+#   8. Install + start the systemd-user tunnel (or fall back to
+#      `openshell forward`) so the browser can reach
+#      http://localhost:18890.
 #
-# Steps performed:
-#   1. Read OpenSky creds from credentials.json (prompt if missing).
-#   2. (Optionally) refresh the openshell provider record (gateway).
-#   3. Start/restart `opensky-proxy.py` on the host (port 9202).
-#   4. Detect the host's primary IP and write a network policy that
-#      lets the sandbox reach <HOST_IP>:9202 (and ARCGIS / TFR), but
-#      NOT opensky-network.org / auth.opensky-network.org directly.
-#   5. Stage server files into the sandbox.
-#   6. Render flight.env with OPENSKY_PROXY_URL only — no keys.
-#   7. Build venv, restart uvicorn, set up the openshell forward.
+# Tested compat matrix:
+#   openshell 0.0.44 + openclaw 2026.5.18         (current — new layout)
+#   older openshell pre-skill-registry builds     (legacy layout)
+#
+# Operational flags (all optional; defaults are safe to use):
+#   ./install.sh [sandbox-name]
+#   ./install.sh --status        Print current install + proxy state and exit
+#   ./install.sh --uninstall     Stop proxies, drop policy block, remove
+#                                skill + app from sandbox, stop tunnel
+#   ./install.sh --update-creds  Force-prompt for new OpenSky creds
+#   ./install.sh --skip-systemd  Don't touch the systemd-user tunnel
+#                                (also via SKIP_SYSTEMD_TUNNEL=1)
+#   ./install.sh --port N        Override the FastAPI port (default 18890,
+#                                also via FLIGHT_APP_PORT=N)
+#   ./install.sh -h | --help     Show this help
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-SANDBOX_NAME="${1:-${OPENSHELL_SANDBOX:-}}"
+INSTALL_DIR="$HOME/.nemoclaw/flight-tracking"
+
 PORT="${FLIGHT_APP_PORT:-18890}"
 OPENSKY_PROXY_PORT="${OPENSKY_PROXY_PORT:-9202}"
+FAA_PROXY_PORT="${FAA_PROXY_PORT:-9203}"
+# Live-aircraft data source for the host proxy:
+#   "community" (default) — free, no-auth ADS-B aggregators (adsb.fi /
+#     airplanes.live / adsb.lol). These are reachable from cloud/VM IPs.
+#     OpenSky blackholes datacenter IP ranges (AWS/GCP/Azure), so from a
+#     brev VM opensky-network.org is unreachable — hence community is the
+#     default so planes show out of the box.
+#   "opensky" — legacy OAuth2 path to opensky-network.org (needs creds and
+#     an egress IP OpenSky accepts; use only on non-cloud hosts).
+FLIGHT_ADSB_SOURCE="${FLIGHT_ADSB_SOURCE:-community}"
 # Gateway name registered with `nemoclaw onboard`. "nemoclaw" is the
 # convention; override via OPENSHELL_GATEWAY=<name> if you renamed it.
 GATEWAY_NAME="${OPENSHELL_GATEWAY:-nemoclaw}"
 # Skip the systemd-user tunnel install (e.g. on macOS hosts that don't
 # have systemd-user — the script will fall back to `openshell forward`).
 SKIP_SYSTEMD_TUNNEL="${SKIP_SYSTEMD_TUNNEL:-0}"
+# Optional public "Brev link" forward: a second, reboot-persistent
+# systemd-user unit that binds 0.0.0.0:$BREV_FORWARD_PORT -> sandbox app,
+# so Brev can publish the console as a secure link
+# (*.apps.run.brev.nvidia.com). Off by default because 0.0.0.0 exposes
+# the app on the VM's network; enable with --brev-link (optionally
+# --brev-link <port>) or ENABLE_BREV_FORWARD=1. The loopback
+# flight-tunnel.service (localhost) is always installed regardless.
+ENABLE_BREV_FORWARD="${ENABLE_BREV_FORWARD:-0}"
+BREV_FORWARD_PORT="${BREV_FORWARD_PORT:-18891}"
 
 CREDS_PATH="$HOME/.nemoclaw/credentials.json"
-ONBOARD_PATH="$HOME/.nemoclaw/onboard-session.json"
+
+# App dir stays in .openclaw-data (host-managed data area, present on
+# both layouts) so reinstalls don't blow away the venv.
 SANDBOX_BASE="/sandbox/.openclaw-data/flight-tracking"
-SKILLS_BASE="/sandbox/.openclaw-data/skills"
-SESSIONS_PATH="/sandbox/.openclaw-data/agents/main/sessions/sessions.json"
+
+# Skills + agent home + openclaw.json are layout-dependent; populated
+# by detect_paths() below once SANDBOX_NAME is known.
+LAYOUT=""
+SKILLS_BASE=""
+OPENCLAW_AGENT_HOME=""
+OPENCLAW_JSON=""
 
 CYAN='\033[0;36m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; NC='\033[0m'
 info()  { printf "${CYAN}  ▸ %s${NC}\n" "$1"; }
 ok()    { printf "${GREEN}  ✓ %s${NC}\n" "$1"; }
 warn()  { printf "${YELLOW}  ⚠ %s${NC}\n" "$1"; }
 fail()  { printf "${RED}  ✗ %s${NC}\n" "$1"; exit 1; }
+
+# ── openshell binary discovery ──────────────────────────────────────────
+# Avoids relying on PATH being correctly set in non-interactive shells
+# (cron jobs, systemd ExecStartPre hooks, MCP-spawned invocations).
+OPENSHELL_BIN=""
+for candidate in \
+  "$(command -v openshell 2>/dev/null || true)" \
+  "$HOME/.local/bin/openshell" \
+  "/usr/local/bin/openshell" \
+  "/usr/bin/openshell"; do
+  if [ -n "$candidate" ] && [ -x "$candidate" ]; then
+    OPENSHELL_BIN="$candidate"; break
+  fi
+done
 
 ssh_sandbox() {
   # -F /dev/null skips system-wide SSH config; some cloud images ship
@@ -52,21 +123,82 @@ ssh_sandbox() {
   ssh -F /dev/null \
       -o StrictHostKeyChecking=no \
       -o UserKnownHostsFile=/dev/null \
+      -o GlobalKnownHostsFile=/dev/null \
       -o LogLevel=ERROR \
-      -o ProxyCommand="openshell ssh-proxy --gateway-name $GATEWAY_NAME --name $SANDBOX_NAME" \
+      -o ConnectTimeout=15 \
+      -o ProxyCommand="$OPENSHELL_BIN ssh-proxy --gateway-name $GATEWAY_NAME --name $SANDBOX_NAME" \
       "sandbox@openshell-$SANDBOX_NAME" "$@"
 }
 
-cat <<EOF
+usage_exit() {
+  cat <<EOF
 
-  ╔════════════════════════════════════════════════════════════╗
-  ║  FlightOps — Flight Tracking Integration installer        ║
-  ║  Live aircraft on a deck.gl + MapLibre console           ║
-  ╚════════════════════════════════════════════════════════════╝
+  Usage: ./install.sh [options] [sandbox-name]
+
+  Options:
+    --status               Print install + proxy state and exit
+    --uninstall            Remove sandbox-side install, stop proxies + tunnel
+    --update-creds         Force-prompt for new OpenSky OAuth2 credentials
+    --skip-systemd         Don't touch the systemd-user tunnel
+    --brev-link [<port>]   Also install a reboot-persistent 0.0.0.0 forward
+                           (default port 18891) so Brev can publish a secure
+                           link. Loopback/localhost access is unaffected.
+    --port <N>             FastAPI port (default 18890)
+    --opensky-port <N>     opensky-proxy port (default 9202)
+    --faa-port <N>         faa-proxy port (default 9203)
+    -h, --help             Show this help
+
+  Env vars:
+    OPENSHELL_GATEWAY      Gateway name registered with nemoclaw onboard
+                           (default "nemoclaw")
+    OPENSHELL_SANDBOX      Default sandbox name when positional is omitted
+    OPENSKY_PROXY_HOST     Override auto-detected host IP for sandbox→host bridge
+    FLIGHT_APP_PORT        FastAPI port (default 18890)
+    SKIP_SYSTEMD_TUNNEL    Set to 1 to skip systemd-user tunnel install
+    FLIGHT_ADSB_SOURCE     Live-aircraft source: community (default) | opensky
+    ENABLE_BREV_FORWARD    Set to 1 to install the public 0.0.0.0 Brev forward
+    BREV_FORWARD_PORT      Public port for the Brev forward (default 18891)
 
 EOF
+  exit 0
+}
 
-# ── 0. Sandbox name ─────────────────────────────────────────────────────
+# ── 0a. Parse args ──────────────────────────────────────────────────────
+SANDBOX_NAME=""
+DO_STATUS=false
+DO_UNINSTALL=false
+FORCE_UPDATE_CREDS=false
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --status)        DO_STATUS=true;        shift ;;
+    --uninstall)     DO_UNINSTALL=true;     shift ;;
+    --update-creds)  FORCE_UPDATE_CREDS=true; shift ;;
+    --skip-systemd)  SKIP_SYSTEMD_TUNNEL=1; shift ;;
+    --brev-link)
+      ENABLE_BREV_FORWARD=1
+      # Optional numeric port may follow (e.g. --brev-link 18895).
+      case "${2:-}" in
+        ''|--*) ;;
+        *[!0-9]*) fail "--brev-link port must be numeric: $2" ;;
+        *) BREV_FORWARD_PORT="$2"; shift ;;
+      esac
+      shift ;;
+    --port)          PORT="${2:?--port needs a value}"; shift 2 ;;
+    --opensky-port)  OPENSKY_PROXY_PORT="${2:?--opensky-port needs a value}"; shift 2 ;;
+    --faa-port)      FAA_PROXY_PORT="${2:?--faa-port needs a value}"; shift 2 ;;
+    -h|--help)       usage_exit ;;
+    -*)              fail "Unknown option: $1 (try --help)" ;;
+    *)
+      if [ -z "$SANDBOX_NAME" ]; then SANDBOX_NAME="$1"; shift
+      else fail "Unknown argument: $1"; fi ;;
+  esac
+done
+
+# Sandbox name from positional, env, or sandboxes.json default.
+if [ -z "$SANDBOX_NAME" ]; then
+  SANDBOX_NAME="${OPENSHELL_SANDBOX:-}"
+fi
 if [ -z "$SANDBOX_NAME" ]; then
   SANDBOX_NAME=$(python3 -c "
 import json, os
@@ -77,19 +209,318 @@ except Exception:
     pass
 " 2>/dev/null || true)
 fi
-if [ -z "$SANDBOX_NAME" ]; then
+if [ -z "$SANDBOX_NAME" ] && [ "$DO_STATUS" != true ]; then
   printf "  Sandbox name: "
   read -r SANDBOX_NAME
 fi
+
+# ── 0b. Path detection ──────────────────────────────────────────────────
+# Run a SINGLE round-trip into the sandbox to figure out which layout is
+# in play. Result is cached in the LAYOUT/SKILLS_BASE/OPENCLAW_AGENT_HOME/
+# OPENCLAW_JSON globals.
+#
+# Decision logic:
+#   * /sandbox/.openclaw/openclaw.json exists  → new layout (canonical)
+#   * /sandbox/.openclaw-data/agents/ exists   → legacy layout
+#   * neither                                  → assume new (best-guess
+#     for fresh-onboard sandboxes; harmless if openclaw.json is absent
+#     — the registry-update step no-ops with a warning)
+detect_paths() {
+  if [ -z "$SANDBOX_NAME" ] || [ -z "$OPENSHELL_BIN" ]; then
+    LAYOUT="new"
+    SKILLS_BASE="/sandbox/.openclaw/skills"
+    OPENCLAW_AGENT_HOME="/sandbox/.openclaw/agents/main"
+    OPENCLAW_JSON="/sandbox/.openclaw/openclaw.json"
+    return 0
+  fi
+  local probe
+  probe=$(ssh_sandbox '
+    if [ -f /sandbox/.openclaw/openclaw.json ]; then echo new
+    elif [ -d /sandbox/.openclaw-data/agents ]; then echo legacy
+    elif [ -d /sandbox/.openclaw/agents ]; then echo new
+    else echo unknown
+    fi' 2>/dev/null || echo unknown)
+  case "$probe" in
+    new)
+      LAYOUT="new"
+      SKILLS_BASE="/sandbox/.openclaw/skills"
+      OPENCLAW_AGENT_HOME="/sandbox/.openclaw/agents/main"
+      OPENCLAW_JSON="/sandbox/.openclaw/openclaw.json"
+      ;;
+    legacy)
+      LAYOUT="legacy"
+      SKILLS_BASE="/sandbox/.openclaw-data/skills"
+      OPENCLAW_AGENT_HOME="/sandbox/.openclaw-data/agents/main"
+      OPENCLAW_JSON=""
+      ;;
+    *)
+      # Sandbox unreachable / not yet onboarded. Default to new but warn.
+      LAYOUT="new"
+      SKILLS_BASE="/sandbox/.openclaw/skills"
+      OPENCLAW_AGENT_HOME="/sandbox/.openclaw/agents/main"
+      OPENCLAW_JSON="/sandbox/.openclaw/openclaw.json"
+      ;;
+  esac
+}
+
+# ── 0c. openclaw.json mutation (new layout only) ────────────────────────
+# Enables flight-tracking in the skill registry and ensures
+# tools.profile=coding so the agent gets the exec/read tools surfaced in
+# the system prompt. Without tools.profile=coding the agent never sees
+# exec and "spins out" looking for the right tool to call.
+#
+# Idempotent. No-op on legacy layouts that don't carry openclaw.json.
+configure_openclaw_json() {
+  [ -z "$OPENCLAW_JSON" ] && return 0
+  if ! ssh_sandbox "[ -f $OPENCLAW_JSON ]" 2>/dev/null; then
+    warn "$OPENCLAW_JSON not found; skipping skill-registry + tools-profile update"
+    return 0
+  fi
+  local result
+  result=$(ssh_sandbox "python3 - <<'PYEOF'
+import json
+p = '$OPENCLAW_JSON'
+d = json.load(open(p))
+changed = False
+
+entry = d.setdefault('skills', {}).setdefault('entries', {}).setdefault('flight-tracking', {})
+if entry.get('enabled') is not True:
+    entry['enabled'] = True
+    changed = True
+
+tools = d.setdefault('tools', {})
+if tools.get('profile') is None:
+    tools['profile'] = 'coding'
+    changed = True
+elif tools.get('profile') != 'coding':
+    print('warn-profile:' + str(tools.get('profile')))
+
+if changed:
+    json.dump(d, open(p, 'w'), indent=2)
+    print('updated')
+else:
+    print('already configured')
+PYEOF" 2>/dev/null || echo error)
+  case "$result" in
+    updated)            ok "openclaw.json: enabled flight-tracking + tools.profile=coding" ;;
+    *already*)          ok "openclaw.json: flight-tracking + tools.profile already set" ;;
+    *warn-profile:*)    warn "openclaw.json: tools.profile is '${result##*:}' (expected 'coding'); leaving as-is" ;;
+    *)                  warn "openclaw.json mutation failed; agent may not see flight-tracking. Run with --status to verify." ;;
+  esac
+}
+
+# ── --status mode ───────────────────────────────────────────────────────
+if [ "$DO_STATUS" = true ]; then
+  echo
+  echo -e "${CYAN}  FlightOps Integration — status${NC}"
+  echo
+  if [ -f "$INSTALL_DIR/config.env" ]; then
+    # shellcheck disable=SC1091
+    . "$INSTALL_DIR/config.env"
+    ok "Installed"
+    echo "    Sandbox:        ${FLIGHT_SANDBOX:-unknown}"
+    echo "    Layout:         ${FLIGHT_LAYOUT:-unknown}"
+    echo "    Skills:         ${FLIGHT_SKILLS_BASE:-unknown}/flight-tracking/"
+    echo "    Agent home:     ${FLIGHT_OPENCLAW_AGENT_HOME:-unknown}"
+    echo "    Host IP:        ${FLIGHT_HOST_IP:-unknown}"
+    echo "    App port:       ${FLIGHT_PORT:-unknown}"
+    echo "    OpenSky proxy:  ${FLIGHT_OPENSKY_PROXY_PORT:-unknown}"
+    echo "    Live data src:  ${FLIGHT_ADSB_SOURCE:-community}"
+    echo "    FAA proxy:      ${FLIGHT_FAA_PROXY_PORT:-unknown}"
+    echo "    Installed at:   ${FLIGHT_INSTALLED_AT:-unknown}"
+  else
+    warn "Not installed (no $INSTALL_DIR/config.env)"
+  fi
+  echo
+  OS_PID=$(pgrep -f "python3.*opensky-proxy\.py" 2>/dev/null | head -1 || true)
+  FA_PID=$(pgrep -f "python3.*faa-proxy\.py" 2>/dev/null | head -1 || true)
+  [ -n "$OS_PID" ] && ok "opensky-proxy running (PID $OS_PID)" || warn "opensky-proxy NOT running"
+  [ -n "$FA_PID" ] && ok "faa-proxy running (PID $FA_PID)"     || warn "faa-proxy NOT running"
+  if curl -fsS -o /dev/null --max-time 2 \
+        "http://127.0.0.1:${OPENSKY_PROXY_PORT}/health" 2>/dev/null; then
+    ok "opensky-proxy /health passed"
+  else
+    warn "opensky-proxy /health failed"
+  fi
+  if curl -fsS -o /dev/null --max-time 2 \
+        "http://127.0.0.1:${FAA_PROXY_PORT}/health" 2>/dev/null; then
+    ok "faa-proxy /health passed"
+  else
+    warn "faa-proxy /health failed"
+  fi
+  echo
+  if [ "${FLIGHT_ADSB_SOURCE:-community}" = "community" ]; then
+    ok "Live data via community ADS-B feeds — no OpenSky credentials required"
+  elif [ -f "$CREDS_PATH" ]; then
+    HAS=$(python3 -c "import json; d=json.load(open('$CREDS_PATH')); print('yes' if (d.get('OPENSKY_CLIENT_ID') and d.get('OPENSKY_CLIENT_SECRET')) else 'no')" 2>/dev/null || echo no)
+    [ "$HAS" = "yes" ] && ok "OPENSKY_CLIENT_ID/SECRET present in $CREDS_PATH" \
+                       || warn "OPENSKY OAuth2 creds missing from $CREDS_PATH (anonymous fallback)"
+  else
+    warn "$CREDS_PATH does not exist"
+  fi
+  echo
+  # Systemd tunnel state if installed.
+  if command -v systemctl >/dev/null 2>&1 && \
+     systemctl --user list-unit-files flight-tunnel.service 2>/dev/null \
+       | grep -q '^flight-tunnel.service'; then
+    if systemctl --user is-active --quiet flight-tunnel.service 2>/dev/null; then
+      ok "flight-tunnel.service active (loopback forward up)"
+    else
+      warn "flight-tunnel.service installed but NOT active"
+    fi
+  fi
+  # Public Brev forward state (only if it was installed).
+  if command -v systemctl >/dev/null 2>&1 && \
+     systemctl --user list-unit-files flight-brev-forward.service 2>/dev/null \
+       | grep -q '^flight-brev-forward.service'; then
+    if systemctl --user is-active --quiet flight-brev-forward.service 2>/dev/null; then
+      ok "flight-brev-forward.service active (0.0.0.0:${FLIGHT_BREV_FORWARD_PORT:-18891} — Brev secure link)"
+    else
+      warn "flight-brev-forward.service installed but NOT active"
+    fi
+  fi
+  # Browser-reachable backend?
+  HEALTH=$(curl -fsSL --max-time 5 "http://127.0.0.1:${PORT}/api/health" 2>/dev/null || true)
+  if [ -n "$HEALTH" ]; then
+    ok "Backend reachable on http://127.0.0.1:${PORT}/api/health"
+  else
+    warn "Backend not reachable on http://127.0.0.1:${PORT}/api/health"
+  fi
+  echo
+  exit 0
+fi
+
+[ -z "$OPENSHELL_BIN" ] && fail "openshell CLI not found. Is NemoClaw installed?"
 [ -z "$SANDBOX_NAME" ] && fail "No sandbox name provided. Usage: ./install.sh <sandbox-name>"
+
+# ── --uninstall mode ────────────────────────────────────────────────────
+if [ "$DO_UNINSTALL" = true ]; then
+  echo
+  echo -e "${CYAN}  Removing FlightOps Integration from $SANDBOX_NAME…${NC}"
+  echo
+  detect_paths
+
+  # 1. Stop the systemd-user tunnel.
+  if command -v systemctl >/dev/null 2>&1 && \
+     systemctl --user list-unit-files flight-tunnel.service 2>/dev/null \
+       | grep -q '^flight-tunnel.service'; then
+    info "Stopping flight-tunnel.service…"
+    systemctl --user stop flight-tunnel.service 2>/dev/null || true
+    systemctl --user disable flight-tunnel.service 2>/dev/null || true
+    rm -f "$HOME/.config/systemd/user/flight-tunnel.service"
+    systemctl --user daemon-reload 2>/dev/null || true
+    ok "Tunnel unit removed"
+  fi
+  # Public Brev forward unit (if it was installed).
+  if command -v systemctl >/dev/null 2>&1 && \
+     systemctl --user list-unit-files flight-brev-forward.service 2>/dev/null \
+       | grep -q '^flight-brev-forward.service'; then
+    info "Stopping flight-brev-forward.service…"
+    systemctl --user stop flight-brev-forward.service 2>/dev/null || true
+    systemctl --user disable flight-brev-forward.service 2>/dev/null || true
+    rm -f "$HOME/.config/systemd/user/flight-brev-forward.service"
+    systemctl --user daemon-reload 2>/dev/null || true
+    ok "Brev forward unit removed"
+  fi
+  openshell forward stop "$PORT" >/dev/null 2>&1 || true
+  # Best-effort: stop any non-persistent Brev forward fallback too.
+  if [ -f "$INSTALL_DIR/config.env" ]; then
+    # shellcheck disable=SC1091
+    . "$INSTALL_DIR/config.env" 2>/dev/null || true
+    [ -n "${FLIGHT_BREV_FORWARD_PORT:-}" ] && \
+      openshell forward stop "$FLIGHT_BREV_FORWARD_PORT" >/dev/null 2>&1 || true
+  fi
+
+  # 2. Stop both host-side proxies.
+  for pat in "python3.*opensky-proxy\.py" "python3.*faa-proxy\.py"; do
+    PIDS=$(pgrep -f "$pat" 2>/dev/null || true)
+    if [ -n "$PIDS" ]; then
+      info "Stopping ${pat##*\.\*} ($PIDS)…"
+      echo "$PIDS" | xargs -r kill 2>/dev/null || true
+      sleep 1
+      pgrep -f "$pat" 2>/dev/null | xargs -r kill -9 2>/dev/null || true
+    fi
+  done
+  ok "Host proxies stopped"
+
+  # 3. Stop the uvicorn server in the sandbox + remove staged files.
+  ssh_sandbox 'for pd in /proc/[0-9]*; do pid=$(basename "$pd"); [ -r "$pd/cmdline" ] || continue; cmd=$(tr "\0" " " < "$pd/cmdline" 2>/dev/null); case "$cmd" in *uvicorn*server:app*) kill -9 "$pid" 2>/dev/null || true ;; esac; done; true' 2>/dev/null || true
+  ssh_sandbox "rm -rf $SANDBOX_BASE" 2>/dev/null && ok "Removed $SANDBOX_BASE" || warn "Could not remove $SANDBOX_BASE"
+  ssh_sandbox "rm -rf $SKILLS_BASE/flight-tracking" 2>/dev/null && ok "Removed $SKILLS_BASE/flight-tracking" || warn "Could not remove skill dir"
+
+  # 4. Disable in openclaw.json registry (new layout only).
+  if [ -n "$OPENCLAW_JSON" ] && ssh_sandbox "[ -f $OPENCLAW_JSON ]" 2>/dev/null; then
+    ssh_sandbox "python3 - <<'PYEOF'
+import json
+p = '$OPENCLAW_JSON'
+d = json.load(open(p))
+e = d.get('skills', {}).get('entries', {})
+if 'flight-tracking' in e:
+    e['flight-tracking']['enabled'] = False
+    json.dump(d, open(p, 'w'), indent=2)
+    print('disabled')
+else:
+    print('absent')
+PYEOF" >/dev/null 2>&1 || true
+    ok "Disabled flight-tracking in openclaw.json"
+  fi
+
+  # 5. Drop the policy block.
+  if openshell policy get "$SANDBOX_NAME" --full 2>/dev/null \
+       | grep -q "flight_tracking_opensky"; then
+    info "Dropping flight_tracking_opensky from sandbox policy…"
+    POL=$(mktemp /tmp/flight-policy-XXXX.yaml)
+    openshell policy get "$SANDBOX_NAME" --full 2>/dev/null \
+      | sed '1,/^---$/d' \
+      | python3 -c "
+import sys, yaml
+d = yaml.safe_load(sys.stdin) or {}
+nps = d.get('network_policies') or {}
+nps.pop('flight_tracking_opensky', None)
+d['network_policies'] = nps
+print(yaml.safe_dump(d, sort_keys=False))" > "$POL"
+    openshell policy set "$SANDBOX_NAME" --policy "$POL" --wait >/dev/null 2>&1 \
+      && ok "Policy block removed" \
+      || warn "policy set failed; review $POL"
+    rm -f "$POL"
+  fi
+
+  # 6. Drop the local install marker.
+  rm -rf "$INSTALL_DIR"
+  ok "Removed $INSTALL_DIR"
+
+  echo
+  echo "  FlightOps uninstalled."
+  echo "  Re-run ./install.sh $SANDBOX_NAME to reinstall."
+  echo
+  exit 0
+fi
+
+# ── Banner (install path) ───────────────────────────────────────────────
+cat <<EOF
+
+  ╔════════════════════════════════════════════════════════════╗
+  ║  FlightOps — Flight Tracking Integration installer        ║
+  ║  Live aircraft on a deck.gl + MapLibre console           ║
+  ╚════════════════════════════════════════════════════════════╝
+
+EOF
+
 info "Target sandbox: $SANDBOX_NAME"
 
 # ── 1. Prerequisites ────────────────────────────────────────────────────
-command -v openshell >/dev/null 2>&1 || fail "openshell CLI not found"
-command -v python3   >/dev/null 2>&1 || fail "python3 not found on host"
-openshell sandbox list 2>/dev/null | grep -q "$SANDBOX_NAME" \
+command -v python3 >/dev/null 2>&1 || fail "python3 not found on host"
+$OPENSHELL_BIN sandbox list 2>/dev/null | grep -q "$SANDBOX_NAME" \
   || fail "Sandbox '$SANDBOX_NAME' not found. Run 'nemoclaw onboard' first."
 ok "Prerequisites OK"
+
+info "Detecting OpenClaw sandbox layout…"
+detect_paths
+ok "Layout: $LAYOUT"
+ok "  skills:      $SKILLS_BASE"
+ok "  agent home:  $OPENCLAW_AGENT_HOME"
+[ -n "$OPENCLAW_JSON" ] && ok "  openclaw.json: $OPENCLAW_JSON" \
+                        || ok "  openclaw.json: (legacy layout — registry update skipped)"
 
 # ── 2. Resolve OpenSky creds — host-canonical via ~/.nemoclaw/credentials.json ─
 #
@@ -98,21 +529,19 @@ ok "Prerequisites OK"
 #   1. the openshell provider `flight-tracking-opensky` (gateway-side
 #      canonical record, used by future credential-injection paths and
 #      makes rotations trivial: edit credentials.json + re-run install.sh)
-#   2. the per-sandbox flight.env (current runtime read path — the
-#      FastAPI server reads OPENSKY_CLIENT_ID/SECRET from its environment
-#      and there's no shell-resolvable resolver for SecretRefs today).
+#   2. flight.env — proxy URLs only, NO secrets.
 #
 # Detect-or-prompt UX:
 #   * Both keys present in credentials.json → ask use existing / replace.
 #   * Either missing → prompt for the missing values and persist.
 #   * `OPENSKY_CLIENT_ID=… ./install.sh` env override still wins (for CI).
+#   * `--update-creds` skips the "use existing" question.
 #
 # Chat & inference auth route through OpenClaw via `openclaw agent --json`,
 # so we don't need any inference key of our own.
 ok "Chat will route through OpenClaw (\`openclaw agent --json\`)."
 ok "OpenClaw already owns inference auth via the gateway-managed route."
 
-# Read whatever's in credentials.json today (may be empty / missing entirely).
 read_cred() {
   local key="$1"
   [ -f "$CREDS_PATH" ] || { echo ""; return; }
@@ -135,7 +564,6 @@ OPENSKY_PASSWORD=$(read_cred OPENSKY_PASSWORD)
 OPENSKY_CLIENT_ID="${OPENSKY_CLIENT_ID:-$SAVED_OPENSKY_CLIENT_ID}"
 OPENSKY_CLIENT_SECRET="${OPENSKY_CLIENT_SECRET:-$SAVED_OPENSKY_CLIENT_SECRET}"
 
-# Mask helper for status prints — never echo the full secret.
 mask() {
   local v="${1:-}"
   local n=${#v}
@@ -149,7 +577,6 @@ prompt_for_creds() {
   printf "    OPENSKY_CLIENT_ID:     "
   read -r OPENSKY_CLIENT_ID
   printf "    OPENSKY_CLIENT_SECRET: "
-  # -s suppresses local echo of the secret
   read -rs OPENSKY_CLIENT_SECRET
   printf "\n"
   if [ -z "$OPENSKY_CLIENT_ID" ] || [ -z "$OPENSKY_CLIENT_SECRET" ]; then
@@ -159,27 +586,30 @@ prompt_for_creds() {
   fi
 }
 
-if [ -n "$OPENSKY_CLIENT_ID" ] && [ -n "$OPENSKY_CLIENT_SECRET" ]; then
+if [ "$FLIGHT_ADSB_SOURCE" = "community" ]; then
+  echo
+  ok "Live-aircraft data source: community ADS-B feeds (adsb.fi / airplanes.live / adsb.lol)"
+  info "No OpenSky account or credentials are required in community mode."
+  info "These feeds are reachable from cloud/VM IPs, unlike opensky-network.org."
+  info "To use OpenSky instead, re-run with FLIGHT_ADSB_SOURCE=opensky (non-cloud hosts only)."
+  # Not used in community mode; leave any existing credentials.json untouched.
+  OPENSKY_CLIENT_ID=""; OPENSKY_CLIENT_SECRET=""
+elif [ -n "$OPENSKY_CLIENT_ID" ] && [ -n "$OPENSKY_CLIENT_SECRET" ]; then
   echo
   ok "OpenSky credentials found in $CREDS_PATH"
   printf "    OPENSKY_CLIENT_ID     = %s\n" "$(mask "$OPENSKY_CLIENT_ID")"
   printf "    OPENSKY_CLIENT_SECRET = %s\n" "$(mask "$OPENSKY_CLIENT_SECRET")"
-  if [ -t 0 ]; then
+  if [ "$FORCE_UPDATE_CREDS" = true ]; then
+    info "Enter new OpenSky OAuth2 credentials (--update-creds):"
+    prompt_for_creds
+  elif [ -t 0 ]; then
     printf "    Use existing, [r]eplace, or [s]kip OpenSky upgrade? [U/r/s] "
     read -r answer
     case "${answer:-U}" in
-      r|R)
-        info "Enter new OpenSky OAuth2 credentials:"
-        prompt_for_creds
-        ;;
-      s|S)
-        warn "Skipping OAuth2 — server will fall back to anonymous (~400 credits/day)."
-        OPENSKY_CLIENT_ID=""
-        OPENSKY_CLIENT_SECRET=""
-        ;;
-      *)
-        ok "Using existing credentials"
-        ;;
+      r|R) info "Enter new OpenSky OAuth2 credentials:"; prompt_for_creds ;;
+      s|S) warn "Skipping OAuth2 — server will fall back to anonymous (~400 credits/day)."
+           OPENSKY_CLIENT_ID=""; OPENSKY_CLIENT_SECRET="" ;;
+      *)   ok "Using existing credentials" ;;
     esac
   else
     ok "Non-interactive shell — using existing credentials"
@@ -199,10 +629,9 @@ else
   fi
 fi
 
-# Persist new / changed credentials into credentials.json so it stays the
-# single source of truth. We update atomically (tempfile + replace), keep
-# 0600 permissions, and only touch the OpenSky keys (other tools' creds
-# in the same file are left exactly as we found them).
+# Persist new / changed credentials into credentials.json (single source
+# of truth). Atomic write, 0600 permissions, only touches OpenSky keys
+# (other tools' creds in the same file are left exactly as found).
 if [ -n "$OPENSKY_CLIENT_ID" ] && [ -n "$OPENSKY_CLIENT_SECRET" ]; then
   if [ "$OPENSKY_CLIENT_ID" != "$SAVED_OPENSKY_CLIENT_ID" ] \
      || [ "$OPENSKY_CLIENT_SECRET" != "$SAVED_OPENSKY_CLIENT_SECRET" ]; then
@@ -239,16 +668,16 @@ fi
 # secret path that gets the keys fully out of the sandbox.
 sync_openshell_provider() {
   [ -n "$OPENSKY_CLIENT_ID" ] && [ -n "$OPENSKY_CLIENT_SECRET" ] || return 0
-  if openshell provider get flight-tracking-opensky >/dev/null 2>&1; then
+  if $OPENSHELL_BIN provider get flight-tracking-opensky >/dev/null 2>&1; then
     info "Updating openshell provider 'flight-tracking-opensky'…"
-    openshell provider update flight-tracking-opensky \
+    $OPENSHELL_BIN provider update flight-tracking-opensky \
       --credential "OPENSKY_CLIENT_ID=$OPENSKY_CLIENT_ID" \
       --credential "OPENSKY_CLIENT_SECRET=$OPENSKY_CLIENT_SECRET" >/dev/null 2>&1 \
       && ok "Provider 'flight-tracking-opensky' refreshed" \
       || warn "Provider update failed; gateway record may be stale"
   else
     info "Registering openshell provider 'flight-tracking-opensky'…"
-    openshell provider create \
+    $OPENSHELL_BIN provider create \
       --name flight-tracking-opensky --type generic \
       --credential "OPENSKY_CLIENT_ID=$OPENSKY_CLIENT_ID" \
       --credential "OPENSKY_CLIENT_SECRET=$OPENSKY_CLIENT_SECRET" >/dev/null 2>&1 \
@@ -277,15 +706,13 @@ fi
 # sees the secret.
 #
 # We restart on every install so that:
-#   * a credentials.json edit takes effect immediately (proxy reads
-#     creds at request time too, but a restart guarantees a clean
-#     token cache for the demo)
+#   * a credentials.json edit takes effect immediately
 #   * a new code revision of opensky-proxy.py is picked up
 #   * we reset any stuck state from a previous run
 echo
-info "Starting host-side opensky-proxy on 0.0.0.0:$OPENSKY_PROXY_PORT…"
+info "Starting host-side opensky-proxy on 0.0.0.0:$OPENSKY_PROXY_PORT (data source: $FLIGHT_ADSB_SOURCE)…"
 
-# Best-effort kill of any prior copy of the daemon. We match the python
+# Best-effort kill of any prior copy of the daemon. Match the python
 # command line rather than relying on a pidfile so a stale pidfile from
 # a crashed previous run can't block us.
 EXISTING_PID=$(pgrep -f "python3.*opensky-proxy\.py" 2>/dev/null || true)
@@ -293,7 +720,6 @@ if [ -n "$EXISTING_PID" ]; then
   info "Stopping existing opensky-proxy (PID $EXISTING_PID)…"
   kill "$EXISTING_PID" 2>/dev/null || true
   sleep 1
-  # Force-kill anything that ignored SIGTERM.
   pgrep -f "python3.*opensky-proxy\.py" 2>/dev/null \
     | xargs -r kill -9 2>/dev/null || true
 fi
@@ -301,7 +727,8 @@ fi
 # `setsid nohup` so the daemon survives the install.sh shell exit and
 # so it gets its own session (won't be orphaned to the systemd reaper).
 mkdir -p "$(dirname /tmp/opensky-proxy.log)" 2>/dev/null || true
-setsid nohup python3 "$SCRIPT_DIR/opensky-proxy.py" \
+setsid nohup env "FLIGHT_ADSB_SOURCE=$FLIGHT_ADSB_SOURCE" \
+    python3 "$SCRIPT_DIR/opensky-proxy.py" \
     --port "$OPENSKY_PROXY_PORT" \
     > /tmp/opensky-proxy.log 2>&1 < /dev/null &
 PROXY_PID=$!
@@ -316,8 +743,6 @@ else
   fail "Could not start opensky-proxy. Inspect /tmp/opensky-proxy.log"
 fi
 
-# Health-probe the daemon — a fresh fork can momentarily be running
-# without yet being bound to the port, so retry briefly.
 PROXY_READY=false
 for _ in 1 2 3 4 5; do
   if curl -fsS -o /dev/null --max-time 2 \
@@ -334,13 +759,6 @@ else
 fi
 
 # ── 3b. Start the host-side FAA proxy ───────────────────────────────────
-#
-# Same pattern as opensky-proxy, but for public no-auth feeds that
-# nonetheless reject requests from the openshell gateway's egress IP
-# (FAA NAS Status, Aviation Weather Center). No credentials involved
-# — this proxy just IP-rewraps the request via the host VM's address,
-# which FAA's WAF accepts.
-FAA_PROXY_PORT="${FAA_PROXY_PORT:-9203}"
 echo
 info "Starting host-side faa-proxy on 0.0.0.0:$FAA_PROXY_PORT…"
 
@@ -384,12 +802,6 @@ else
 fi
 
 # ── 4. Detect the host IP the sandbox should dial ───────────────────────
-#
-# This must be the address the sandbox sees the host at, not 127.0.0.1
-# (the sandbox has its own loopback). The brev VM publishes its primary
-# interface address via `hostname -I`; that's what the sandbox's NAT
-# tables route to. Allow override via env var for unusual networking
-# setups.
 HOST_IP="${OPENSKY_PROXY_HOST:-}"
 if [ -z "$HOST_IP" ]; then
   HOST_IP=$( (hostname -I 2>/dev/null || true) | awk '{print $1}')
@@ -407,12 +819,13 @@ FAA_PROXY_URL="http://${HOST_IP}:${FAA_PROXY_PORT}"
 info "Applying flight_tracking_opensky network policy (Tier-1)…"
 
 POLICY_FILE=$(mktemp /tmp/flight-tracking-policy-XXXX.yaml)
-openshell policy get "$SANDBOX_NAME" --full 2>/dev/null | sed '1,/^---$/d' > "$POLICY_FILE"
+$OPENSHELL_BIN policy get "$SANDBOX_NAME" --full 2>/dev/null | sed '1,/^---$/d' > "$POLICY_FILE"
 
-# Idempotent upsert. Crucially, we DROP opensky-network.org and
-# auth.opensky-network.org from the policy — under tier-1 the sandbox
-# must reach OpenSky only via the host proxy. Anything else would
-# bypass the kept-on-host credential boundary.
+# Idempotent upsert. We REPLACE the flight_tracking_opensky block on
+# every install (not just append) so host-IP changes between runs are
+# applied cleanly. We DROP opensky-network.org and
+# auth.opensky-network.org from the policy — under Tier-1 the sandbox
+# must reach OpenSky only via the host proxy.
 export HOST_IP
 export PROXY_PORT="$OPENSKY_PROXY_PORT"
 export FAA_PROXY_PORT
@@ -489,6 +902,28 @@ desired = {
                 {'allow': {'method': 'GET', 'path': '/geoserver/TFR/ows*'}},
             ],
         },
+        # PyPI access for venv builds (FastAPI / uvicorn / httpx /
+        # pydantic). Needed on the first install per sandbox; once the
+        # venv is built it never gets used again (we don't run
+        # `pip install` on subsequent restarts). `/**` glob = multi-
+        # segment, because pip fetches /simple/<pkg>/ then
+        # /packages/<a>/<b>/<c>/<wheel>. Scoped to GET so the sandbox
+        # can read but not publish.
+        {
+            'host': 'pypi.org', 'port': 443, 'protocol': 'rest',
+            'tls': 'terminate', 'enforcement': 'enforce',
+            'rules': [
+                {'allow': {'method': 'GET', 'path': '/simple/**'}},
+                {'allow': {'method': 'GET', 'path': '/pypi/**'}},
+            ],
+        },
+        {
+            'host': 'files.pythonhosted.org', 'port': 443, 'protocol': 'rest',
+            'tls': 'terminate', 'enforcement': 'enforce',
+            'rules': [
+                {'allow': {'method': 'GET', 'path': '/packages/**'}},
+            ],
+        },
     ],
     'binaries': [
         {'path': '/usr/bin/python3'},
@@ -508,13 +943,13 @@ PY
 if [ "$PATCH_RESULT" = "unchanged" ]; then
   ok "Policy already up to date"
 else
-  openshell policy set "$SANDBOX_NAME" --policy "$POLICY_FILE" --wait 2>&1 \
+  $OPENSHELL_BIN policy set "$SANDBOX_NAME" --policy "$POLICY_FILE" --wait 2>&1 \
     && ok "Policy applied (host-proxy only — direct OpenSky access removed)" \
     || fail "openshell policy set failed; review $POLICY_FILE"
 fi
 rm -f "$POLICY_FILE"
 
-# ── 4. Stage server files inside the sandbox ────────────────────────────
+# ── 6. Stage server files inside the sandbox ────────────────────────────
 info "Provisioning $SANDBOX_BASE in the sandbox…"
 
 ssh_sandbox "mkdir -p $SANDBOX_BASE/app/static/data $SKILLS_BASE/flight-tracking/scripts" 2>/dev/null
@@ -537,32 +972,34 @@ upload "$SCRIPT_DIR/skills/flight-tracking/scripts/fly"                "$SKILLS_
 ssh_sandbox "chmod +x $SANDBOX_BASE/start.sh $SKILLS_BASE/flight-tracking/scripts/fly" 2>/dev/null
 ok "Files staged"
 
-# ── 6. flight.env (Tier-1: zero secrets in sandbox) ─────────────────────
+# ── 6b. Update openclaw.json registry + tools.profile (new layout only) ─
+configure_openclaw_json
+
+# ── 7. flight.env (Tier-1: zero secrets in sandbox) ─────────────────────
 #
-# This file used to carry OPENSKY_CLIENT_ID/SECRET into the sandbox.
-# Under Tier-1 those values STAY ON THE HOST — the sandbox only learns
-# the proxy URL, and the proxy attaches the Bearer token at the
-# host↔OpenSky hop. The file is chmod 600 (sandbox user only).
+# Carries proxy URLs + the detected OPENCLAW_AGENT_HOME so server.py
+# reads sessions/JSONL from the right place on each layout. NO OpenSky
+# secrets — those stay on the host inside opensky-proxy.py.
 info "Writing flight.env (zero OpenSky secrets — Tier-1)…"
 
 ssh_sandbox "cat > $SANDBOX_BASE/flight.env" <<EOF
 # Auto-generated by install.sh — DO NOT EDIT BY HAND.
 # Tier-1 architecture: OpenSky credentials live ONLY on the host at
 # ~/.nemoclaw/credentials.json. The host-side opensky-proxy.py
-# (PID listed via \`pgrep -f opensky-proxy\` on the host) injects
-# the Bearer token; this sandbox never sees the secret.
-# Rotate by editing credentials.json on the host then re-running
-# install.sh.
+# (PID via \`pgrep -f opensky-proxy\` on the host) injects the
+# Bearer token; this sandbox never sees the secret.
+# Rotate by editing credentials.json on the host then re-running install.sh.
 OPENSKY_PROXY_URL=$OPENSKY_PROXY_URL
 FAA_PROXY_URL=$FAA_PROXY_URL
 FLIGHT_APP_PORT=$PORT
 OPENCLAW_AGENT=main
+OPENCLAW_AGENT_HOME=$OPENCLAW_AGENT_HOME
 OPENCLAW_TIMEOUT_S=180
 EOF
 ssh_sandbox "chmod 600 $SANDBOX_BASE/flight.env" 2>/dev/null
-ok "flight.env written (proxy URLs only — no secrets)"
+ok "flight.env written (proxy URLs + agent home — no secrets)"
 
-# ── 6. Build venv + install deps inside the sandbox ─────────────────────
+# ── 8. Build venv + install deps inside the sandbox ─────────────────────
 info "Building Python venv inside the sandbox (one-time)…"
 ssh_sandbox "
 set -euo pipefail
@@ -576,7 +1013,7 @@ pip install --quiet -r app/requirements.txt
 "
 ok "Python deps installed"
 
-# ── 7. (Re)start the server inside the sandbox ──────────────────────────
+# ── 9. (Re)start the server inside the sandbox ──────────────────────────
 info "Starting FlightOps server inside the sandbox on port $PORT…"
 
 # Two separate one-line ssh calls. Multi-line heredoc invocations of
@@ -587,11 +1024,11 @@ info "Starting FlightOps server inside the sandbox on port $PORT…"
 # step walks /proc directly (always available, always sees our own
 # UID's processes regardless of session).
 
-# Step 7a — kill any prior uvicorn serving this app.
+# 9a — kill any prior uvicorn serving this app.
 ssh_sandbox 'for pd in /proc/[0-9]*; do pid=$(basename "$pd"); [ -r "$pd/cmdline" ] || continue; cmd=$(tr "\0" " " < "$pd/cmdline" 2>/dev/null); case "$cmd" in *uvicorn*server:app*) kill -9 "$pid" 2>/dev/null || true ;; esac; done; sleep 1; true' \
   || true
 
-# Step 7b — truncate the log + launch start.sh detached. Inline one-
+# 9b — truncate the log + launch start.sh detached. Inline one-
 # liner so SSH's fd cleanup doesn't block on the disowned background.
 ssh_sandbox "cd $SANDBOX_BASE && : > server.log && nohup ./start.sh > server.log 2>&1 < /dev/null & disown; true" \
   || true
@@ -637,75 +1074,69 @@ else
   fail "FlightOps backend failed to come up. Inspect $SANDBOX_BASE/server.log"
 fi
 
-# ── 7c. Install / refresh the systemd-user tunnel unit ──────────────────
-# Renders scripts/systemd/flight-tunnel.service.template into
-# ~/.config/systemd/user/flight-tunnel.service with this install's
-# sandbox name, gateway name, app port, and $HOME baked in. This is
-# the recommended tunnel path — wraps `ssh -L` with TCP keepalives
-# and Restart=always so demo-time gateway flaps auto-recover.
-#
-# Skipped automatically on hosts without systemd-user (e.g. macOS) or
-# when SKIP_SYSTEMD_TUNNEL=1 is set; install.sh's port-forward step
-# falls back to `openshell forward` in that case.
+# ── 9c. Install / refresh the systemd-user tunnel unit ──────────────────
 TUNNEL_TEMPLATE="$SCRIPT_DIR/scripts/systemd/flight-tunnel.service.template"
 TUNNEL_UNIT_DIR="$HOME/.config/systemd/user"
 TUNNEL_UNIT="$TUNNEL_UNIT_DIR/flight-tunnel.service"
 
 systemd_user_available() {
+  # A user-bus has to be REACHABLE, not just present in PATH. On
+  # headless / ssh-only sessions (Brev VMs, build images, MCP shells)
+  # systemctl exists but the user manager bus is gone, so
+  # `systemctl --user list-units` succeeds while `daemon-reload` /
+  # `enable` exits non-zero. Probe with a no-side-effect call first so
+  # we fall through to `openshell forward` cleanly instead of `set -e`-
+  # killing the installer mid-step.
   command -v systemctl >/dev/null 2>&1 || return 1
-  # systemctl --user --version succeeds when the user manager is up.
-  systemctl --user --version >/dev/null 2>&1
+  systemctl --user --version >/dev/null 2>&1 || return 1
+  systemctl --user list-units --no-legend --no-pager >/dev/null 2>&1
 }
 
 if [ "$SKIP_SYSTEMD_TUNNEL" = "1" ]; then
   info "Skipping systemd-user tunnel install (SKIP_SYSTEMD_TUNNEL=1)."
 elif ! systemd_user_available; then
-  info "systemd-user not available — will use \`openshell forward\` fallback."
+  info "systemd-user bus not reachable — will use \`openshell forward\` fallback."
 elif [ ! -f "$TUNNEL_TEMPLATE" ]; then
   warn "Tunnel template missing at $TUNNEL_TEMPLATE — skipping."
 else
   info "Installing systemd-user tunnel unit (flight-tunnel.service)…"
   mkdir -p "$TUNNEL_UNIT_DIR"
-  # Render the template. sed -e per-placeholder so we don't choke on
-  # paths containing slashes (HOME).
   TMP_UNIT=$(mktemp)
   sed -e "s|__SANDBOX_NAME__|$SANDBOX_NAME|g" \
       -e "s|__GATEWAY_NAME__|$GATEWAY_NAME|g" \
       -e "s|__APP_PORT__|$PORT|g" \
       -e "s|__HOME__|$HOME|g" \
       "$TUNNEL_TEMPLATE" > "$TMP_UNIT"
-  # Only rewrite the unit (and reload systemd) if it actually changed —
-  # avoids spurious restarts when the operator re-runs install.sh
-  # against the same sandbox.
   if [ ! -f "$TUNNEL_UNIT" ] || ! cmp -s "$TMP_UNIT" "$TUNNEL_UNIT"; then
     mv "$TMP_UNIT" "$TUNNEL_UNIT"
-    systemctl --user daemon-reload
-    ok "Wrote $TUNNEL_UNIT"
+    # daemon-reload can still fail on bus disconnect mid-install;
+    # don't let set -e kill us — fall through to forward fallback.
+    systemctl --user daemon-reload 2>/dev/null \
+      && ok "Wrote $TUNNEL_UNIT" \
+      || warn "daemon-reload failed; unit written but not loaded"
   else
     rm -f "$TMP_UNIT"
     ok "Tunnel unit already up to date"
   fi
-  systemctl --user enable flight-tunnel.service >/dev/null 2>&1 || true
-  ok "Tunnel unit enabled (sandbox=$SANDBOX_NAME, gateway=$GATEWAY_NAME, port=$PORT)"
+  systemctl --user enable flight-tunnel.service >/dev/null 2>&1 \
+    && ok "Tunnel unit enabled (sandbox=$SANDBOX_NAME, gateway=$GATEWAY_NAME, port=$PORT)" \
+    || warn "Could not enable flight-tunnel.service — falling back to \`openshell forward\`."
+  # Enable linger so the user manager (and thus these forwards) starts at
+  # boot on headless VMs where nobody logs in interactively. Best-effort:
+  # try unprivileged first, then sudo -n; a failure only means the unit
+  # won't auto-start until the next login.
+  if [ "$(loginctl show-user "$(id -un)" --property=Linger --value 2>/dev/null)" != "yes" ]; then
+    if loginctl enable-linger "$(id -un)" >/dev/null 2>&1 \
+       || sudo -n loginctl enable-linger "$(id -un)" >/dev/null 2>&1; then
+      ok "Enabled systemd linger (forwards start on reboot)"
+    else
+      warn "Could not enable systemd linger — forwards may not start until next login."
+      warn "  Fix with: sudo loginctl enable-linger $(id -un)"
+    fi
+  fi
 fi
 
-# ── 8. Host-side port forward ───────────────────────────────────────────
-# Two paths supported, preferred-first:
-#
-#   (a) systemd-user unit `flight-tunnel.service` (recommended). Wraps a
-#       raw `ssh -L 18890:...` with ServerAliveInterval=30 +
-#       ExitOnForwardFailure=yes + Restart=always, so a transient
-#       openshell gateway flap auto-recovers within ~5s. This is the
-#       path that survives demos.
-#
-#   (b) `openshell forward start ... -d` as a fallback for hosts that
-#       don't have systemd-user (or where the unit isn't installed).
-#       Less robust — when the underlying gateway connection breaks
-#       the forward stays half-alive (accepts but never proxies),
-#       which is what bit us during demo prep.
-#
-# Either way we VERIFY by hitting /api/health through the forward —
-# `openshell forward list` returning a row isn't enough proof.
+# ── 10. Host-side port forward ──────────────────────────────────────────
 info "Forwarding localhost:$PORT to the sandbox…"
 
 verify_forward() {
@@ -718,7 +1149,6 @@ forward_ok=false
 if command -v systemctl >/dev/null 2>&1 \
    && systemctl --user list-unit-files flight-tunnel.service \
         2>/dev/null | grep -q '^flight-tunnel.service'; then
-  # Cycle to pick up any policy / sandbox changes from this install.
   systemctl --user restart flight-tunnel.service >/dev/null 2>&1 || true
   for _ in 1 2 3 4 5; do
     sleep 1
@@ -733,8 +1163,8 @@ fi
 
 # (b) openshell forward fallback.
 if ! $forward_ok; then
-  openshell forward stop "$PORT" >/dev/null 2>&1 || true
-  openshell forward start "$PORT" "$SANDBOX_NAME" -d >/dev/null 2>&1 || true
+  $OPENSHELL_BIN forward stop "$PORT" >/dev/null 2>&1 || true
+  $OPENSHELL_BIN forward start "$PORT" "$SANDBOX_NAME" -d >/dev/null 2>&1 || true
   for _ in 1 2 3 4 5; do
     sleep 1
     if verify_forward; then forward_ok=true; break; fi
@@ -750,11 +1180,105 @@ if ! $forward_ok; then
   warn "  openshell forward stop $PORT && openshell forward start $PORT $SANDBOX_NAME -d"
 fi
 
-# ── 9. Refresh agent sessions so the skill is picked up ────────────────
+# ── 10b. Optional public Brev forward (0.0.0.0, reboot-persistent) ───────
+# A SECOND forward, bound to all interfaces, so Brev can publish the
+# console as a secure link. Kept separate from the loopback tunnel above
+# so local/Cursor access (127.0.0.1:$PORT) is never disturbed.
+BREV_FORWARD_TEMPLATE="$SCRIPT_DIR/scripts/systemd/flight-brev-forward.service.template"
+BREV_FORWARD_UNIT="$TUNNEL_UNIT_DIR/flight-brev-forward.service"
+if [ "$ENABLE_BREV_FORWARD" = "1" ]; then
+  echo
+  if [ "$BREV_FORWARD_PORT" = "$PORT" ]; then
+    warn "--brev-link port ($BREV_FORWARD_PORT) must differ from the app port ($PORT); skipping Brev forward."
+  else
+    info "Installing public Brev forward on 0.0.0.0:$BREV_FORWARD_PORT -> sandbox app ($PORT)…"
+    brev_ok=false
+    if systemd_user_available && [ -f "$BREV_FORWARD_TEMPLATE" ]; then
+      mkdir -p "$TUNNEL_UNIT_DIR"
+      TMP_BUNIT=$(mktemp)
+      sed -e "s|__SANDBOX_NAME__|$SANDBOX_NAME|g" \
+          -e "s|__GATEWAY_NAME__|$GATEWAY_NAME|g" \
+          -e "s|__APP_PORT__|$PORT|g" \
+          -e "s|__BREV_PORT__|$BREV_FORWARD_PORT|g" \
+          -e "s|__HOME__|$HOME|g" \
+          "$BREV_FORWARD_TEMPLATE" > "$TMP_BUNIT"
+      if [ ! -f "$BREV_FORWARD_UNIT" ] || ! cmp -s "$TMP_BUNIT" "$BREV_FORWARD_UNIT"; then
+        mv "$TMP_BUNIT" "$BREV_FORWARD_UNIT"
+        systemctl --user daemon-reload 2>/dev/null \
+          && ok "Wrote $BREV_FORWARD_UNIT" \
+          || warn "daemon-reload failed; unit written but not loaded"
+      else
+        rm -f "$TMP_BUNIT"
+        ok "Brev forward unit already up to date"
+      fi
+      systemctl --user enable flight-brev-forward.service >/dev/null 2>&1 \
+        && ok "Brev forward unit enabled (survives reboot)" \
+        || warn "Could not enable flight-brev-forward.service"
+      systemctl --user restart flight-brev-forward.service >/dev/null 2>&1 || true
+      for _ in 1 2 3 4 5; do
+        sleep 1
+        if curl -fsS -o /dev/null --max-time 5 "http://127.0.0.1:$BREV_FORWARD_PORT/api/health"; then
+          brev_ok=true; break
+        fi
+      done
+    else
+      warn "systemd-user not available or template missing — using non-persistent \`openshell forward\` fallback."
+      $OPENSHELL_BIN forward stop "$BREV_FORWARD_PORT" >/dev/null 2>&1 || true
+      setsid nohup "$OPENSHELL_BIN" forward service --target-port "$PORT" \
+          --local "0.0.0.0:$BREV_FORWARD_PORT" "$SANDBOX_NAME" \
+          > /tmp/flight-brev-forward.log 2>&1 < /dev/null &
+      disown 2>/dev/null || true
+      for _ in 1 2 3 4 5; do
+        sleep 1
+        if curl -fsS -o /dev/null --max-time 5 "http://127.0.0.1:$BREV_FORWARD_PORT/api/health"; then
+          brev_ok=true; break
+        fi
+      done
+    fi
+    if $brev_ok; then
+      ok "Public Brev forward active on 0.0.0.0:$BREV_FORWARD_PORT"
+      info "Publish port $BREV_FORWARD_PORT in the Brev console for a secure *.apps.run.brev.nvidia.com link."
+    else
+      warn "Brev forward not reachable on 0.0.0.0:$BREV_FORWARD_PORT — inspect:"
+      warn "  systemctl --user status flight-brev-forward.service"
+      warn "  (or /tmp/flight-brev-forward.log if using the fallback)"
+    fi
+  fi
+else
+  info "Public Brev forward disabled. Enable a reboot-persistent secure-link forward with:"
+  info "  ./install.sh $SANDBOX_NAME --brev-link            # default port 18891"
+fi
+
+# ── 11. Refresh agent sessions so the skill is picked up ────────────────
+# Layout-aware: clear whichever sessions.json the agent home actually
+# carries. No-op on a fresh install (file doesn't exist yet).
+SESSIONS_PATH="$OPENCLAW_AGENT_HOME/sessions/sessions.json"
 ssh_sandbox "[ -f $SESSIONS_PATH ] && echo '{}' > $SESSIONS_PATH || true" 2>/dev/null \
   && ok "Agent sessions cleared (skill will load on next message)"
 
-# ── 10. Health check ────────────────────────────────────────────────────
+# ── 12. Persist install marker so --status / --uninstall know what we set up ─
+mkdir -p "$INSTALL_DIR"
+cat > "$INSTALL_DIR/config.env" <<EOF
+# Auto-generated by install.sh — used by --status / --uninstall.
+FLIGHT_SANDBOX=$SANDBOX_NAME
+FLIGHT_GATEWAY=$GATEWAY_NAME
+FLIGHT_LAYOUT=$LAYOUT
+FLIGHT_SKILLS_BASE=$SKILLS_BASE
+FLIGHT_OPENCLAW_AGENT_HOME=$OPENCLAW_AGENT_HOME
+FLIGHT_OPENCLAW_JSON=$OPENCLAW_JSON
+FLIGHT_HOST_IP=$HOST_IP
+FLIGHT_PORT=$PORT
+FLIGHT_OPENSKY_PROXY_PORT=$OPENSKY_PROXY_PORT
+FLIGHT_ADSB_SOURCE=$FLIGHT_ADSB_SOURCE
+FLIGHT_ENABLE_BREV_FORWARD=$ENABLE_BREV_FORWARD
+FLIGHT_BREV_FORWARD_PORT=$BREV_FORWARD_PORT
+FLIGHT_FAA_PROXY_PORT=$FAA_PROXY_PORT
+FLIGHT_OPENSHELL_BIN=$OPENSHELL_BIN
+FLIGHT_INSTALLED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+EOF
+ok "Install marker at $INSTALL_DIR/config.env"
+
+# ── 13. Health check ────────────────────────────────────────────────────
 info "Probing health endpoint…"
 sleep 2
 # --max-time guard: a half-open SSH forward (the openshell-forward
@@ -779,7 +1303,10 @@ cat <<EOF
   Console:     http://localhost:$PORT
   API:         http://localhost:$PORT/api/health
   Logs:        ssh into $SANDBOX_NAME, then tail $SANDBOX_BASE/server.log
-  Skill:       /sandbox/.openclaw-data/skills/flight-tracking
+  Skill:       $SKILLS_BASE/flight-tracking
+  Agent home:  $OPENCLAW_AGENT_HOME
+  Layout:      $LAYOUT
+  Live data:   $FLIGHT_ADSB_SOURCE  (community = adsb.fi / airplanes.live / adsb.lol; no OpenSky creds needed)
   Helper:      \`fly\` CLI inside the sandbox (try: fly goto IAD)
 
   Secrets (Tier-1 host-proxy):
@@ -790,9 +1317,26 @@ cat <<EOF
     sandbox:      $SANDBOX_BASE/flight.env  (no secrets — only proxy URLs)
     rotate:       edit credentials.json → re-run ./install.sh
 
-  Try in chat:
+  Maintenance:
+    Status:     ./install.sh --status
+    Uninstall:  ./install.sh --uninstall
+
+  Try in the chat panel on the dashboard:
     "Go to IAD and analyse traffic"
     "Show inbound arcs to JFK"
     "Any unusual squawks near LHR right now?"
 
 EOF
+
+if [ "$ENABLE_BREV_FORWARD" = "1" ] && [ "$BREV_FORWARD_PORT" != "$PORT" ]; then
+  cat <<EOF
+  Brev secure link:
+    Public forward: 0.0.0.0:$BREV_FORWARD_PORT -> sandbox app ($PORT), reboot-persistent
+    Unit:           systemctl --user status flight-brev-forward.service
+    Next step:      publish port $BREV_FORWARD_PORT in the Brev console to get a
+                    https://<name>.apps.run.brev.nvidia.com secure link.
+    Note:           0.0.0.0 exposes the app on the VM network; the app has no auth
+                    of its own — rely on Brev's secure link and remove with --uninstall.
+
+EOF
+fi

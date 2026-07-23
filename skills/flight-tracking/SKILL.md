@@ -1,6 +1,6 @@
 ---
 name: flight-tracking
-description: "Live aircraft tracking, airport lookup, and interactive map control for the FlightOps map UI at http://127.0.0.1:18890. Use this skill whenever the user asks about live air traffic, what is flying near an airport, inbound patterns, unusual squawks, METAR weather, NAS status / ground stops, ARTCC boundaries, OR wants the map driven in ANY way (fly to an airport, draw arcs, highlight a flight, RECOLOUR the planes, toggle a layer, filter by phase or squawk, switch to 3D, change METAR colour mode). HARD RULES: (1) ALL data and ALL map control live behind http://127.0.0.1:18890 in this same sandbox. NEVER curl upstream FAA/OpenSky/AWC/adsbdb/hexdb hosts directly — they're firewalled. If a local call fails say 'service unavailable', do not invent a network-outage excuse. (2) ANY request that changes what's drawn on the map REQUIRES issuing the matching POST /api/map/... call FIRST, BEFORE describing the result. Never claim 'I've updated the map to ...' unless you actually issued the POST this turn — the user is looking at a live chart and will see if nothing changed. (3) The aircraft colour scheme has exactly FOUR fixed presets — phase | altitude | vrate | squawk — set via POST /api/map/color {\"mode\":\"<one of four>\"}. Aliases 'elevation', 'flight level', 'rate of climb', 'emergency' are accepted. Do NOT invent custom palettes; describe only what the preset shows: phase = orange family, altitude = single-hue green ramp (mint→deep green, NOT a rainbow), vrate = diverging purple (violet↔magenta), squawk = grey + red/amber for 7500/7600/7700. (4) Other map controls: POST /api/map/metar-color (flt_cat|wind|temp|visibility), POST /api/map/layer, POST /api/map/filter, POST /api/map/goto, POST /api/map/view, POST /api/map/arcs (auto-tilts), POST /api/map/airspace3d, POST /api/map/track (ONE-shot 'find this plane and follow it' — preferred over /api/map/highlight + /api/map/view in two calls). (5) EVERY /api/map/* response includes a `delivered` integer = how many browser tabs received the broadcast. If `delivered:0` the dashboard isn't open right now — say 'I issued the command but no map UI is connected to receive it; please open http://127.0.0.1:18890 first', do NOT claim the map updated. The server caches the last sticky command for ~3 minutes, so a tab that opens shortly after will still catch up. (6) For 'find a flight matching X and track it' (e.g. 'what just left IAD heading to TPA, zoom on it'), use the find→track pattern: GET /api/flights/find?departing=IAD&arriving=TPA picks candidates server-side, then POST /api/map/track {\"flight\":\"<id from find>\"} drives the camera. NEVER loop over /api/route/<callsign> per live flight — that's hundreds of HTTP calls inside a tool exec and will time out. Open the SKILL.md body for examples and field schemas."
+description: "FlightOps live-aircraft + airport + interactive-map control at http://127.0.0.1:18890. Use for live traffic near an airport, inbound patterns, squawks, METAR, NAS/ground-stops, ARTCC, OR driving the map (fly, arcs, track/highlight, recolour, toggle layer, filter, 3D, METAR colour, switch feed). EXEC-READY RECIPES — run verbatim, substitute the token; field names differ per endpoint, do NOT guess. (A) 'go to <X> and analyse [traffic]' → ONE call: `curl -fsS --max-time 60 -X POST -H 'Content-Type: application/json' -d '{\"target\":\"<X>\",\"zoom\":9,\"radius_km\":80}' 'http://127.0.0.1:18890/api/map/goto-analyze'` — flies the map AND returns the traffic summary in a single shot (field is `target`, NOT `airport`). Read `.analysis` from the JSON for the summary. (B) 'show arcs into <X>' → ONE call: `curl -fsS --max-time 60 -X POST -H 'Content-Type: application/json' -d '{\"airport\":\"<X>\",\"radius_km\":80}' 'http://127.0.0.1:18890/api/map/arcs'`. NOTE: arcs' field IS `airport` (different from goto). (C) 'recolour planes by <altitude|vrate|squawk|phase>' → ONE call: `curl -fsS --max-time 60 -X POST -H 'Content-Type: application/json' -d '{\"mode\":\"<altitude|vrate|squawk|phase>\"}' 'http://127.0.0.1:18890/api/map/color'`. (D) 'find <plane matching X> and track it' → TWO calls: `curl -fsS --max-time 60 'http://127.0.0.1:18890/api/flights/find?departing=<X>&limit=5'` then pick the first id and `curl -fsS --max-time 60 -X POST -H 'Content-Type: application/json' -d '{\"flight\":\"<id>\",\"zoom\":10}' 'http://127.0.0.1:18890/api/map/track'`. (E) 'toggle layer <L> on/off' → `curl -fsS --max-time 60 -X POST -H 'Content-Type: application/json' -d '{\"layer\":\"<L>\",\"visible\":true}' 'http://127.0.0.1:18890/api/map/layer'` (layer ∈ flights|airports|arcs|trails|paths|weather|sua|classes|tfrs|runways|taxiways|obstacles|ats|metar|nas|artcc|navaids). (F) 'is <airport> delayed / GDP / ground stop?' → `curl -fsS --max-time 60 'http://127.0.0.1:18890/api/nas/airport/<X>'`. (G) 'weather at <X> / METAR' → `curl -fsS --max-time 60 'http://127.0.0.1:18890/api/weather/metar?bbox=-77,38,-76,39'`. (H) 'what is <airport>' → `curl -fsS --max-time 60 'http://127.0.0.1:18890/api/airport/<X>'`. (I) 'switch/change the live feed/provider/data source to <community|adsb.fi|airplanes.live|adsb.lol|opensky>' → ONE call: `curl -fsS --max-time 60 -X POST -H 'Content-Type: application/json' -d '{\"source\":\"<X>\"}' 'http://127.0.0.1:18890/api/map/source'`. NOTE: field is `source`. This changes the feed for BOTH the operator's map AND your own analysis. List feeds + what each supports with `curl -fsS 'http://127.0.0.1:18890/api/sources'`. FEED: default is `community` (live positions/tracking/trails + origin→dest via `/api/route/<callsign>`) with NO pre-built history → `/api/flight/<icao24>` and `/track` return nothing and `route_match` is never `confirmed-opensky` (don't claim an OpenSky-confirmed origin; use `/api/route/<callsign>` + geometry). `opensky` has history but is BLOCKED from cloud/VM IPs (returns no planes here). ANTI-PATTERNS — never: exec a bare URL without `curl`; omit `--max-time 60`; GET a /api/map/* endpoint (POST-only, GET=405); guess JSON field names (each recipe shows the exact body); read /sandbox/.openclaw/skills/ files; call any OTHER skill; curl upstream OpenSky/FAA/AWC hosts (firewalled — the local proxies handle them). RULES: (1) any map change = do the matching POST BEFORE describing it. (2) colour modes are exactly phase|altitude|vrate|squawk (aliases elevation/flight level/rate of climb/emergency); no invented palettes. (3) every /api/map/* returns `delivered`; if ≥1 confirm in ONE sentence and stop (no hedging); if 0 say 'no map UI connected — open http://127.0.0.1:18890'. (4) 405/422 = wrong method/body: re-read the recipe, retry ONCE, else 'service unavailable' and stop. (5) use the FEWEST tool calls."
 ---
 
 # flight-tracking
@@ -110,6 +110,11 @@ GET  /api/route/{callsign}                           # callsign → origin/desti
 ### Write (drives the map for any connected browsers)
 
 ```
+POST /api/map/goto-analyze {"target":"IAD","zoom":9,"radius_km":80}
+# PREFERRED for "go to <X> and analyse": one call flies the map AND
+# returns the traffic analysis together as {ok, delivered, goto, analysis}.
+# Saves a model round-trip vs. goto + /api/analyze. Optional pitch/bearing.
+
 POST /api/map/goto       {"target":"IAD","zoom":9,"pitch":55,"bearing":0}
 # pitch/bearing are optional 3D camera hints. 0° pitch = top-down,
 # 50–60° pitch reads as "looking across the chart" and is the
@@ -196,8 +201,69 @@ POST /api/map/airspace3d   {"enabled":true}
 # Toggle 3D extrusion of airspace polygons + lift planes to their
 # reported altitude. Looks great paired with a 50–60° pitch.
 
+POST /api/map/source     {"source":"community|adsb.fi|airplanes.live|adsb.lol|opensky"}
+# Switch the LIVE AIRCRAFT DATA FEED for the operator's map AND for your
+# own reads (/api/flights, /api/analyze, /api/flights/find, /api/map/track
+# all follow it). Aliases: "auto"/"all" → community. See "Live data feed"
+# section below for what each feed can and can't do. Returns
+# {ok, delivered, current}. delivered=0 just means no browser is open —
+# the server-side feed still changed.
+
 POST /api/map/command    {"type":"...","payload":{...}}      # generic broadcast
 ```
+
+## Live data feed / multiple providers
+
+Live aircraft can come from **OpenSky** or from free **community ADS-B
+aggregators** (`adsb.fi`, `airplanes.live`, `adsb.lol`). The feed is
+selectable — from the map's **Layers → Data feed** dropdown, or by you via
+`POST /api/map/source`. Inspect the options + capabilities any time:
+
+```bash
+curl -s http://127.0.0.1:18890/api/sources | python3 -m json.tool
+# → { "current": "community", "sources":[…], "capabilities": {
+#       "community": {live_positions, live_tracking, live_trail,
+#                     prebuilt_history:false, origin_destination:"via callsign",
+#                     needs_credentials:false, works_from_cloud:true},
+#       "opensky":   {…, prebuilt_history:true, needs_credentials:true,
+#                     works_from_cloud:false} } }
+```
+
+**Default = `community`.** Why: OpenSky blackholes datacenter/cloud IP
+ranges, so from this VM `opensky-network.org` is unreachable and planes
+never load. The community feeds have no such block and need no credentials.
+
+### What works on every feed vs OpenSky-only
+
+| Ask | community (default) | opensky |
+|---|---|---|
+| Live positions / `/api/flights` / analyse / find / track | ✅ | ✅ (but blocked on cloud) |
+| Colour, filter, arcs, layers, camera — all `/api/map/*` | ✅ | ✅ |
+| Origin → destination | ✅ via `/api/route/<callsign>` (adsbdb) | ✅ via icao24 history |
+| `/api/flight/<icao24>` + `/api/flight/<icao24>/track` (pre-built history) | ❌ returns no data | ✅ |
+| Aircraft registry/photo `/api/registry/<icao24>` | ✅ (feed-independent) | ✅ |
+
+**Consequences you MUST respect on the default community feed:**
+
+1. **Do not promise OpenSky-confirmed origins.** `route_match` values
+   `confirmed-opensky` / `wrong-airport-opensky` and the `opensky_origin`
+   block only appear when the feed is `opensky`. On community, the best you
+   get is `confirmed` (adsbdb scheduled route) or `geometric-*`. Caption
+   accordingly ("IAD → TPA per adsbdb", or describe the geometry) — never
+   quote an `estDepartureAirport`/takeoff time you didn't receive.
+2. **`/api/flight/<icao24>` and `/api/flight/<icao24>/track` will be empty.**
+   For "where did it come from / where's it going", use
+   `/api/route/<callsign>` (works on every feed). For "where has it been",
+   say the pre-built track isn't available on the current feed — the live
+   trail still accumulates in the browser as you watch. Only offer to
+   switch to OpenSky if the host is NOT a cloud VM.
+3. **Everything else is identical** — live tracking, following a plane,
+   trails, colour/filter/arcs/layers, registry, METAR, NAS, airspace all
+   work unchanged regardless of feed.
+
+If the user explicitly asks to switch feeds, use `POST /api/map/source`.
+If they ask "why don't I see planes on OpenSky?", explain the cloud-IP
+block and switch them back to `community`.
 
 ### Driving the map: a worked example
 
@@ -240,12 +306,15 @@ rather than pretending to have done it.
 ## How to drive a typical request
 
 ```bash
-# user: "go to IAD and analyse the traffic"
-curl -sX POST http://127.0.0.1:18890/api/map/goto \
+# user: "go to IAD and analyse the traffic"  → ALWAYS ONE call (map + analysis)
+curl -sX POST http://127.0.0.1:18890/api/map/goto-analyze \
      -H 'Content-Type: application/json' \
-     -d '{"target":"IAD","zoom":9}'
-
-curl -s "http://127.0.0.1:18890/api/analyze?airport=IAD&radius_km=80"
+     -d '{"target":"IAD","zoom":9,"radius_km":80}'
+# → {"ok":true,"delivered":N,"goto":{...},"analysis":{...}}
+# Read `.analysis` for the summary. Do NOT split this into a separate
+# /api/map/goto + /api/analyze — that is a slower two-round-trip path.
+# Use standalone /api/map/goto ONLY when the user wants to fly the
+# camera WITHOUT an analysis.
 ```
 
 ### When the user asks for arcs
@@ -359,6 +428,12 @@ above (with `confirm_route=true`) does it server-side, capped at 20
 in parallel, with caching.
 
 ### Route confirmation can fail — read `route_match` before claiming
+
+> **Feed caveat:** the OpenSky tiers below (`confirmed-opensky`,
+> `wrong-airport-opensky`, `opensky_origin`) only fire when the active feed
+> is `opensky`. On the **default `community` feed** the pipeline degrades to
+> the adsbdb (`confirmed`) and geometric tiers — plan your captions for
+> those. See "Live data feed / multiple providers" above.
 
 `/api/flights/find` runs a layered confirmation pipeline against TWO
 independent upstreams in parallel:

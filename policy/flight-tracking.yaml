@@ -83,6 +83,27 @@ network_policies:
         tls: terminate
         rules:
           - allow: { method: GET, path: "/geoserver/TFR/ows*" }
+      # PyPI access for the one-time venv build (FastAPI / uvicorn /
+      # httpx / pydantic). install.sh runs `pip install -r app/requirements.txt`
+      # once per sandbox; subsequent restarts reuse the venv and never
+      # hit pypi again. `/**` = multi-segment glob (pip fetches
+      # /simple/<pkg>/ and /packages/<a>/<b>/<c>/<wheel>). Scoped to
+      # GET so the sandbox can fetch but not publish.
+      - host: pypi.org
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        tls: terminate
+        rules:
+          - allow: { method: GET, path: "/simple/**" }
+          - allow: { method: GET, path: "/pypi/**" }
+      - host: files.pythonhosted.org
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        tls: terminate
+        rules:
+          - allow: { method: GET, path: "/packages/**" }
     binaries:
       - { path: /usr/bin/python3 }
       - { path: /usr/bin/python3.11 }

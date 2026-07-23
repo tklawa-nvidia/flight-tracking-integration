@@ -1,0 +1,44 @@
+[Unit]
+# Rendered by install.sh into ~/.config/systemd/user/flight-brev-forward.service
+# with the placeholders (__SANDBOX_NAME__, __GATEWAY_NAME__, __APP_PORT__,
+# __BREV_PORT__, __HOME__) substituted for this install.
+#
+# Purpose: expose the sandbox FlightOps app on ALL host interfaces
+# (0.0.0.0:__BREV_PORT__) so Brev can publish it as a secure link
+# (*.apps.run.brev.nvidia.com). This is separate from flight-tunnel.service,
+# which binds loopback only (127.0.0.1:__APP_PORT__) for local/Cursor use.
+#
+# To inspect / cycle manually:
+#   systemctl --user status  flight-brev-forward.service
+#   systemctl --user restart flight-brev-forward.service
+#   journalctl --user -u flight-brev-forward.service -f
+
+Description=FlightOps public (Brev) port-forward to OpenShell sandbox (__SANDBOX_NAME__)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=PATH=__HOME__/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# Same resilient `ssh -L` pattern as flight-tunnel.service, but the local
+# bind address is 0.0.0.0 (all interfaces) and the local port (__BREV_PORT__)
+# maps to the sandbox app port (__APP_PORT__). Binding a client-side -L
+# forward to 0.0.0.0 does NOT require GatewayPorts (that only governs -R).
+ExecStart=/usr/bin/ssh \
+  -F /dev/null \
+  -o StrictHostKeyChecking=no \
+  -o UserKnownHostsFile=/dev/null \
+  -o LogLevel=ERROR \
+  -o ServerAliveInterval=30 \
+  -o ServerAliveCountMax=3 \
+  -o ExitOnForwardFailure=yes \
+  -o ConnectTimeout=15 \
+  -N \
+  -L 0.0.0.0:__BREV_PORT__:127.0.0.1:__APP_PORT__ \
+  -o "ProxyCommand=openshell ssh-proxy --gateway-name __GATEWAY_NAME__ --name __SANDBOX_NAME__" \
+  sandbox@openshell-__SANDBOX_NAME__
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

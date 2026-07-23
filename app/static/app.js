@@ -54,6 +54,13 @@ const state = {
   // intent here and re-try it from `ingestFlights` once the post-flyTo
   // poll loads the plane in. {target: lowercase id-or-callsign, expiresAt}.
   pendingHighlight: null,
+  // Live-aircraft data feed chosen in the layer panel's source sub-selector.
+  // Forwarded to /api/flights as ?provider=…; the host proxy resolves it to
+  // OpenSky or a community ADS-B aggregator. Persisted in localStorage.
+  flightSource: (() => {
+    try { return localStorage.getItem('flightSource') || 'community'; }
+    catch { return 'community'; }
+  })(),
   layerVisibility: {
     flights: true,
     airports: true,
@@ -2916,7 +2923,7 @@ async function pump({ snapshot = false } = {}) {
     const bboxStr = currentBbox();
     const airportQuery = airportsQueryForZoom(state.map.getZoom());
     const [flightsRes, airportsRes] = await Promise.all([
-      fetchOrThrow(`/api/flights?bbox=${bboxStr}`),
+      fetchOrThrow(`/api/flights?bbox=${bboxStr}&provider=${encodeURIComponent(state.flightSource)}`),
       fetchOrThrow(`/api/airports?bbox=${bboxStr}&${airportQuery}`),
     ]);
 
@@ -3247,9 +3254,118 @@ function wireLiveControls() {
 
 // ── Layer toggles ────────────────────────────────────────────────────────
 
+// ── Live-aircraft data feed selector ─────────────────────────────────────
+// Capability copy per source group. Keyed by the `group` field from
+// /api/sources so all three community feeds share one note.
+const FLIGHT_SOURCE_CAPS = {
+  community: {
+    lines: [
+      ['ok', 'Live positions, tracking & follow'],
+      ['ok', 'Live trail (builds as you watch)'],
+      ['ok', 'Origin → destination (via callsign)'],
+      ['no', 'No pre-built track history'],
+    ],
+    warn: 'No credentials needed · works on cloud/VM.',
+  },
+  opensky: {
+    lines: [
+      ['ok', 'Live positions, tracking & follow'],
+      ['ok', 'Live trail + pre-built track history'],
+      ['ok', 'Origin → destination (via icao24)'],
+      ['no', 'Needs OpenSky credentials'],
+    ],
+    warn: 'Blocked from cloud/VM IPs — use only on a non-cloud host.',
+  },
+};
+
+let FLIGHT_SOURCE_GROUPS = { community: 'community', opensky: 'opensky' };
+
+function renderFlightSourceNote() {
+  const el = document.getElementById('flight-source-note');
+  if (!el) return;
+  const group = FLIGHT_SOURCE_GROUPS[state.flightSource] || 'community';
+  const caps = FLIGHT_SOURCE_CAPS[group] || FLIGHT_SOURCE_CAPS.community;
+  const rows = caps.lines
+    .map(([k, txt]) => `<span class="fs-cap"><span class="${k}">${k === 'ok' ? '✓' : '✗'}</span> ${txt}</span>`)
+    .join('<br/>');
+  el.innerHTML = `${rows}<span class="fs-warn">${caps.warn}</span>`;
+}
+
+async function initFlightSource() {
+  const sel = document.getElementById('flight-source');
+  const wrap = document.getElementById('flight-source-wrap');
+  if (!sel) return;
+
+  let sources = [
+    { id: 'community', label: 'Community · auto', group: 'community' },
+    { id: 'adsb.fi', label: 'adsb.fi', group: 'community' },
+    { id: 'airplanes.live', label: 'airplanes.live', group: 'community' },
+    { id: 'adsb.lol', label: 'adsb.lol', group: 'community' },
+    { id: 'opensky', label: 'OpenSky', group: 'opensky' },
+  ];
+  try {
+    const res = await fetch('/api/sources');
+    if (res.ok) {
+      const data = await res.json();
+      if (Array.isArray(data.sources) && data.sources.length) sources = data.sources;
+    }
+  } catch { /* keep the built-in list */ }
+
+  FLIGHT_SOURCE_GROUPS = {};
+  sel.innerHTML = '';
+  for (const s of sources) {
+    FLIGHT_SOURCE_GROUPS[s.id] = s.group || 'community';
+    const opt = document.createElement('option');
+    opt.value = s.id;
+    opt.textContent = s.label || s.id;
+    if (s.note) opt.title = s.note;
+    sel.appendChild(opt);
+  }
+  if (!FLIGHT_SOURCE_GROUPS[state.flightSource]) state.flightSource = 'community';
+  sel.value = state.flightSource;
+  renderFlightSourceNote();
+
+  // User picked a feed from the panel → apply locally AND tell the server
+  // so the agent's analyse/find/track reads use the same feed (best-effort).
+  sel.addEventListener('change', (e) => {
+    applyFlightSource(e.target.value, { announce: true });
+    fetch('/api/map/source', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ source: e.target.value }),
+    }).catch(() => { /* map still works locally even if this fails */ });
+  });
+
+  if (wrap) wrap.classList.toggle('is-disabled', !state.layerVisibility.flights);
+}
+
+// Apply a live-feed selection (from the panel OR an agent broadcast):
+// update state, the <select>, the capability note, drop the old feed's
+// cached planes, and refetch immediately.
+function applyFlightSource(id, { announce = false } = {}) {
+  if (!FLIGHT_SOURCE_GROUPS[id]) return false;
+  const changed = state.flightSource !== id;
+  state.flightSource = id;
+  try { localStorage.setItem('flightSource', id); } catch { /* ignore */ }
+  const sel = document.getElementById('flight-source');
+  if (sel && sel.value !== id) sel.value = id;
+  renderFlightSourceNote();
+  state.flights.clear();
+  state.flightHistory.clear();
+  schedulePump({ force: true });
+  if (announce && changed) {
+    const label = (sel && sel.options[sel.selectedIndex]?.text) || id;
+    toast(`Live feed → ${label}`);
+  }
+  return changed;
+}
+
 function wireLayerToggles() {
+  initFlightSource();
   document.getElementById('layer-flights').addEventListener('change', (e) => {
     state.layerVisibility.flights = e.target.checked;
+    const wrap = document.getElementById('flight-source-wrap');
+    if (wrap) wrap.classList.toggle('is-disabled', !e.target.checked);
     refreshLayers();
   });
   document.getElementById('layer-airports').addEventListener('change', (e) => {
@@ -4159,6 +4275,18 @@ function handleBusMessage(msg) {
       if (!ok) toast(`Unknown color mode: ${msg.mode}`);
       break;
     }
+    case 'source': {
+      // The chat skill switched the live feed via POST /api/map/source,
+      // which broadcasts {type:'source', id:'<feed>'}. Mirror it in the
+      // panel selector + capability note so the map the operator sees
+      // matches what the agent is analysing.
+      if (msg.id && !applyFlightSource(msg.id, { announce: true })) {
+        // Already on that feed — still surface the note in case the
+        // capability text is what the user asked about.
+        renderFlightSourceNote();
+      }
+      break;
+    }
     case 'highlight': {
       const target = (msg.flight || '').toLowerCase();
       if (tryHighlightTarget(target)) break;
@@ -4475,7 +4603,22 @@ syncChatToggleUI();
 // tool-result / thought card. We try to extract the most useful
 // fragment (the URL hit by curl, the python file body's first line,
 // etc.) so the user can scan the trace without expanding everything.
+// Update the live "Agent working…" status line with a present-tense
+// label for the step currently running. Shown regardless of the trace
+// toggle so the turn always feels alive during the model's think time.
+function setWorkingStatus(contentEl, label) {
+  if (!contentEl) return;
+  const safe = String(label || 'Agent working').replace(/[&<>]/g, (c) => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]
+  ));
+  contentEl.innerHTML =
+    `${safe} <span class="thinking-dots"><span></span><span></span><span></span></span>`;
+}
+
 function summariseTraceItem(item) {
+  if (item.kind === 'progress') {
+    return item.label || item.command || 'step';
+  }
   if (item.kind === 'tool_call') {
     const cmd = (item.command || '').trim();
     if (cmd) {
@@ -4522,6 +4665,9 @@ function appendTraceCard(wrap, e) {
   } else if (e.kind === 'thought') {
     cls += ' trace-thought';  tag = 'thinking';
     body = e.text || '';
+  } else if (e.kind === 'progress') {
+    cls += ' trace-progress'; tag = 'step';
+    body = e.command || '';
   } else {
     return null;
   }
@@ -4560,7 +4706,8 @@ function shouldShowEvent(e) {
   // step, so it lives under the same Tool calls toggle. Surfacing
   // them together gives the user a coherent "plan → call → result"
   // story for each step.
-  if (e.kind === 'tool_call' || e.kind === 'tool_result' || e.kind === 'planning') {
+  if (e.kind === 'tool_call' || e.kind === 'tool_result'
+      || e.kind === 'planning' || e.kind === 'progress') {
     return chatTrace.showTools;
   }
   return false;
@@ -4645,6 +4792,12 @@ elChatForm.addEventListener('submit', async (e) => {
         try { msg = JSON.parse(line); }
         catch (_e) { continue; }
         if (msg.type === 'event') {
+          // Progress events (synthesised from the agent's own loopback
+          // tool calls) drive the live status line ALWAYS — even with
+          // the trace toggle off — so the turn never looks frozen.
+          if (msg.kind === 'progress') {
+            setWorkingStatus(content, msg.label);
+          }
           if (shouldShowEvent(msg)) {
             const card = appendTraceCard(traceWrap, msg);
             if (msg.kind === 'tool_call' && msg.call_id && card) {

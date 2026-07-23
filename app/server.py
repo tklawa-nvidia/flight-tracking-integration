@@ -40,6 +40,7 @@ import math
 import os
 import shutil
 import time
+from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable
@@ -143,10 +144,30 @@ OPENCLAW_TIMEOUT_S = int(os.getenv("OPENCLAW_TIMEOUT_S", "180"))
 # Where the agent writes its per-session JSONL transcripts. We read
 # these post-call to surface tool calls + thinking back to the chat
 # UI when the user has the "Show tool calls / thinking" toggle on.
-OPENCLAW_AGENT_HOME = os.getenv(
-    "OPENCLAW_AGENT_HOME",
-    f"/sandbox/.openclaw-data/agents/{OPENCLAW_AGENT}",
-).rstrip("/")
+#
+# install.sh writes the detected path into flight.env so this just
+# reads OPENCLAW_AGENT_HOME. When it's unset (dev runs, pre-0.0.44
+# image, etc.) we fall back to whichever layout's agents/ dir is
+# actually present on disk:
+#   /sandbox/.openclaw/agents/<agent>/        (openshell ≥ 0.0.44)
+#   /sandbox/.openclaw-data/agents/<agent>/   (legacy)
+# Both layouts are supported so the chat panel works without code
+# changes regardless of which sandbox build the operator onboarded.
+def _detect_agent_home() -> str:
+    explicit = os.getenv("OPENCLAW_AGENT_HOME", "").strip().rstrip("/")
+    if explicit:
+        return explicit
+    new_path = f"/sandbox/.openclaw/agents/{OPENCLAW_AGENT}"
+    legacy_path = f"/sandbox/.openclaw-data/agents/{OPENCLAW_AGENT}"
+    if Path(new_path).is_dir():
+        return new_path
+    if Path(legacy_path).is_dir():
+        return legacy_path
+    # Neither present yet — go with the new layout (matches openclaw
+    # ≥ 2026.5.x). The sessions dir is created on first turn anyway.
+    return new_path
+
+OPENCLAW_AGENT_HOME = _detect_agent_home()
 OPENCLAW_SESSIONS_DIR = f"{OPENCLAW_AGENT_HOME}/sessions"
 
 DEFAULT_ANALYSIS_RADIUS_KM = 80.0
@@ -419,6 +440,10 @@ class OpenSkyCache:
             cutoff = time.time() - 60
             self._entries = {k: v for k, v in self._entries.items() if v[0] >= cutoff}
 
+    async def clear(self) -> None:
+        async with self._lock:
+            self._entries.clear()
+
 
 _cache = OpenSkyCache()
 _http: httpx.AsyncClient | None = None
@@ -543,14 +568,35 @@ def _decode_state(row: list[Any]) -> dict[str, Any] | None:
     }
 
 
+# Server-side "active" live feed. None = let the host proxy use its own
+# default (community). Set via POST /api/map/source so EVERY agent-facing
+# read (fetch_flights, /api/analyze, /api/flights/find, /api/map/track…)
+# and the browser map stay on the SAME feed — otherwise the agent could
+# analyse community data while the operator's map shows OpenSky.
+_active_source: str | None = None
+
+
 async def fetch_flights(
     bbox: tuple[float, float, float, float] | None = None,
+    provider: str | None = None,
 ) -> dict[str, Any]:
-    """Fetch live flights, cached briefly to respect OpenSky rate limits."""
+    """Fetch live flights, cached briefly to respect provider rate limits.
+
+    `provider` is an optional per-request live-source override (the UI's
+    source selector, or the agent's `POST /api/map/source`). It is forwarded
+    to the host proxy, which resolves it to OpenSky or a community ADS-B
+    feed. When no explicit provider is passed we fall back to the
+    server-wide `_active_source`. Cache is keyed per provider so switching
+    sources doesn't serve a stale cross-source snapshot.
+    """
     if _http is None:
         raise RuntimeError("HTTP client not initialised")
 
-    key = "global" if bbox is None else f"{bbox[0]:.2f},{bbox[1]:.2f},{bbox[2]:.2f},{bbox[3]:.2f}"
+    if provider is None:
+        provider = _active_source
+
+    bkey = "global" if bbox is None else f"{bbox[0]:.2f},{bbox[1]:.2f},{bbox[2]:.2f},{bbox[3]:.2f}"
+    key = f"{provider}|{bkey}" if provider else bkey
     cached = await _cache.get(key)
     if cached is not None:
         return {"flights": cached, "fetched_from": "cache"}
@@ -559,6 +605,8 @@ async def fetch_flights(
     if bbox is not None:
         s, n, w, e = bbox
         params = {"lamin": s, "lamax": n, "lomin": w, "lomax": e}
+    if provider:
+        params["provider"] = provider
 
     try:
         r = await _http.get(
@@ -2849,6 +2897,8 @@ async def health() -> dict[str, Any]:
         "openclaw_bin": OPENCLAW_BIN,
         "openclaw_available": Path(OPENCLAW_BIN).exists(),
         "openclaw_agent": OPENCLAW_AGENT,
+        "openclaw_agent_home": OPENCLAW_AGENT_HOME,
+        "openclaw_sessions_dir_exists": Path(OPENCLAW_SESSIONS_DIR).is_dir(),
     }
 
 
@@ -2864,12 +2914,94 @@ def _parse_bbox(bbox: str | None) -> tuple[float, float, float, float] | None:
     return (s, n, w, e)
 
 
+_LIVE_SOURCES = ("community", "adsb.fi", "airplanes.live", "adsb.lol", "opensky", "auto", "all")
+
+
+def _sanitize_provider(provider: str | None) -> str | None:
+    """Only forward a recognised source name to the proxy; ignore anything else."""
+    if not provider:
+        return None
+    p = provider.strip().lower()
+    return p if p in _LIVE_SOURCES else None
+
+
+@app.get("/api/sources")
+async def api_sources():
+    """Describe selectable live-aircraft sources + per-group capabilities.
+
+    Drives the UI's source sub-selector and its "what this feed supports"
+    note. Static (matches the host proxy's behaviour) so the panel renders
+    even if the proxy is momentarily unreachable.
+    """
+    community_caps = {
+        "live_positions": True,
+        "live_tracking": True,
+        "live_trail": True,
+        "prebuilt_history": False,
+        "origin_destination": "via callsign route lookup",
+        "needs_credentials": False,
+        "works_from_cloud": True,
+    }
+    opensky_caps = {
+        "live_positions": True,
+        "live_tracking": True,
+        "live_trail": True,
+        "prebuilt_history": True,
+        "origin_destination": "via icao24 flight history",
+        "needs_credentials": True,
+        "works_from_cloud": False,
+    }
+    return {
+        "default": "community",
+        "current": _active_source or "community",
+        "sources": [
+            {"id": "community",      "label": "Community · auto",  "group": "community",
+             "note": "adsb.fi → airplanes.live → adsb.lol, first to answer wins"},
+            {"id": "adsb.fi",        "label": "adsb.fi",           "group": "community", "note": "pin one vendor"},
+            {"id": "airplanes.live", "label": "airplanes.live",    "group": "community", "note": "pin one vendor"},
+            {"id": "adsb.lol",       "label": "adsb.lol",          "group": "community", "note": "pin one vendor"},
+            {"id": "opensky",        "label": "OpenSky",           "group": "opensky",
+             "note": "full history + credentials; blocked from cloud/VM IPs"},
+        ],
+        "capabilities": {"community": community_caps, "opensky": opensky_caps},
+    }
+
+
+def _source_group(source: str) -> str:
+    return "opensky" if source == "opensky" else "community"
+
+
+async def tool_set_source(source: str) -> dict[str, Any]:
+    """Switch the live-aircraft feed used by the agent AND every browser.
+
+    Sets the server-wide `_active_source` (so subsequent /api/flights,
+    /api/analyze, /api/flights/find, /api/map/track reads use it) and
+    broadcasts a `source` bus message so connected maps flip their feed
+    selector + capability note in lock-step.
+    """
+    global _active_source
+    src = (source or "").strip().lower()
+    if src not in _LIVE_SOURCES:
+        return {"ok": False, "error": f"unknown source {source!r}", "valid": list(_LIVE_SOURCES)}
+    # Normalise the "auto"/"all" aliases to the canonical community id.
+    if src in ("auto", "all"):
+        src = "community"
+    _active_source = None if src == "community" else src
+    # Drop cross-source cached snapshots so the next read is the new feed.
+    await _cache.clear()
+    payload = {"type": "source", "id": src, "group": _source_group(src)}
+    delivered = await _bus.broadcast(payload)
+    return {"ok": True, "delivered": delivered, "current": src, **payload}
+
+
 @app.get("/api/flights")
 async def api_flights(
     bbox: str | None = Query(default=None, description="west,south,east,north"),
+    provider: str | None = Query(default=None,
+                                 description="live source: community|adsb.fi|airplanes.live|adsb.lol|opensky"),
 ):
     parsed = _parse_bbox(bbox)
-    return await fetch_flights(parsed)
+    return await fetch_flights(parsed, provider=_sanitize_provider(provider))
 
 
 @app.get("/api/flights/find")
@@ -3734,6 +3866,38 @@ async def api_map_goto(body: GotoBody):
     return await tool_goto(body.target, body.zoom, body.pitch, body.bearing)
 
 
+class GotoAnalyzeBody(BaseModel):
+    target: str
+    zoom: float | None = None
+    radius_km: float = DEFAULT_ANALYSIS_RADIUS_KM
+    pitch: float | None = None
+    bearing: float | None = None
+
+
+@app.post("/api/map/goto-analyze")
+async def api_map_goto_analyze(body: GotoAnalyzeBody):
+    """Fly the map to an airport AND return its traffic analysis in ONE call.
+
+    Combines POST /api/map/goto (broadcast the camera move to every browser)
+    with GET /api/analyze (the airborne/vertical-mode/countries/squawk
+    summary) so the agent can satisfy "go to <X> and analyse" with a single
+    tool call instead of two — one fewer model round-trip.
+
+    Returns {ok, delivered, goto:{…}, analysis:{…}}. If the airport can't be
+    resolved, returns the goto error unchanged (analysis is skipped).
+    """
+    goto = await tool_goto(body.target, body.zoom, body.pitch, body.bearing)
+    if not goto.get("ok"):
+        return goto
+    analysis = await tool_analyze_traffic(body.target, body.radius_km)
+    return {
+        "ok": True,
+        "delivered": goto.get("delivered", 0),
+        "goto": {k: v for k, v in goto.items() if k not in ("ok", "delivered")},
+        "analysis": analysis.get("summary", analysis),
+    }
+
+
 class ArcBody(BaseModel):
     airport: str
     radius_km: float = DEFAULT_ANALYSIS_RADIUS_KM
@@ -3803,6 +3967,22 @@ async def api_map_track(body: TrackBody):
         pitch=body.pitch,
         bearing=body.bearing,
     )
+
+
+class SourceBody(BaseModel):
+    source: str
+
+
+@app.post("/api/map/source")
+async def api_map_source(body: SourceBody):
+    """Switch the live-aircraft data feed for the agent and all browsers.
+
+    `source` ∈ community | adsb.fi | airplanes.live | adsb.lol | opensky
+    (aliases: auto, all → community). See GET /api/sources for the list +
+    per-feed capabilities. Note: opensky is unreachable from cloud/VM IPs,
+    and only opensky provides pre-built per-aircraft track history.
+    """
+    return await tool_set_source(body.source)
 
 
 class ColorBody(BaseModel):
@@ -3936,6 +4116,89 @@ async def api_chat(body: ChatRequest):
 # The client buffers events until `done` and renders them under the
 # assistant bubble live, regardless of whether the user has the
 # trace-toggles on (off = events arrive but get dropped).
+# ── Live progress feed ──────────────────────────────────────────────
+#
+# `openclaw agent --json` is batch: it flushes its session JSONL only
+# when the turn ends, so tailing that file (see run_and_tail below)
+# can't show anything until the agent is already done — hence the long
+# "Agent working…" wait with no feedback.
+#
+# But EVERY tool the agent runs is an HTTP call it curls at our own
+# loopback (127.0.0.1:18890), whereas real browsers hit us from their
+# public IP. So we tap loopback /api hits in a ring buffer, and the
+# streaming endpoint replays any that fall inside the active turn as
+# `progress` events. That gives real-time "Centering the map…",
+# "Analyzing traffic around IAD…" status updates that don't depend on
+# OpenClaw flushing anything, and show up regardless of the user's
+# trace toggle.
+_AGENT_ACTIVITY: deque[dict[str, Any]] = deque(maxlen=400)
+
+
+def _is_tool_path(path: str) -> bool:
+    """Allowlist of endpoints that represent an *agent* tool call.
+
+    We deliberately do NOT record the browser's high-frequency polls
+    (/api/flights, /api/airports) or chat plumbing — only the handful
+    of write/lookup endpoints the SKILL tells the agent to hit. This
+    stays correct even when a browser reaches us through the loopback
+    tunnel (and thus also looks like 127.0.0.1)."""
+    return (
+        path.startswith("/api/map/")          # goto, goto-analyze, track, source, clear
+        or path == "/api/analyze"
+        or path.startswith("/api/flight/")     # single-flight detail (NOT /api/flights)
+        or path.startswith("/api/flights/find")
+        or path.startswith("/api/airspace")
+    )
+
+
+def _activity_label(entry: dict[str, Any]) -> str:
+    """Present-tense, human status line for one recorded tool hit."""
+    path = entry.get("path", "")
+    q = entry.get("query") or {}
+    who = q.get("airport") or q.get("code") or q.get("target") or q.get("q")
+    if path == "/api/map/goto-analyze":
+        return "Centering the map and analyzing traffic…"
+    if path == "/api/map/goto":
+        return "Centering the map…"
+    if path == "/api/analyze":
+        return f"Analyzing traffic around {who}…" if who else "Analyzing traffic…"
+    if path == "/api/map/track":
+        return "Locating and tracking the flight…"
+    if path == "/api/map/source":
+        return "Switching the live data feed…"
+    if path == "/api/map/clear":
+        return "Clearing the map…"
+    if path.startswith("/api/flight/") or path.startswith("/api/flights/find"):
+        return f"Looking up flight {who}…" if who else "Looking up the flight…"
+    if path == "/api/flights":
+        return "Fetching live aircraft…"
+    if path.startswith("/api/airport"):
+        return f"Looking up {who}…" if who else "Looking up airport data…"
+    if path.startswith("/api/airspace"):
+        return "Checking the airspace…"
+    return "Working…"
+
+
+@app.middleware("http")
+async def _tap_agent_activity(request: Any, call_next: Any):  # type: ignore[no-untyped-def]
+    # Record BEFORE awaiting the handler so the status updates the
+    # instant the tool fires — the slow part is the model's *next*
+    # round-trip, and we want something on screen during that wait.
+    try:
+        client = request.client.host if request.client else ""
+        path = request.url.path
+        if client in ("127.0.0.1", "::1") and _is_tool_path(path):
+            _AGENT_ACTIVITY.append({
+                "ts_ms":  int(time.time() * 1000),
+                "method": request.method,
+                "path":   path,
+                "query":  dict(request.query_params),
+            })
+    except Exception:
+        pass
+    return await call_next(request)
+
+
 @app.post("/api/chat/stream")
 async def api_chat_stream(body: ChatRequest):
     if not Path(OPENCLAW_BIN).exists():
@@ -3982,13 +4245,35 @@ async def api_chat_stream(body: ChatRequest):
         drain_err = asyncio.create_task(drain(proc.stderr, stderr_buf))   # type: ignore[arg-type]
 
         offsets: dict[str, int] = {}
+        seen_activity: set[int] = set()
         deadline = time.time() + OPENCLAW_TIMEOUT_S + 30
+
+        async def flush_progress() -> None:
+            # Replay any loopback tool hits that landed inside this turn
+            # and haven't been emitted yet, as live `progress` events.
+            for entry in list(_AGENT_ACTIVITY):
+                if entry["ts_ms"] < started_at_ms:
+                    continue
+                oid = id(entry)
+                if oid in seen_activity:
+                    continue
+                seen_activity.add(oid)
+                await queue.put({
+                    "type":    "event",
+                    "kind":    "progress",
+                    "ts_ms":   entry["ts_ms"],
+                    "label":   _activity_label(entry),
+                    "tool":    entry.get("path"),
+                    "command": f'{entry.get("method")} {entry.get("path")}',
+                })
+
         try:
             while True:
                 path = _resolve_session_path(body.session_id, started_at_ms)
                 if path is not None:
                     for ev in _read_new_events(path, started_at_ms, offsets):
                         await queue.put({"type": "event", **ev})
+                await flush_progress()
                 if proc.returncode is not None:
                     break
                 if time.time() > deadline:
@@ -3999,6 +4284,7 @@ async def api_chat_stream(body: ChatRequest):
             # One last drain in case the subprocess wrote the closing
             # JSONL records right before exit.
             await asyncio.gather(drain_out, drain_err)
+            await flush_progress()
             path = _resolve_session_path(body.session_id, started_at_ms)
             if path is not None:
                 for ev in _read_new_events(path, started_at_ms, offsets):

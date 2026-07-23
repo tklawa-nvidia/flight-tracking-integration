@@ -25,8 +25,11 @@ fi
 . "$VENV/bin/activate"
 
 cd "$APP_DIR"
+# Access logs are ON: every /api/* request the OpenClaw agent issues lands in
+# $LOG, so when a skill call returns 4xx/5xx you can grep the log to see the
+# exact method+path+status without having to instrument the agent.
 exec python -m uvicorn server:app \
   --host 0.0.0.0 \
   --port "$PORT" \
   --log-level info \
-  --no-access-log
+  --access-log

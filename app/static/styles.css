@@ -488,6 +488,75 @@ body.rail-resizing .map { pointer-events: none; }
   letter-spacing: 0.02em;
 }
 
+/* ── Live-aircraft sub-control: data-feed selector + capability note ───── */
+
+.flight-source {
+  margin: 2px 0 8px 40px;      /* indent under the Live aircraft toggle */
+  padding: 8px 10px;
+  border-left: 2px solid rgba(118, 185, 0, 0.35);
+  background: rgba(255, 255, 255, 0.03);
+  border-radius: 6px;
+  display: grid;
+  gap: 6px;
+}
+
+.flight-source.is-disabled {
+  opacity: 0.45;
+  pointer-events: none;
+}
+
+.fs-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.fs-label {
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  white-space: nowrap;
+}
+
+.fs-select {
+  flex: 1;
+  min-width: 0;
+  appearance: none;
+  background: rgba(0, 0, 0, 0.35) url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'><path d='M0 0l5 6 5-6z' fill='%239aa'/></svg>") no-repeat right 8px center;
+  color: var(--text);
+  border: 1px solid var(--rail-stroke);
+  border-radius: 6px;
+  padding: 5px 22px 5px 9px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.fs-select:focus {
+  outline: none;
+  border-color: rgba(118, 185, 0, 0.55);
+  box-shadow: 0 0 0 2px rgba(118, 185, 0, 0.18);
+}
+
+.fs-note {
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--text-dim);
+}
+
+.fs-note .fs-cap {
+  display: inline-block;
+  margin: 1px 0;
+}
+
+.fs-note .ok  { color: var(--accent); }
+.fs-note .no  { color: #e0736a; }
+.fs-note .fs-warn {
+  display: block;
+  margin-top: 4px;
+  color: #e6b667;
+}
+
 /* ── Airspace section: divider + swatches + legend ─────────────────────── */
 
 .layers-divider {
@@ -1578,6 +1647,7 @@ body.rail-resizing .map { pointer-events: none; }
 .trace-item.trace-result-err .trace-tag{ color: rgba(255, 140, 140, 0.95);      border-color: rgba(255, 100, 100, 0.40); background: rgba(255, 80, 80, 0.10); }
 .trace-item.trace-planning .trace-tag  { color: rgba(220, 170, 255, 0.95);      border-color: rgba(200, 150, 255, 0.40); background: rgba(180, 120, 255, 0.10); }
 .trace-item.trace-thought .trace-tag   { color: rgba(220, 170, 255, 0.92);      border-color: rgba(200, 150, 255, 0.32); background: rgba(180, 120, 255, 0.08); }
+.trace-item.trace-progress .trace-tag  { color: rgba(255, 210, 120, 0.95);      border-color: rgba(255, 190, 90, 0.36);  background: rgba(255, 190, 90, 0.09); }
 
 /* Planning bodies are prose, not JSON, so let them wrap normally
    instead of using the monospace JSON pre styling. */
