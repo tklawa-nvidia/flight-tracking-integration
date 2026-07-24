@@ -1002,6 +1002,7 @@ upload "$SCRIPT_DIR/app/requirements.txt"                              "$SANDBOX
 upload "$SCRIPT_DIR/app/static/index.html"                             "$SANDBOX_BASE/app/static/index.html"
 upload "$SCRIPT_DIR/app/static/styles.css"                             "$SANDBOX_BASE/app/static/styles.css"
 upload "$SCRIPT_DIR/app/static/app.js"                                 "$SANDBOX_BASE/app/static/app.js"
+upload "$SCRIPT_DIR/app/static/favicon.svg"                            "$SANDBOX_BASE/app/static/favicon.svg"
 upload "$SCRIPT_DIR/app/static/data/airports.json"                     "$SANDBOX_BASE/app/static/data/airports.json"
 upload "$SCRIPT_DIR/start.sh"                                          "$SANDBOX_BASE/start.sh"
 upload "$SCRIPT_DIR/skills/flight-tracking/SKILL.md"                   "$SKILLS_BASE/flight-tracking/SKILL.md"
