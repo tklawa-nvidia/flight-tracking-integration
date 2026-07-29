@@ -52,6 +52,7 @@ Environment:
 
 from __future__ import annotations
 
+import concurrent.futures
 import http.server
 import json
 import math
@@ -104,6 +105,40 @@ RAW_SOURCE = (os.getenv("FLIGHT_ADSB_SOURCE", "community") or "community").strip
 MAX_RADIUS_NM = float(os.getenv("FLIGHT_ADSB_MAX_NM", "250") or "250")
 DEFAULT_LAT = float(os.getenv("FLIGHT_ADSB_DEFAULT_LAT", "39.5") or "39.5")
 DEFAULT_LON = float(os.getenv("FLIGHT_ADSB_DEFAULT_LON", "-98.35") or "-98.35")
+# Community aggregators are point+radius (capped at MAX_RADIUS_NM), so a single
+# query can't cover a wide/zoomed-out bbox — you'd get one cluster around the
+# centre. To approximate OpenSky's whole-region coverage we tile the bbox into
+# a grid of ≤MAX_RADIUS_NM circles, fetch them concurrently, and merge/dedupe.
+# MAX_TILES bounds the fan-out (latency + provider rate limits); when the bbox
+# needs more tiles than this we coarsen the grid (wider spacing → some gaps but
+# full extent) rather than exceeding the cap.
+# 20 × 250 nm circles covers the continental US with only small gaps; spread
+# across 3 providers that's ~7 gentle requests each per refresh. Raise for
+# denser coverage, lower to reduce fan-out.
+MAX_TILES = int(os.getenv("FLIGHT_ADSB_MAX_TILES", "16") or "16")
+# Keep concurrency modest: with 3 providers rotated across tiles this is ~2
+# simultaneous hits per provider, which avoids the 420/429 rate-limits the free
+# aggregators (esp. adsb.lol) return under bursty fan-out.
+_TILE_WORKERS = int(os.getenv("FLIGHT_ADSB_TILE_WORKERS", "6") or "6")
+# Per-tile cache. The free aggregators rate-limit bursts, so we cache each
+# tile's translated states and reuse them for TILE_TTL seconds. Steady-state
+# refreshes then mostly hit the cache (fast, gentle), and if a provider
+# rate-limits/fails we serve the last-known tile data (stale) rather than
+# leaving a hole in the map. Cache key is the rounded tile centre + radius.
+_TILE_TTL = float(os.getenv("FLIGHT_ADSB_TILE_TTL", "45") or "45")
+# Hard wall-clock budget for gathering tiles. We seed the response from cached
+# (even stale) tile data up front, then overlay whatever fresh fetches finish
+# within the deadline; slow/throttled tiles keep running in the background to
+# warm the cache for the next refresh. This keeps every request snappy no
+# matter how aggressively the upstream APIs are rate-limiting us.
+_TILE_DEADLINE_S = float(os.getenv("FLIGHT_ADSB_DEADLINE", "9") or "9")
+_TILE_CACHE: dict[tuple, tuple[float, list]] = {}
+_TILE_CACHE_LOCK = threading.Lock()
+# Persistent pool so background tile fetches survive past a request's deadline
+# (they finish and populate the cache for the next refresh).
+_TILE_POOL = concurrent.futures.ThreadPoolExecutor(
+    max_workers=max(2, _TILE_WORKERS), thread_name_prefix="tile"
+)
 
 # Community ADS-B aggregators. All speak the readsb/tar1090 "aircraft.json"
 # dialect; they differ only in URL shape and the top-level array key.
@@ -310,6 +345,111 @@ def _bbox_to_circle(qs: dict[str, list[str]]) -> tuple[float, float, int]:
     return (clat, clon, int(round(radius_nm)))
 
 
+def _bbox_tiles(
+    qs: dict[str, list[str]], max_tiles: int = MAX_TILES
+) -> list[tuple[float, float, int]]:
+    """Cover an OpenSky bbox with a grid of (lat, lon, nm) radius queries.
+
+    Community endpoints are point+radius (≤MAX_RADIUS_NM), so one query can't
+    span a wide view. We lay a grid of circles over the bbox:
+
+      * If the bbox fits within a few cells, each circle's radius is sized to
+        cover its cell corner (minimal overlap) — a small zoom is still ~1 call.
+      * If the bbox needs more cells than `max_tiles`, we coarsen the grid
+        (fewer, wider-spaced cells) so the full extent is still sampled — some
+        gaps between the 250 nm circles, but planes appear across the whole
+        region instead of a single centre cluster.
+    """
+    def _get(name: str) -> float | None:
+        v = qs.get(name, [None])[0]
+        try:
+            return float(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    lamin, lamax = _get("lamin"), _get("lamax")
+    lomin, lomax = _get("lomin"), _get("lomax")
+    if None in (lamin, lamax, lomin, lomax) or lamax <= lamin or lomax <= lomin:
+        return [(DEFAULT_LAT, DEFAULT_LON, int(MAX_RADIUS_NM))]
+
+    mean_lat = (lamin + lamax) / 2.0
+    lat_span_nm = max(0.001, (lamax - lamin) * 60.0)
+    lon_span_nm = max(0.001, (lomax - lomin) * 60.0 * math.cos(math.radians(mean_lat)))
+
+    # Base cell side chosen so a MAX_RADIUS_NM circle fully covers a cell
+    # (half-diagonal ≤ radius) with a little overlap: side ≈ radius * 1.3.
+    cell = MAX_RADIUS_NM * 1.30
+    ncols = max(1, math.ceil(lon_span_nm / cell))
+    nrows = max(1, math.ceil(lat_span_nm / cell))
+
+    # Coarsen to fit the tile budget: repeatedly drop a cell from the larger
+    # dimension so cells stay ~square (minimises the worst-case gap).
+    while ncols * nrows > max_tiles:
+        if ncols >= nrows and ncols > 1:
+            ncols -= 1
+        elif nrows > 1:
+            nrows -= 1
+        else:
+            break
+
+    cell_w_nm = lon_span_nm / ncols
+    cell_h_nm = lat_span_nm / nrows
+    half_diag = 0.5 * math.sqrt(cell_w_nm ** 2 + cell_h_nm ** 2)
+    nm = int(max(1, min(MAX_RADIUS_NM, math.ceil(half_diag) + 2)))
+
+    dlat = (lamax - lamin) / nrows
+    dlon = (lomax - lomin) / ncols
+    tiles: list[tuple[float, float, int]] = []
+    for r in range(nrows):
+        for c in range(ncols):
+            clat = lamin + (r + 0.5) * dlat
+            clon = lomin + (c + 0.5) * dlon
+            tiles.append((clat, clon, nm))
+    return tiles
+
+
+def _get_tile(
+    tile_idx: int, lat: float, lon: float, nm: int, providers: list[str], now: float
+) -> tuple[str | None, list]:
+    """Return (status, translated_states) for one tile.
+
+    status is the provider name on a fresh upstream fetch, "cache" when served
+    from the fresh cache, "stale" when a fetch failed but we had older cached
+    data, or None when there was nothing to serve. Provider order is rotated by
+    tile index so load spreads across aggregators.
+    """
+    key = (round(lat, 1), round(lon, 1), nm)
+
+    with _TILE_CACHE_LOCK:
+        hit = _TILE_CACHE.get(key)
+    if hit is not None and (now - hit[0]) < _TILE_TTL:
+        return ("cache", hit[1])
+
+    if not providers:
+        return (("stale", hit[1]) if hit else (None, []))
+
+    start = tile_idx % len(providers)
+    order = providers[start:] + providers[:start]
+    for name in order:
+        try:
+            raw = _fetch_provider(name, lat, lon, nm, timeout=8) or []
+        except (urllib.error.URLError, urllib.error.HTTPError, OSError,
+                json.JSONDecodeError, ValueError) as e:
+            sys.stderr.write(f"[opensky-proxy] tile {tile_idx} via {name} failed: {e}\n")
+            continue
+        states = [row for row in (_translate_aircraft(ac, now) for ac in raw
+                                  if isinstance(ac, dict)) if row is not None]
+        with _TILE_CACHE_LOCK:
+            _TILE_CACHE[key] = (now, states)
+        return (name, states)
+
+    # Every provider failed for this tile — serve the last-known data if we have
+    # any so the map keeps showing aircraft instead of a hole.
+    if hit is not None:
+        return ("stale", hit[1])
+    return (None, [])
+
+
 def _haversine_nm(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     r_nm = 3440.065  # Earth radius in nautical miles
     p1, p2 = math.radians(lat1), math.radians(lat2)
@@ -392,7 +532,8 @@ def _translate_aircraft(ac: dict, now: float) -> list | None:
     ]
 
 
-def _fetch_provider(name: str, lat: float, lon: float, nm: int) -> list | None:
+def _fetch_provider(name: str, lat: float, lon: float, nm: int,
+                    timeout: int = 15) -> list | None:
     """Fetch raw aircraft list from one provider, or None on failure."""
     spec = _PROVIDER_TABLE[name]
     url = spec["url"].format(lat=f"{lat:.5f}", lon=f"{lon:.5f}", nm=nm)
@@ -401,7 +542,7 @@ def _fetch_provider(name: str, lat: float, lon: float, nm: int) -> list | None:
         method="GET",
         headers={"Accept": "application/json", "User-Agent": USER_AGENT},
     )
-    with urllib.request.urlopen(req, timeout=15) as resp:
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
         payload = json.loads(resp.read().decode("utf-8"))
     ac = payload.get(spec["key"])
     return ac if isinstance(ac, list) else []
@@ -443,55 +584,81 @@ def _serve_states_community(
     marks that this community answer is standing in for a failed OpenSky
     request, so the app/UI can say "OpenSky unavailable — community feed".
     """
-    lat, lon, nm = _bbox_to_circle(qs)
     now = time.time()
-
     meta_headers = {
         "X-Flightops-Source": "community",
         "X-Flightops-Requested": requested,
         "X-Flightops-Fallback": "1" if fallback else "0",
     }
 
-    last_err: Exception | None = None
-    for name in providers:
-        try:
-            raw = _fetch_provider(name, lat, lon, nm)
-        except (urllib.error.URLError, urllib.error.HTTPError, OSError,
-                json.JSONDecodeError, ValueError) as e:
-            last_err = e
-            sys.stderr.write(f"[opensky-proxy] provider {name} failed: {e}\n")
-            continue
+    # Tile the requested bbox so a wide/zoomed-out view still returns aircraft
+    # across the whole region instead of a single centre cluster (the community
+    # feeds are point+radius, capped at MAX_RADIUS_NM).
+    tiles = _bbox_tiles(qs)
 
-        states = []
-        for ac in (raw or []):
-            if isinstance(ac, dict):
-                row = _translate_aircraft(ac, now)
-                if row is not None:
-                    states.append(row)
-        sys.stderr.write(
-            f"[opensky-proxy] states via {name}: {len(states)} aircraft "
-            f"({lat:.2f},{lon:.2f} r={nm}nm)"
-            f"{' [opensky-fallback]' if fallback else ''}\n"
-        )
+    # Dedupe across overlapping tiles by icao24 (row[0]); keep the freshest
+    # sighting (larger last_contact at row[4]).
+    merged: dict[str, list] = {}
+    used_providers: set[str] = set()
+
+    def _overlay(states: list) -> None:
+        for row in states:
+            key = row[0]
+            prev = merged.get(key)
+            if prev is None or (row[4] or 0) >= (prev[4] or 0):
+                merged[key] = row
+
+    # 1) Seed from cache (any age) so slow/throttled tiles still show their
+    #    last-known aircraft instead of a hole.
+    with _TILE_CACHE_LOCK:
+        for clat, clon, nm in tiles:
+            hit = _TILE_CACHE.get((round(clat, 1), round(clon, 1), nm))
+            if hit:
+                _overlay(hit[1])
+
+    # 2) Kick off fresh fetches (cache-fresh tiles return instantly inside
+    #    _get_tile) and overlay whatever finishes within the deadline. Tiles
+    #    that don't finish keep running in the background to warm the cache.
+    futs = [_TILE_POOL.submit(_get_tile, i, t[0], t[1], t[2], providers, now)
+            for i, t in enumerate(tiles)]
+    try:
+        for fut in concurrent.futures.as_completed(futs, timeout=_TILE_DEADLINE_S):
+            status, states = fut.result()
+            if status is not None:
+                used_providers.add(status)
+            _overlay(states)
+    except concurrent.futures.TimeoutError:
+        pass  # remaining tiles: stale data already seeded; they finish later
+
+    if not merged and not used_providers:
         _send_json(
-            handler, 200,
+            handler, 502,
             {
-                "time": int(now), "states": states,
-                "source": "community", "requested": requested,
-                "fallback": bool(fallback), "provider": name,
+                "error": "all ADS-B providers failed for every tile",
+                "states": [], "source": "community", "requested": requested,
+                "fallback": bool(fallback),
             },
-            extra_headers={**meta_headers, "X-Flightops-Provider": name},
+            extra_headers=meta_headers,
         )
         return
 
+    states = list(merged.values())
+    provider_label = (next(iter(used_providers)) if len(used_providers) == 1
+                      else f"community×{len(tiles)}")
+    sys.stderr.write(
+        f"[opensky-proxy] states: {len(states)} aircraft via "
+        f"{','.join(sorted(used_providers)) or 'none'} over {len(tiles)} tile(s)"
+        f"{' [opensky-fallback]' if fallback else ''}\n"
+    )
     _send_json(
-        handler, 502,
+        handler, 200,
         {
-            "error": f"all ADS-B providers failed; last error: {last_err}",
-            "states": [], "source": "community", "requested": requested,
-            "fallback": bool(fallback),
+            "time": int(now), "states": states,
+            "source": "community", "requested": requested,
+            "fallback": bool(fallback), "provider": provider_label,
+            "tiles": len(tiles),
         },
-        extra_headers=meta_headers,
+        extra_headers={**meta_headers, "X-Flightops-Provider": provider_label},
     )
 
 

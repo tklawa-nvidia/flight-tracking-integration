@@ -456,7 +456,7 @@ if [ "$DO_UNINSTALL" = true ]; then
   ok "Host proxies stopped"
 
   # 3. Stop the uvicorn server in the sandbox + remove staged files.
-  ssh_sandbox 'for pd in /proc/[0-9]*; do pid=$(basename "$pd"); [ -r "$pd/cmdline" ] || continue; cmd=$(tr "\0" " " < "$pd/cmdline" 2>/dev/null); case "$cmd" in *uvicorn*server:app*) kill -9 "$pid" 2>/dev/null || true ;; esac; done; true' 2>/dev/null || true
+  ssh_sandbox 'p="'"$PORT"'"; for pd in /proc/[0-9]*; do pid=$(basename "$pd"); [ -r "$pd/cmdline" ] || continue; cmd=$(tr "\0" " " < "$pd/cmdline" 2>/dev/null); case "$cmd" in *uvicorn*server:app*) case "$cmd" in *"--port $p "*) kill -9 "$pid" 2>/dev/null || true ;; esac ;; esac; done; true' 2>/dev/null || true
   ssh_sandbox "rm -rf $SANDBOX_BASE" 2>/dev/null && ok "Removed $SANDBOX_BASE" || warn "Could not remove $SANDBOX_BASE"
   ssh_sandbox "rm -rf $SKILLS_BASE/flight-tracking" 2>/dev/null && ok "Removed $SKILLS_BASE/flight-tracking" || warn "Could not remove skill dir"
 
@@ -1066,7 +1066,7 @@ info "Starting FlightOps server inside the sandbox on port $PORT…"
 # 9a — kill any prior uvicorn serving this app. Belt-and-braces: kill by
 # port (fuser, shared network view) AND by /proc scan, so a stale build
 # from a prior session can't keep the port and silently serve old code.
-ssh_sandbox 'p="'"$PORT"'"; (command -v fuser >/dev/null 2>&1 && fuser -k "${p}/tcp" 2>/dev/null) || true; for pd in /proc/[0-9]*; do pid=$(basename "$pd"); [ -r "$pd/cmdline" ] || continue; cmd=$(tr "\0" " " < "$pd/cmdline" 2>/dev/null); case "$cmd" in *uvicorn*server:app*) kill -9 "$pid" 2>/dev/null || true ;; esac; done; sleep 1; true' \
+ssh_sandbox 'p="'"$PORT"'"; (command -v fuser >/dev/null 2>&1 && fuser -k "${p}/tcp" 2>/dev/null) || true; for pd in /proc/[0-9]*; do pid=$(basename "$pd"); [ -r "$pd/cmdline" ] || continue; cmd=$(tr "\0" " " < "$pd/cmdline" 2>/dev/null); case "$cmd" in *uvicorn*server:app*) case "$cmd" in *"--port $p "*) kill -9 "$pid" 2>/dev/null || true ;; esac ;; esac; done; sleep 1; true' \
   || true
 
 # 9b — truncate the log + launch start.sh detached. Inline one-

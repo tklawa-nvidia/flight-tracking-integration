@@ -39,6 +39,10 @@ for pd in /proc/[0-9]*; do
   _c=$(tr '\0' ' ' < "$pd/cmdline" 2>/dev/null)
   case "$_c" in
     *uvicorn*server:app*)
+      # Only reap our OWN port: the sibling demos (boat, satellite) run the
+      # same "uvicorn server:app" command line and differ only by --port, so an
+      # unscoped kill here tears them down too.
+      case "$_c" in *"--port $PORT "*) ;; *) continue ;; esac
       _p=$(basename "$pd")
       [ "$_p" = "$$" ] || kill -9 "$_p" 2>/dev/null || true ;;
   esac

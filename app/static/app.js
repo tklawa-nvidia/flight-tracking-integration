@@ -145,8 +145,11 @@ const state = {
     nextRefresh: 0,        // performance.now() — driven by nasTick()
   },
   // Current map zoom (cached so layers can size themselves without
-  // calling map.getZoom() repeatedly each animation tick).
-  zoom: 3.4,
+  // calling map.getZoom() repeatedly each animation tick). Default is a
+  // regional zoom (not the whole continent) so the community feed's tiled
+  // 250 nm queries densely cover the view — a full-US zoom-out spreads the
+  // tile budget too thin and leaves gaps between plane clusters.
+  zoom: 5.0,
   // 0..1 sine-driven phase used to throb hazardous-airspace fills and the
   // ATS-route halo. Updated every animate() tick; layers consume it via
   // their `opacity` prop, which is cheap (no per-feature accessor recompute).
@@ -473,7 +476,7 @@ function initMap() {
     container: 'map',
     style: BASE_STYLE,
     center: [-95, 38],
-    zoom: 3.4,
+    zoom: 5.0,
     pitch: 0,
     bearing: 0,
     // MapLibre's default maxPitch is 60°. 85° is the upper safe limit
